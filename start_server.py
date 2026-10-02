@@ -26,7 +26,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 
 REQUIREMENTS = [
-    "mcp[cli]==1.5.0",
+    "mcp[cli]>=2.0.0",
     "pillow>=11.1.0",
     "pywin32>=310",
 ]

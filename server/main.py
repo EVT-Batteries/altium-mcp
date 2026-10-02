@@ -1,5 +1,5 @@
-from mcp.server.fastmcp import FastMCP, Context
-from mcp.server.fastmcp.utilities.types import Image as MCPImage
+from mcp.server.mcpserver import MCPServer, Context
+from mcp.server.mcpserver.utilities.types import Image as MCPImage
 import json
 import os
 import time
@@ -60,7 +60,7 @@ REQUEST_FILE = EXCHANGE_DIR / "request.json"
 RESPONSE_FILE = EXCHANGE_DIR / "response.json"
 
 # Initialize FastMCP server
-mcp = FastMCP("AltiumMCP", description="Altium integration through the Model Context Protocol")
+mcp = MCPServer("AltiumMCP")
 
 class AltiumConfig:
     def __init__(self):

@@ -85,7 +85,7 @@ These are hard-won lessons from debugging DXT builds. Violating any of these wil
 
 1. **Do NOT use `os.execv()` in `start_server.py`.** The DXT installs to a path containing spaces (`Claude Extensions`). On Windows, `os.execv` splits the path at the space and fails. Use `sys.exit(subprocess.call([...]))` instead.
 
-2. **Pin `mcp` to `==1.5.0`.** Using `>=1.5.0` pulls in the latest version, which has breaking API changes (`FastMCP.__init__()` dropped the `description` kwarg). The server code was written against 1.5.0.
+2. **Ensure `mcp` is pinned to `>=2.0.0`.** The server code has been updated to use the new `MCPServer` API from the Model Context Protocol SDK v2.0+.
 
 3. **Do NOT use `manifest_version: "0.4"` with `"type": "uv"`.** Claude Desktop does not support it yet. You will get `Invalid manifest: server: Required`. Use `"type": "python"` with `manifest_version: "0.3"`.
 
