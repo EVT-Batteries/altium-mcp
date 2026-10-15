@@ -2025,6 +2025,7 @@ var
     P, DocIdx   : Integer;
     Project     : IProject;
     Doc         : IDocument;
+    ServerDoc   : IServerDocument;
     Obj         : ISch_GraphicalObject;
     WireCount   : Integer;
     NcCount     : Integer;
@@ -2057,8 +2058,8 @@ begin
                     Doc := Project.DM_LogicalDocuments(DocIdx);
                     if (Doc <> nil) and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or (Doc.DM_DocumentKind = 'SCH')) then
                     begin
-                        Doc.DM_OpenAndFocusDocument;
-                        Sleep(500);
+                        ServerDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
+                        if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
                         TargetDoc := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
                         if TargetDoc = nil then
                             TargetDoc := SchServer.GetCurrentSchDocument;

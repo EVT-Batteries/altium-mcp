@@ -2485,7 +2485,9 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
         focused_document = focus_info.get("focused_document", "")
         wanted_kind = {"pcb": "PCB", "sch": "SCH"}.get(view_type.lower())
-        if wanted_kind and focused_kind and focused_kind != wanted_kind:
+        is_sch_match = (wanted_kind == "SCH" and focused_kind in ("SCH", "HARNESSWIRINGDIAGRAM", "HARNESSLAYOUT"))
+        is_pcb_match = (wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB"))
+        if wanted_kind and focused_kind and not (is_sch_match or is_pcb_match):
             logger.error(f"Requested {view_type} view but {focused_kind} document is focused")
             return json.dumps({
                 "success": False,

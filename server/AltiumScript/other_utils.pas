@@ -143,9 +143,11 @@ var
     Doc         : IDocument;
     DocFound    : Boolean;
     CurrentDoc  : IServerDocument;
+    Module      : IServerModule;
     DocumentKind: String;
     LogMessage  : String;
-    OutJobPath: String;
+    OutJobPath  : String;
+    J           : Integer;
 begin
     Result := False;
     DocFound := False;
@@ -314,12 +316,12 @@ begin
       For I := 0 to Project.DM_LogicalDocumentCount - 1 Do
       Begin
         Doc := Project.DM_LogicalDocuments(I);
-        If Doc.DM_DocumentKind = DocumentKind Then
+        If (Doc.DM_DocumentKind = DocumentKind) or ((DocumentKind = 'SCH') and (Doc.DM_DocumentKind = 'HarnessWiringDiagram')) Then
         Begin
             DocFound := True;
-            // Try to open and focus the document
-            Doc.DM_OpenAndFocusDocument;
-            // Give it a moment to focus
+            CurrentDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
+            if CurrentDoc <> nil then Client.ShowDocument(CurrentDoc)
+            else Doc.DM_OpenAndFocusDocument;
             Sleep(500);
 
             // Verify that the document is now focused
@@ -373,8 +375,39 @@ begin
       End;
     End;
 
-    // TODO: Do I want to iterate through all workspace projects to find valid document if it is not current document?
-    // Could use IWorkspace.DM_ProjectCount and for loop
+    if not DocFound then
+    begin
+        for I := 0 to Client.Count - 1 do
+        begin
+            Module := Client.ServerModule[I];
+            if Module <> nil then
+            begin
+                for J := 0 to Module.DocumentCount - 1 do
+                begin
+                    CurrentDoc := Module.Documents[J];
+                    if CurrentDoc <> nil then
+                    begin
+                        if (DocumentKind = 'SCH') and ((CurrentDoc.Kind = 'SCH') or (CurrentDoc.Kind = 'HarnessWiringDiagram')) then
+                        begin
+                            DocFound := True;
+                            Client.ShowDocument(CurrentDoc);
+                            Sleep(500);
+                            Result := True;
+                            Exit;
+                        end;
+                        if (DocumentKind = 'PCB') and (CurrentDoc.Kind = 'PCB') then
+                        begin
+                            DocFound := True;
+                            Client.ShowDocument(CurrentDoc);
+                            Sleep(500);
+                            Result := True;
+                            Exit;
+                        end;
+                    end;
+                end;
+            end;
+        end;
+    end;
 
     // No matching document found or couldn't be focused
     if not DocFound then
