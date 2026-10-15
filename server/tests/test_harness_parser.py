@@ -323,6 +323,37 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         err_place = json.loads(raw_place)
         self.assertEqual(err_place.get("project_type"), "harness")
 
+    async def test_add_harness_wiring_validation(self):
+        import main
+        # Odd number of coordinates should fail validation
+        res = await main.add_harness_wiring(
+            None,
+            wires=[{"designator": "W1", "net": "NET1", "points": [100, 200, 300]}],
+        )
+        data = json.loads(res)
+        self.assertFalse(data.get("success"))
+        self.assertIn("error", data)
+
+    async def test_add_harness_wiring_dispatch(self):
+        import main
+        self.mock_bridge.return_value = {
+            "success": True,
+            "result": json.dumps({"success": True, "wires": 2, "no_connects": 1}),
+        }
+        res = await main.add_harness_wiring(
+            None,
+            wires=[
+                {"designator": "W1", "net": "NET1", "points": [100, 200, 300, 400]},
+                {"designator": "W2", "net": "NET2", "points": [500, 600, 700, 800]},
+            ],
+            no_connects=[{"x": 150, "y": 250}],
+            net_labels=[{"x": 100, "y": 200, "orientation": 0, "text": "NET1"}],
+        )
+        data = json.loads(res)
+        self.assertTrue(data.get("success"))
+        self.assertEqual(data.get("wires"), 2)
+        self.assertEqual(data.get("no_connects"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

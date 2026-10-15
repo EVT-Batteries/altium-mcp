@@ -1184,6 +1184,8 @@ begin
             Result := GetBoardSummary(ROOT_DIR);
         'get_component_primitives':
             Result := ExecuteGetComponentPrimitives(RequestData);
+        'add_harness_wiring':
+            Result := ExecuteAddHarnessWiring(ROOT_DIR, ROOT_DIR + 'harness_wiring_spec.txt');
     else
         LogScriptError('Error: Unknown command: ' + CommandName);
     end;

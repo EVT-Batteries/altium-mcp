@@ -190,6 +190,10 @@
     {
       "name": "get_server_status",
       "description": "Get the current status of the Altium MCP server"
+    },
+    {
+      "name": "add_harness_wiring",
+      "description": "Add wires, no-connect directives, and net labels to the active Harness Wiring Diagram (.WirDoc)"
     }
   ],
   "compatibility": {

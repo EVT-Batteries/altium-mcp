@@ -1710,6 +1710,88 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
                               "wires from these, not from predicted offsets.")
     return json.dumps(result, indent=2)
 
+
+@mcp.tool()
+async def add_harness_wiring(ctx: Context, wires: list = None,
+                            no_connects: list = None,
+                            net_labels: list = None) -> str:
+    """
+    Add wires, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
+
+    Args:
+        wires (list): List of wire dicts, e.g.:
+            [
+                {
+                    "designator": "W1",
+                    "net": "BMSS_C01_POS",
+                    "points": [1670, 840, 1160, 840, 1160, 1320, 650, 1320]
+                }
+            ]
+            points are alternating x, y coordinates in mils (even length >= 4).
+        no_connects (list): List of no-connect dicts, e.g.:
+            [
+                {"x": 1670, "y": 810}
+            ]
+        net_labels (list): List of net label dicts, e.g.:
+            [
+                {"x": 1670, "y": 840, "orientation": 0, "text": "BMSS_C01_POS"}
+            ]
+
+    Returns:
+        str: JSON string reporting placement counts and document name.
+    """
+    logger.info(
+        f"Adding harness wiring: {len(wires or [])} wires, "
+        f"{len(no_connects or [])} no-connects, "
+        f"{len(net_labels or [])} net labels"
+    )
+
+    lines = []
+    for w in (wires or []):
+        des = str(w.get("designator", "")).strip()
+        net = str(w.get("net", "")).strip()
+        pts = w.get("points", [])
+        if len(pts) < 4 or len(pts) % 2 != 0:
+            return json.dumps({
+                "success": False,
+                "error": f"wire needs an even count of >=4 coords: {w}"
+            })
+        pts_str = "|".join(str(int(v)) for v in pts)
+        lines.append(f"WIRE|{des}|{net}|{pts_str}")
+
+    for nc in (no_connects or []):
+        x = int(nc.get("x", 0))
+        y = int(nc.get("y", 0))
+        lines.append(f"NOCONNECT|{x}|{y}")
+
+    for nl in (net_labels or []):
+        x = int(nl.get("x", 0))
+        y = int(nl.get("y", 0))
+        ori = int(nl.get("orientation", 0))
+        text = str(nl.get("text", "")).strip()
+        if text:
+            lines.append(f"NETLABEL|{x}|{y}|{ori}|{text}")
+
+    spec_path = Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt")
+    spec_path.parent.mkdir(parents=True, exist_ok=True)
+    write_altium_text(spec_path, "\n".join(lines) + "\n")
+
+    response = await altium_bridge.execute_command("add_harness_wiring", {})
+    if not response.get("success", False):
+        return json.dumps({
+            "success": False,
+            "error": response.get("error", "unknown error")
+        })
+
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            return json.dumps(json.loads(result), indent=2)
+        except ValueError:
+            return result
+    return json.dumps(result, indent=2)
+
+
 @mcp.tool()
 async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     """

@@ -2011,3 +2011,144 @@ begin
     Spec.Free;
     Placement.Free;
 end;
+
+// Add wires, no-connect directives, and net labels to the current wiring diagram or schematic
+function ExecuteAddHarnessWiring(ROOT_DIR: String, SpecPath: String): String;
+var
+    Spec        : TStringList;
+    TargetDoc   : ISch_Document;
+    Rec         : String;
+    Kind        : String;
+    WireDes     : String;
+    NetName     : String;
+    i, fld, vtx : Integer;
+    Obj         : ISch_GraphicalObject;
+    WireCount   : Integer;
+    NcCount     : Integer;
+    NetCount    : Integer;
+begin
+    Result := '{"success": false, "error": "wiring did not run"}';
+
+    if not FileExists(SpecPath) then
+    begin
+        Result := '{"success": false, "error": "spec file not found: ' + SpecPath + '"}';
+        Exit;
+    end;
+
+    TargetDoc := SchServer.GetCurrentSchDocument;
+    if (TargetDoc = nil) then
+    begin
+        Result := '{"success": false, "error": "no active schematic or harness document open"}';
+        Exit;
+    end;
+
+    Spec := TStringList.Create;
+    try
+        Spec.LoadFromFile(SpecPath);
+        SchServer.ProcessControl.PreProcess(TargetDoc, '');
+
+        WireCount := 0;
+        NcCount := 0;
+        NetCount := 0;
+
+        for i := 0 to Spec.Count - 1 do
+        begin
+            Rec := Spec[i];
+            Kind := GetFieldFromPipeString(Rec, 0);
+
+            if (Kind = 'WIRE') then
+            begin
+                // WIRE|<Designator>|<NetName>|x1|y1|x2|y2|...
+                WireDes := GetFieldFromPipeString(Rec, 1);
+                NetName := GetFieldFromPipeString(Rec, 2);
+
+                Obj := SchServer.SchObjectFactory(82, 1); // eHarnessWire
+                if (Obj = nil) then
+                    Obj := SchServer.SchObjectFactory(eWire, eCreate_GlobalCopy);
+
+                if (Obj <> nil) then
+                begin
+                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3))),
+                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 4))));
+                    fld := 3;
+                    vtx := 0;
+                    while (GetFieldFromPipeString(Rec, fld) <> '') do
+                    begin
+                        vtx := vtx + 1;
+                        Obj.InsertVertex := vtx;
+                        Obj.SetState_Vertex(vtx,
+                            Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
+                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1)))));
+                        fld := fld + 2;
+                    end;
+
+                    try
+                        if (WireDes <> '') and (Obj.Designator <> nil) then
+                            Obj.Designator.Text := WireDes;
+                    except
+                    end;
+
+                    try
+                        if (NetName <> '') and (Obj.Comment <> nil) then
+                            Obj.Comment.Text := NetName;
+                    except
+                    end;
+
+                    TargetDoc.RegisterSchObjectInContainer(Obj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    WireCount := WireCount + 1;
+                end;
+            end
+            else if (Kind = 'NOCONNECT') then
+            begin
+                // NOCONNECT|x|y
+                Obj := SchServer.SchObjectFactory(94, 1); // eHarnessNoConnect
+                if (Obj = nil) then
+                    Obj := SchServer.SchObjectFactory(2, eCreate_GlobalCopy); // eNoConnect
+
+                if (Obj <> nil) then
+                begin
+                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
+                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+                    try
+                        Obj.Style := 1; // Thick Cross
+                    except
+                    end;
+
+                    TargetDoc.RegisterSchObjectInContainer(Obj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    NcCount := NcCount + 1;
+                end;
+            end
+            else if (Kind = 'NETLABEL') then
+            begin
+                // NETLABEL|x|y|orientation|Text
+                Obj := SchServer.SchObjectFactory(eNetLabel, eCreate_GlobalCopy);
+                if (Obj <> nil) then
+                begin
+                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
+                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+                    Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
+                    Obj.Text := GetFieldFromPipeString(Rec, 4);
+
+                    TargetDoc.RegisterSchObjectInContainer(Obj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    NetCount := NetCount + 1;
+                end;
+            end;
+        end;
+
+        SchServer.ProcessControl.PostProcess(TargetDoc, '');
+        TargetDoc.GraphicallyInvalidate;
+
+        Result := '{"success": true, "sheet": "' + TargetDoc.DocumentName +
+                  '", "wires": ' + IntToStr(WireCount) +
+                  ', "no_connects": ' + IntToStr(NcCount) +
+                  ', "net_labels": ' + IntToStr(NetCount) + '}';
+    finally
+        Spec.Free;
+    end;
+end;
