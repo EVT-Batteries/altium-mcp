@@ -672,19 +672,13 @@ begin
             Exit;
         end;
 
-        // Open the library document. If it is already open, only focus it -
-        // re-opening reloads from disk and silently discards unsaved changes.
-        if Client.IsDocumentOpen(LibraryPath) then
-            ServerDoc := Client.GetDocumentByPath(LibraryPath)
-        else
-            ServerDoc := Client.OpenDocument('SchLib', LibraryPath);
+        // Open the library, or only focus it when it is already open
+        ServerDoc := OpenLibraryDocument('SchLib', LibraryPath);
         if ServerDoc = Nil then
         begin
             Result := 'ERROR: Failed to open library: ' + LibraryPath;
             Exit;
         end;
-        Client.ShowDocument(ServerDoc);
-        Sleep(500); // Give Altium time to focus the document
     end;
 
     // Get the current schematic library document
@@ -988,17 +982,12 @@ begin
             Result := 'ERROR: Library file not found: ' + LibraryPath;
             Exit;
         end;
-        if Client.IsDocumentOpen(LibraryPath) then
-            ServerDoc := Client.GetDocumentByPath(LibraryPath)
-        else
-            ServerDoc := Client.OpenDocument('SchLib', LibraryPath);
+        ServerDoc := OpenLibraryDocument('SchLib', LibraryPath);
         if ServerDoc = Nil then
         begin
             Result := 'ERROR: Failed to open library: ' + LibraryPath;
             Exit;
         end;
-        Client.ShowDocument(ServerDoc);
-        Sleep(500);
     end;
 
     CurrentLib := SchServer.GetCurrentSchDocument;
@@ -1642,6 +1631,51 @@ begin
     end;
 end;
 
+// A detached copy of a library symbol with all of its primitives. While a
+// symbol is the one shown in the library editor, Altium hands its body, pins
+// and visible parameters to the library document (their Container is the
+// SchLib), and Replicate copies only what the component itself holds - so
+// the shown symbol, such as one just made by create_schematic_symbol, was
+// placed with no body or pins (issue #22). Copy across what the library
+// document holds, and only when the copy came out short.
+function ReplicateLibSymbol(Comp: ISch_Component): ISch_Component;
+var
+    Iter : ISch_Iterator;
+    Obj : ISch_GraphicalObject;
+    Have, Want : Integer;
+begin
+    Result := Comp.Replicate;
+    Want := 0;
+    Iter := Comp.SchIterator_Create;
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        Want := Want + 1;
+        Obj := Iter.NextSchObject;
+    end;
+    Comp.SchIterator_Destroy(Iter);
+    Have := 0;
+    Iter := Result.SchIterator_Create;
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        Have := Have + 1;
+        Obj := Iter.NextSchObject;
+    end;
+    Result.SchIterator_Destroy(Iter);
+    if (Have >= Want) then Exit;
+
+    Iter := Comp.SchIterator_Create;
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (Obj.Container <> nil) and (Obj.Container.ObjectId <> eSchComponent) then
+            Result.AddSchObject(Obj.Replicate);
+        Obj := Iter.NextSchObject;
+    end;
+    Comp.SchIterator_Destroy(Iter);
+end;
+
 function BuildCircuitFromSpec(SpecPath: String; PlacementPath: String): String;
 var
     Spec, Placement, PinMap : TStringList;
@@ -1650,7 +1684,7 @@ var
     Iter, ChildIter : ISch_Iterator;
     Prim, Param, Obj : ISch_GraphicalObject;
     Impl : ISch_Implementation;
-    Rec, Kind, CurLib, PName, PVal, Adopted : String;
+    Rec, Kind, CurLib, PName, PVal, Adopted, Missing, Ok : String;
     Proj : IProject;
     i, fld, vtx, PartCount, GfxCount, PinCount : Integer;
     HotX, HotY : Integer;
@@ -1707,6 +1741,7 @@ begin
     SchServer.ProcessControl.PreProcess(TargetDoc, '');
     Comp := nil;
     CurLib := '';
+    Missing := '';
     PartCount := 0;
     GfxCount := 0;
 
@@ -1720,8 +1755,8 @@ begin
             if (GetFieldFromPipeString(Rec, 2) <> CurLib) then
             begin
                 CurLib := GetFieldFromPipeString(Rec, 2);
-                Client.ShowDocument(Client.OpenDocument('SchLib', CurLib));
-                Sleep(1200);
+                OpenLibraryDocument('SchLib', CurLib);
+                Sleep(700);
             end;
             LibDoc := SchServer.GetCurrentSchDocument;
 
@@ -1737,10 +1772,17 @@ begin
             LibDoc.SchIterator_Destroy(Iter);
 
             if (Found = nil) then
-                Comp := nil
+            begin
+                // Report it: skipping silently gave an empty sheet that
+                // claimed success (issue #19)
+                Comp := nil;
+                if (Missing <> '') then Missing := Missing + ', ';
+                Missing := Missing + '"' + JSONEscapeString(GetFieldFromPipeString(Rec, 1) + ': ' +
+                    GetFieldFromPipeString(Rec, 3) + ' not found in ' + CurLib) + '"';
+            end
             else
             begin
-                Replica := Found.Replicate;
+                Replica := ReplicateLibSymbol(Found);
                 Replica.Designator.Text := GetFieldFromPipeString(Rec, 1);
                 Replica.DesignItemID    := GetFieldFromPipeString(Rec, 4);
                 Replica.Orientation     := StrToInt(GetFieldFromPipeString(Rec, 7));
@@ -1960,10 +2002,12 @@ begin
     PinMap.SaveToFile('C:\Users\Public\altium_mcp\pin_map.txt');
     PinMap.Free;
 
-    Result := '{"success": true, "detached_from": "' + Adopted + '", "sheet": "' + TargetDoc.DocumentName +
+    if (Missing = '') then Ok := 'true' else Ok := 'false';
+    Result := '{"success": ' + Ok + ', "detached_from": "' + Adopted + '", "sheet": "' + TargetDoc.DocumentName +
               '", "parts": ' + IntToStr(PartCount) +
               ', "graphics": ' + IntToStr(GfxCount) +
-              ', "pins": ' + IntToStr(PinCount) + '}';
+              ', "pins": ' + IntToStr(PinCount) +
+              ', "missing_parts": [' + Missing + ']}';
     Spec.Free;
     Placement.Free;
 end;

@@ -217,9 +217,7 @@ begin
             // Look for component name
             if (Pos('"symbol_name"', RequestData[i]) > 0) then
             begin
-                ValueStart := Pos(':', RequestData[i]) + 1;
-                ComponentName := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-                ComponentName := TrimJSON(ComponentName);
+                ComponentName := JSONLineValue(RequestData[i]);
             end
             // Look for part_count
             else if (Pos('"part_count"', RequestData[i]) > 0) then
@@ -275,7 +273,7 @@ begin
             begin
                 ValueStart := Pos(':', RequestData[i]) + 1;
                 ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-                ParamValue := TrimJSON(ParamValue);
+                ParamValue := JSONLineValue(RequestData[i]);
                 PinsList.Add('Description=' + ParamValue);
             end;
         end;
@@ -516,13 +514,13 @@ begin
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            LibraryPath := TrimJSON(ParamValue);
+            LibraryPath := JSONLineValue(RequestData[i]);
         end
         else if (Pos('"footprint_name"', RequestData[i]) > 0) then
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            FootprintName := TrimJSON(ParamValue);
+            FootprintName := JSONLineValue(RequestData[i]);
         end;
     end;
 
@@ -544,7 +542,7 @@ begin
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            SpecFile := TrimJSON(ParamValue);
+            SpecFile := JSONLineValue(RequestData[i]);
         end;
     end;
 
@@ -570,8 +568,7 @@ begin
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            ParamValue := TrimJSON(ParamValue);
-            SpecFile := ParamValue;
+            SpecFile := JSONLineValue(RequestData[i]);
         end;
     end;
 
@@ -600,16 +597,14 @@ begin
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            ParamValue := TrimJSON(ParamValue);
-            LibraryPath := ParamValue;
+            LibraryPath := JSONLineValue(RequestData[i]);
         end
         // Look for symbol_name
         else if (Pos('"symbol_name"', RequestData[i]) > 0) then
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            ParamValue := TrimJSON(ParamValue);
-            SymbolName := ParamValue;
+            SymbolName := JSONLineValue(RequestData[i]);
         end;
     end;
 
@@ -844,8 +839,7 @@ begin
         begin
             // Found the outjob_path parameter
             ParamValue := Copy(RequestData[i], Pos(':', RequestData[i]) + 1, Length(RequestData[i]));
-            ParamValue := TrimJSON(ParamValue);
-            OutJobPath := ParamValue;
+            OutJobPath := JSONLineValue(RequestData[i]);
             break;
         end;
     end;
@@ -925,12 +919,12 @@ begin
             if (Pos('"footprint_name"', RequestData[i]) > 0) then
             begin
                 ValueStart := Pos(':', RequestData[i]) + 1;
-                FootprintName := TrimJSON(Copy(RequestData[i], ValueStart, Length(RequestData[i])));
+                FootprintName := JSONLineValue(RequestData[i]);
             end
             else if (Pos('"description"', RequestData[i]) > 0) then
             begin
                 ValueStart := Pos(':', RequestData[i]) + 1;
-                Description := TrimJSON(Copy(RequestData[i], ValueStart, Length(RequestData[i])));
+                Description := JSONLineValue(RequestData[i]);
             end
             else if (Pos('"courtyard_x_mm"', RequestData[i]) > 0) then
             begin
@@ -988,16 +982,14 @@ begin
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            ParamValue := TrimJSON(ParamValue);
-            LibraryPath := ParamValue;
+            LibraryPath := JSONLineValue(RequestData[i]);
         end
         // Look for symbol_name
         else if (Pos('"symbol_name"', RequestData[i]) > 0) then
         begin
             ValueStart := Pos(':', RequestData[i]) + 1;
             ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-            ParamValue := TrimJSON(ParamValue);
-            SymbolName := ParamValue;
+            SymbolName := JSONLineValue(RequestData[i]);
         end;
     end;
 
@@ -1009,6 +1001,81 @@ begin
     begin
         Result := 'ERROR: No symbol name provided for search_library_symbol';
     end;
+end;
+
+// get_erc_violations: optional "compile" parameter (default true)
+function ExecuteGetERCViolations(RequestData: TStringList): String;
+var
+    i: Integer;
+    DoCompile: Boolean;
+    ParamValue: String;
+begin
+    DoCompile := True;
+    for i := 0 to RequestData.Count - 1 do
+    begin
+        if (Pos('"compile"', RequestData[i]) > 0) then
+        begin
+            ParamValue := Copy(RequestData[i], Pos(':', RequestData[i]) + 1, Length(RequestData[i]));
+            DoCompile := LowerCase(TrimJSON(ParamValue)) <> 'false';
+        end;
+    end;
+    Result := GetERCViolations(ROOT_DIR, DoCompile);
+end;
+
+// get_component_primitives: "designators" array parameter
+function ExecuteGetComponentPrimitives(RequestData: TStringList): String;
+var
+    ParamValue: String;
+    i: Integer;
+    DesignatorsList: TStringList;
+begin
+    DesignatorsList := TStringList.Create;
+    try
+        for i := 0 to RequestData.Count - 1 do
+        begin
+            if (Pos('"designators"', RequestData[i]) > 0) then
+            begin
+                i := i + 1;
+                while (i < RequestData.Count) and (Pos(']', RequestData[i]) = 0) do
+                begin
+                    ParamValue := RequestData[i];
+                    ParamValue := StringReplace(ParamValue, '"', '', REPLACEALL);
+                    ParamValue := StringReplace(ParamValue, ',', '', REPLACEALL);
+                    ParamValue := Trim(ParamValue);
+                    if (ParamValue <> '') and (ParamValue <> '[') then
+                        DesignatorsList.Add(ParamValue);
+                    i := i + 1;
+                end;
+                break;
+            end;
+        end;
+
+        if DesignatorsList.Count > 0 then
+            Result := GetComponentPrimitivesFromList(ROOT_DIR, DesignatorsList)
+        else
+            Result := 'ERROR: No designators given for get_component_primitives';
+    finally
+        DesignatorsList.Free;
+    end;
+end;
+
+// get_project_components: optional "include_parameters" (default false)
+function ExecuteGetProjectComponents(RequestData: TStringList): String;
+var
+    i: Integer;
+    IncludeParams: Boolean;
+    ParamValue: String;
+begin
+    IncludeParams := False;
+    for i := 0 to RequestData.Count - 1 do
+    begin
+        if (Pos('"include_parameters"', RequestData[i]) > 0) then
+        begin
+            ParamValue := Copy(RequestData[i], Pos(':', RequestData[i]) + 1, Length(RequestData[i]));
+            IncludeParams := LowerCase(TrimJSON(ParamValue)) = 'true';
+        end;
+    end;
+    Result := GetProjectComponents(ROOT_DIR, IncludeParams);
 end;
 
 // Function to execute a command with parameters
@@ -1107,6 +1174,16 @@ begin
             Result := ExecuteSearchLibrarySymbol(RequestData);
         'create_pcb_footprint':
             Result := ExecuteCreatePCBFootprint(RequestData);
+        'get_project_info':
+            Result := GetProjectInfo(ROOT_DIR);
+        'get_project_components':
+            Result := ExecuteGetProjectComponents(RequestData);
+        'get_erc_violations':
+            Result := ExecuteGetERCViolations(RequestData);
+        'get_board_summary':
+            Result := GetBoardSummary(ROOT_DIR);
+        'get_component_primitives':
+            Result := ExecuteGetComponentPrimitives(RequestData);
     else
         LogScriptError('Error: Unknown command: ' + CommandName);
     end;
@@ -1136,9 +1213,9 @@ begin
     ValueStart := Pos(':', Line) + 1;
     ParamValue := Copy(Line, ValueStart, Length(Line) - ValueStart + 1);
 
-    // Trim only if it's not an array
+    // Decode it only if it's not an array (keeps commas, decodes escapes)
     if (Pos('[', ParamValue) = 0) then
-        ParamValue := TrimJSON(ParamValue);
+        ParamValue := JSONLineValue(Line);
 
     // Add to parameters list
     if (ParamName <> '') and (ParamName <> 'command') then
