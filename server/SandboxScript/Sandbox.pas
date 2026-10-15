@@ -44,7 +44,33 @@ begin
 
     try
         // === BEGIN EXPERIMENT (rewritten by the run_altium_script tool) ===
-        SandboxLog('no script loaded');
+        Obj2 := SchServer.SchObjectFactory(82, 1);
+        SandboxLog('Checking wire name/comment properties');
+        if Obj2.Comment <> nil then
+            SandboxLog('Obj2.Comment: ' + Obj2.Comment.Text)
+        else
+            SandboxLog('Obj2.Comment is nil');
+
+        if Obj2.Description <> nil then
+            SandboxLog('Obj2.Description: ' + Obj2.Description.Text)
+        else
+            SandboxLog('Obj2.Description is nil');
+
+        // Check child parameters
+        List1 := TStringList.Create;
+        Iter := Obj2.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eParameter));
+        Prim := Iter.FirstSchObject;
+        while Prim <> nil do
+        begin
+            List1.Add(Prim.Name + '=' + Prim.Text);
+            Prim := Iter.NextSchObject;
+        end;
+        Obj2.SchIterator_Destroy(Iter);
+        SandboxLog('Child params: ' + List1.CommaText);
+        List1.Free;
+
+        ResultText := '{"done": true}';
         // === END EXPERIMENT ===
     except
         SandboxLog('EXCEPTION escaped the script body');

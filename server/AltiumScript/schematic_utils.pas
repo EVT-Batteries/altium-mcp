@@ -2022,6 +2022,9 @@ var
     WireDes     : String;
     NetName     : String;
     i, fld, vtx : Integer;
+    P, DocIdx   : Integer;
+    Project     : IProject;
+    Doc         : IDocument;
     Obj         : ISch_GraphicalObject;
     WireCount   : Integer;
     NcCount     : Integer;
@@ -2036,6 +2039,37 @@ begin
     end;
 
     TargetDoc := SchServer.GetCurrentSchDocument;
+    if (TargetDoc = nil) then
+    begin
+        for P := -1 to GetWorkspace.DM_ProjectCount - 1 do
+        begin
+            if P < 0 then
+                Project := GetWorkspace.DM_FocusedProject
+            else
+            begin
+                Project := GetWorkspace.DM_Projects(P);
+                if (Project = nil) or (Project = GetWorkspace.DM_FocusedProject) then Continue;
+            end;
+            if Project <> nil then
+            begin
+                for DocIdx := 0 to Project.DM_LogicalDocumentCount - 1 do
+                begin
+                    Doc := Project.DM_LogicalDocuments(DocIdx);
+                    if (Doc <> nil) and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or (Doc.DM_DocumentKind = 'SCH')) then
+                    begin
+                        Doc.DM_OpenAndFocusDocument;
+                        Sleep(500);
+                        TargetDoc := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
+                        if TargetDoc = nil then
+                            TargetDoc := SchServer.GetCurrentSchDocument;
+                        if TargetDoc <> nil then Break;
+                    end;
+                end;
+            end;
+            if TargetDoc <> nil then Break;
+        end;
+    end;
+
     if (TargetDoc = nil) then
     begin
         Result := '{"success": false, "error": "no active schematic or harness document open"}';
@@ -2075,10 +2109,19 @@ begin
                     while (GetFieldFromPipeString(Rec, fld) <> '') do
                     begin
                         vtx := vtx + 1;
-                        Obj.InsertVertex := vtx;
-                        Obj.SetState_Vertex(vtx,
-                            Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1)))));
+                        try
+                            Obj.InsertVertex(vtx);
+                            Obj.Vertex[vtx] := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
+                                                     MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
+                        except
+                            try
+                                Obj.InsertVertex := vtx;
+                                Obj.SetState_Vertex(vtx,
+                                    Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
+                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1)))));
+                            except
+                            end;
+                        end;
                         fld := fld + 2;
                     end;
 
