@@ -3,10 +3,12 @@
 Run from repo root:  python -m unittest server.tests.test_harness_parser -v
 or from server/:      python -m unittest tests.test_harness_parser -v
 """
+import json
 import os
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -196,5 +198,132 @@ class TestHarnessParser(unittest.TestCase):
         self.assertTrue(found.name.endswith((".PrjHar", ".WirDoc")))
 
 
+class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
+    """Test MCP tool fallbacks when Altium IPC bridge fails and harness is present."""
+
+    async def asyncSetUp(self):
+        # Mock altium_bridge.execute_command to simulate Altium failure or unhandled doc
+        self.bridge_patcher = patch(
+            "main.altium_bridge.execute_command",
+            new_callable=AsyncMock,
+            return_value={"success": False, "error": "No PCB document open in Altium"},
+        )
+        self.mock_bridge = self.bridge_patcher.start()
+
+    async def asyncTearDown(self):
+        self.bridge_patcher.stop()
+
+    async def test_fallback_get_project_components(self):
+        import main
+        raw = await main.get_project_components(None, include_parameters=True)
+        data = json.loads(raw)
+        self.assertIn("components", data)
+        self.assertGreaterEqual(data.get("component_count", 0), 9)
+        des_list = [c["designator"] for c in data["components"]]
+        self.assertIn("P1", des_list)
+
+    async def test_fallback_get_harness_data(self):
+        import main
+        # Auto-detects workspace project
+        raw = await main.get_harness_data(None)
+        data = json.loads(raw)
+        self.assertIn("documents", data)
+        self.assertGreater(data.get("document_count", 0), 0)
+
+        # Explicit WirDoc path
+        raw_wir = await main.get_harness_data(None, file_path=str(MAIN_WIRDOC))
+        data_wir = json.loads(raw_wir)
+        self.assertIn("connectors", data_wir)
+        self.assertIn("summary", data_wir)
+        self.assertGreaterEqual(data_wir["summary"]["connector_count"], 9)
+
+    async def test_fallback_get_all_nets(self):
+        import main
+        raw = await main.get_all_nets(None)
+        nets = json.loads(raw)
+        self.assertIsInstance(nets, list)
+        self.assertIn("BMSM1_CAN1_H", nets)
+
+    async def test_fallback_get_all_designators(self):
+        import main
+        raw = await main.get_all_designators(None)
+        des = json.loads(raw)
+        self.assertIsInstance(des, list)
+        self.assertIn("P1", des)
+
+    async def test_fallback_get_component_pins(self):
+        import main
+        raw = await main.get_component_pins(None, ["P1"])
+        pins_data = json.loads(raw)
+        self.assertEqual(len(pins_data), 1)
+        self.assertEqual(pins_data[0]["designator"], "P1")
+        self.assertEqual(len(pins_data[0]["pins"]), 26)
+
+    async def test_fallback_get_component_data(self):
+        import main
+        raw = await main.get_component_data(None, ["P1"])
+        data = json.loads(raw)
+        self.assertIn("components", data)
+        self.assertEqual(data["components"][0]["designator"], "P1")
+
+    async def test_fallback_get_schematic_data(self):
+        import main
+        raw = await main.get_schematic_data(None, ["P1"])
+        data = json.loads(raw)
+        self.assertIn("components", data)
+        self.assertEqual(len(data["components"]), 1)
+        self.assertEqual(data["components"][0]["designator"], "P1")
+
+    async def test_fallback_get_property_names_and_values(self):
+        import main
+        names_raw = await main.get_all_component_property_names(None)
+        names = json.loads(names_raw)
+        self.assertIn("PartNumber", names)
+
+        vals_raw = await main.get_component_property_values(None, "PartNumber")
+        vals = json.loads(vals_raw)
+        p1 = [v for v in vals if v.get("designator") == "P1"]
+        self.assertTrue(len(p1) > 0)
+        self.assertEqual(p1[0]["PartNumber"], "1376360-1")
+
+    async def test_fallback_get_net_connections(self):
+        import main
+        raw = await main.get_net_connections(None, ["P1"])
+        conns = json.loads(raw)
+        self.assertIn("nets", conns)
+        self.assertIsInstance(conns["nets"], list)
+        self.assertGreater(len(conns["nets"]), 0)
+
+    async def test_fallback_get_erc_violations(self):
+        import main
+        raw = await main.get_erc_violations(None)
+        erc = json.loads(raw)
+        self.assertIn("violations", erc)
+        self.assertGreater(erc.get("total", 0), 0)
+
+    async def test_fallback_get_board_summary(self):
+        import main
+        raw = await main.get_board_summary(None)
+        summary = json.loads(raw)
+        self.assertEqual(summary.get("project_type"), "harness")
+        self.assertGreaterEqual(summary.get("connector_count", 0), 9)
+
+    async def test_pcb_only_tool_error_interception(self):
+        import main
+        raw = await main.get_pcb_layers(None)
+        err = json.loads(raw)
+        self.assertIn("error", err)
+        self.assertEqual(err.get("project_type"), "harness")
+        self.assertIn("requires an active PCB layout document", err["error"])
+        self.assertIn("get_harness_data", err["error"])
+
+        raw_place = await main.place_components(
+            None, [{"designator": "R1", "x": 100, "y": 200}]
+        )
+        err_place = json.loads(raw_place)
+        self.assertEqual(err_place.get("project_type"), "harness")
+
+
 if __name__ == "__main__":
     unittest.main()
+

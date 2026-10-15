@@ -33,7 +33,7 @@
     },
     {
       "name": "get_project_components",
-      "description": "List every component of the compiled project with comment, footprint, library reference, sheet and optional parameters"
+      "description": "List every component of the compiled project or harness design (.PrjHar, .WirDoc) with comment, footprint, library reference, sheet, pinouts, and parameters"
     },
     {
       "name": "get_harness_data",
@@ -41,11 +41,11 @@
     },
     {
       "name": "get_erc_violations",
-      "description": "Compile the focused project in memory and list ERC/compiler violations by level"
+      "description": "Compile the focused project in memory and list ERC/compiler violations by level (supports PCB, schematic, and harness projects)"
     },
     {
       "name": "get_board_summary",
-      "description": "Summarise the focused PCB: outline, origin, dimensions, vias by hole size, components per side, primitives per layer and overlay texts"
+      "description": "Summarise the focused PCB (outline, origin, dimensions, vias, components) or harness project (.PrjHar/.WirDoc overview)"
     },
     {
       "name": "get_component_primitives",
@@ -53,27 +53,27 @@
     },
     {
       "name": "get_all_designators",
-      "description": "Get all component designators from the current Altium board"
+      "description": "Get all component designators from the current Altium board or active harness design"
     },
     {
       "name": "get_all_component_property_names",
-      "description": "Get all available component property names (JSON keys) from all components"
+      "description": "Get all available component property names (JSON keys) from PCB/Schematic components or harness connectors"
     },
     {
       "name": "get_component_property_values",
-      "description": "Get values of a specific property for all components"
+      "description": "Get values of a specific property for all components or harness connectors"
     },
     {
       "name": "get_component_data",
-      "description": "Get all data for components in Altium"
+      "description": "Get all data for components in Altium PCB/Schematic or harness design"
     },
     {
       "name": "get_component_pins",
-      "description": "Get pin data for components in Altium"
+      "description": "Get pin data for components in Altium PCB/Schematic, or connectors in harness wiring diagrams"
     },
     {
       "name": "get_schematic_data",
-      "description": "Get schematic data for components in Altium"
+      "description": "Get schematic data for components in Altium, with fallback to harness connector wiring data"
     },
     {
       "name": "create_schematic_symbol",
@@ -105,7 +105,7 @@
     },
     {
       "name": "get_all_nets",
-      "description": "Return every unique net name in the active PCB document"
+      "description": "Return every unique net name in the active PCB document or active harness wiring diagram (.WirDoc)"
     },
     {
       "name": "create_net_class",
@@ -153,7 +153,7 @@
     },
     {
       "name": "get_net_connections",
-      "description": "For the nets touching the given components, list every pad on each net with airline (unrouted) lengths"
+      "description": "For the nets touching the given components, list every pad on each net with airline lengths, or harness connector pin-to-net connectivity mappings"
     },
     {
       "name": "layout_duplicator",

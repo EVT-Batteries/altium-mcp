@@ -20,6 +20,8 @@ This is a Model Context Protocol (MCP) server that provides an interface to inte
 - Get me all length matching rules
 - Check my project is ready for fabrication: unsaved documents, ERC errors, and which layers my Gerber output job plots
 - Draw a schematic of an LED with a current-limiting resistor on a new sheet, using symbols from my library
+- Inspect harness wiring diagrams, connector pinouts, and net connectivity
+- Check harness design rule violations: unannotated connectors, unconnected pins, and single-pin nets
 
 ## Installing the MCP Server
 The easiest way to install is to use Claude Code, point it to this repo and ask it to install it for you. Or alternatively, see below.
@@ -126,20 +128,24 @@ The server provides several tools to interact with Altium Designer:
 
 ### Project & Validation
 - `get_project_info`: Focused project's parameters, documents with their state (`closed` / `open` / `modified` = unsaved changes in memory), schematic sheet count and variants with their variations (e.g. Not Fitted parts). Read-only; use it to confirm nothing is unsaved before generating outputs.
-- `get_project_components`: Every component of the compiled project with its schematic Comment, footprint, library reference and sheet (optionally all parameters). Use it for BOM work: the instance Comment is where generic passives keep their value, which PCB-side tools and ActiveBOM may not show.
-- `get_erc_violations`: Compile the focused project in memory (nothing is saved) and list compiler/ERC violations with their level (fatal / error / warning). Violations are read from the project object - the per-document `DM_ViolationCount` does not exist in recent Altium versions.
-- `get_board_summary`: Fabrication-oriented summary of the focused PCB in mm: board outline (bounding box, size, vertices) and origin, dimension objects, vias by hole size, components per side, primitive counts per layer (free vs. inside components, e.g. to see which mechanical layers hold the assembly outlines) and the free texts on both overlays.
+- `get_project_components`: Every component of the compiled project with its schematic Comment, footprint, library reference and sheet (optionally all parameters). For Altium Harness projects (`.PrjHar` / `.WirDoc`), automatically parses harness connectors, pin numbers, mating components, and harness parameters directly from disk.
+- `get_erc_violations`: Compile the focused project in memory (nothing is saved) and list compiler/ERC violations with their level (fatal / error / warning). For harness projects, performs native rule-checking (unconnected connector pins, single-pin nets, unannotated connectors).
+- `get_board_summary`: Fabrication-oriented summary of the focused PCB in mm (board outline, origin, dimension objects, vias, components per side, primitives per layer) or a harness system summary (connectors, total/connected pin counts, wiring documents) when run on harness projects.
 - `get_component_primitives`: Every primitive of the given components with its layer (pads with size and solder/paste mask expansion, arcs, tracks, texts). Catches footprints that were flipped to the bottom side but kept part of their copper or mask opening on the top (e.g. fiducials).
 
+### Harness & Wiring Diagrams
+- `get_harness_data`: Parse an Altium Harness Wiring Diagram (`.WirDoc`), Layout Drawing (`.LdrDoc`), or Harness Project (`.PrjHar`) directly from disk (pure Python, no Altium GUI needed) and extract harness connectors, pin numbers, signal/net mappings, parameters, and metadata. If `file_path` is omitted or empty, it automatically detects the active harness project or wiring diagram in the workspace.
+- **Harness Fallbacks & PCB Safety**: All PCB-oriented tools automatically detect harness projects. Inspection tools (`get_project_components`, `get_all_nets`, `get_all_designators`, `get_component_pins`, `get_component_data`, `get_schematic_data`, `get_net_connections`, `get_board_summary`, `get_erc_violations`) provide full offline fallbacks when run on harness designs, while PCB-only layout tools (`place_components`, `move_components`, `set_pcb_layer_visibility`, etc.) return clear, informative guidance directing the LLM to harness tools instead of generic failure errors.
+
 ### Component Information
-- `get_all_designators`: Get a list of all component designators in the current board
-- `get_all_component_property_names`: Get a list of all available component property names
-- `get_component_property_values`: Get the values of a specific property for all components
-- `get_component_data`: Get detailed data for specific components by designator
-- `get_component_pins`: Get pin information for specified components
+- `get_all_designators`: Get a list of all component designators in the current board, or all harness connector designators in an active harness project
+- `get_all_component_property_names`: Get a list of all available component property names (from PCB/Schematic components or harness connectors)
+- `get_component_property_values`: Get the values of a specific property for all components or harness connectors
+- `get_component_data`: Get detailed data for specific components by designator (supports PCB/Schematic components and harness connectors)
+- `get_component_pins`: Get pin information for specified components, including connector pin-to-net mappings from harness wiring diagrams
 
 ### Schematic/Symbol
-- `get_schematic_data`: Get schematic data for specified components
+- `get_schematic_data`: Get schematic data for specified components (with fallback to harness connector wiring data)
 - `create_schematic_symbol` ([YouTube](https://youtu.be/MMP7ZfmbCMI)): Passes pin list with pin type & coordinates to Altium script. Supports multi-part symbols (e.g. quad op-amps) via a `part_count` parameter and an `owner_part_id` field on each pin (use 0 for shared power/GND pins), active-low pin name overbars by placing a backslash after each overbarred character (e.g. `R\E\S\E\T\` renders as `RESET` with overbar), per-pin length and name/designator visibility, and an optional `graphics` list (lines, polylines, polygons, rectangles, arcs, ellipses, labels) for non-rectangular bodies like op-amp triangles and diode glyphs. When creating a symbol, the agent is instructed to first look up a similar symbol in an available library as a style reference (skipped gracefully if no library is available).
 - `get_symbol_primitives`: Inventory a .SchLib (every symbol with per-type primitive counts) or dump one symbol's complete geometry (all graphics + pin details, in mils; `symbol_name="*"` dumps every symbol). Used to gap-analyze a library, to give the agent a reference example when drawing a new symbol, and to verify recreations. The symbol creator round-trips a complete production library set exactly - 514/514 symbols across IC, connector, misc, and passives libraries (dump -> recreate -> dump -> diff, zero differences). Footprint/model links (implementations) are metadata outside the graphics round-trip.
 - `create_symbols_batch`: Create many symbols in one script run from a plain-text spec file (bulk imports/migrations) - far faster and more robust than one create call per symbol.
@@ -151,7 +157,7 @@ The server provides several tools to interact with Altium Designer:
 ![Symbol Creator](assets/symbol_creator.gif)
 
 ### Layout Operations
-- `get_all_nets`: Returns a list of unique nets from the pcb
+- `get_all_nets`: Returns a list of unique nets from the active PCB document or active harness wiring diagram (.WirDoc)
 - `create_net_class` ([YouTube](https://youtu.be/89booqRbnzQ)): Create a net class from a list of nets
 - `get_pcb_layers`: Get detailed layer information including electrical, mechanical, layer pairs, etc.
 - `get_pcb_layer_stackup`: Gets stackup info like dielectric, layer thickness, etc.
@@ -163,7 +169,7 @@ The server provides several tools to interact with Altium Designer:
 - `place_components`: Batch absolute placement - place any number of components (x, y, rotation, top/bottom layer) in a single transaction / one undo step. The workhorse for AI-driven placement.
 - `check_placement`: Verify a placement - finds overlaps and clearance violations against every other component on the board using true primitive-to-primitive distances (designator text excluded). Run after placing; a screenshot is not verification.
 - `check_orientation`: Advisory check for 2-pad passives whose rotation could be improved (e.g. a decoupling cap with its GND pad facing away from the IC). Geometry only - review suggestions with judgement; parts like pull-ups don't care.
-- `get_net_connections`: For the nets touching a set of components, list every pad on each net board-wide with per-net airline (MST) lengths - the data behind connectivity-driven placement (shorten critical nets, see off-cluster loads and filter banks).
+- `get_net_connections`: For the nets touching a set of components, list every pad on each net board-wide with per-net airline (MST) lengths, or harness connector pin-to-net connectivity mappings.
 - `layout_duplicator` ([YouTube](https://youtu.be/HD-A_8iVV70)): Starts layout duplication assuming you have already selected the source components on the PCB.
 - `layout_duplicator_apply`: Action #2 of `layout_duplicator`. Agent will use part info automatically to predict the match between source and destination components, then will send those matches to the place script.
 
@@ -210,6 +216,7 @@ Files exchanged with the scripts are read and written the way Altium does: in th
 - [daescobarh](https://github.com/daescobarh) — project validation tools (`get_project_info`, `get_project_components`, `get_erc_violations`, `get_board_summary`, `get_component_primitives`, `get_outjob_settings`) and safer dialog dismissal ([PR #18](https://github.com/coffeenmusic/altium-mcp/pull/18))
 - [coffeedust](https://github.com/coffeedust) — `create_pcb_footprint` tool for PcbLib automation ([PR #7](https://github.com/coffeenmusic/altium-mcp/pull/7))
 - [fwolter](https://github.com/fwolter) — Fix JSON parsing error when the decimal separator is a comma ([PR #3](https://github.com/coffeenmusic/altium-mcp/pull/3))
+- [Felix / EVT] — Harness project (`.PrjHar`), wiring diagram (`.WirDoc`), and layout (`.LdrDoc`) parser (`get_harness_data`), netlist connectivity extraction, and harness fallbacks across all inspection tools
 
 ## Disclaimer
 This is a third-party integration and not made by Altium. Made by [coffeenmusic](https://x.com/coffeenmusic)

@@ -477,7 +477,7 @@ async def _pcb_only_tool_error(tool_name: str, original_error: str) -> Optional[
 @mcp.tool()
 async def get_all_component_property_names(ctx: Context) -> str:
     """
-    Get all available component property names (JSON keys) from all components
+    Get all available component property names (JSON keys) from PCB/Schematic components or harness connectors.
     
     Returns:
         str: JSON array with all unique property names
@@ -537,7 +537,7 @@ async def get_all_component_property_names(ctx: Context) -> str:
 @mcp.tool()
 async def get_component_property_values(ctx: Context, property_name: str) -> str:
     """
-    Get values of a specific property for all components
+    Get values of a specific property for all components (PCB/Schematic or harness connectors).
     
     Args:
         property_name (str): The name of the property to get values for
@@ -836,13 +836,13 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
 @mcp.tool()
 async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
     """
-    Get schematic data for components in Altium
+    Get schematic data for components in Altium (or connectors in harness wiring documents).
     
     Args:
-        cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "U3"])
+        cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "P1"])
     
     Returns:
-        str: JSON object with schematic component data for requested designators
+        str: JSON object with schematic/connector component data for requested designators
     """
     logger.info(f"Getting schematic data for components: {cmp_designators}")
     
@@ -997,10 +997,10 @@ async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: boo
 @mcp.tool()
 async def get_component_data(ctx: Context, cmp_designators: list) -> str:
     """
-    Get all data for components in Altium
+    Get all data for components in Altium PCB/Schematic or harness design.
     
     Args:
-        cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "U3"])
+        cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "P1"])
     
     Returns:
         str: JSON object with all component data for requested designators
@@ -1182,10 +1182,10 @@ async def get_all_designators(ctx: Context) -> str:
 @mcp.tool()
 async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
     """
-    Get pin data for components in Altium
+    Get pin data for components in Altium PCB/Schematic, or connectors in harness wiring diagrams.
     
     Args:
-        cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "U3"])
+        cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "P1"])
 
     Returns:
         str: JSON array, one entry per component with pins list
@@ -2058,16 +2058,13 @@ def _mst_length(points: list) -> float:
 async def get_net_connections(ctx: Context, cmp_designators: list = None, max_pads_per_net: int = 40) -> str:
     """
     Get net connectivity and airline (unrouted connection) lengths for the
-    nets touching the given components.
+    nets touching the given components (supports PCB layout and harness wiring).
 
     Use this to plan or score a placement: it shows every pad on each net -
     including pads of OTHER components outside the given set (e.g. an input
     filter the cluster must connect to) - plus the net's minimum-spanning-tree
-    airline length in mils. Shorter airlines on critical nets (switching
-    loops, input/output capacitors) mean a better placement; non-critical
-    nets (enables, set resistors, feedback dividers) may be lengthened to
-    buy routing space. Plane nets like GND have many pads and a meaningless
-    airline - judge them by proximity to plane connections instead.
+    airline length in mils. For harness projects, returns connector pin-to-net
+    mappings for all requested connector nets.
 
     Args:
         cmp_designators (list, optional): Components whose nets to analyze
