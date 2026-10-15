@@ -23,7 +23,22 @@ import glob
 import re
 
 from altium_files import read_altium_text, write_altium_text
-from harness_parser import get_harness_components, parse_prjhar, parse_wirdoc
+from harness_parser import (
+    find_workspace_harness,
+    get_harness_components,
+    get_harness_component_data,
+    get_harness_component_pins,
+    get_harness_designators,
+    get_harness_erc_violations,
+    get_harness_net_connections,
+    get_harness_nets,
+    get_harness_property_names,
+    get_harness_property_values,
+    get_harness_schematic_data,
+    get_harness_wiring_docs,
+    parse_prjhar,
+    parse_wirdoc,
+)
 from outjob_parser import parse_outjob
 
 # Configure logging
@@ -422,6 +437,43 @@ class AltiumBridge:
 # Create a global bridge instance
 altium_bridge = AltiumBridge()
 
+_last_known_project_path: Optional[str] = None
+
+
+async def _get_active_harness_path() -> Optional[Path]:
+    """Resolve active harness project (.PrjHar) or wiring diagram (.WirDoc).
+
+    Checks:
+    1. Last known project path from Altium if it was a .PrjHar
+    2. Instant workspace / directory search for .PrjHar or .WirDoc
+    """
+    global _last_known_project_path
+    if _last_known_project_path:
+        p = Path(_last_known_project_path)
+        if p.suffix.lower() == ".prjhar" and p.exists():
+            return p
+
+    return find_workspace_harness()
+
+
+async def _pcb_only_tool_error(tool_name: str, original_error: str) -> Optional[str]:
+    """If a PCB layout tool fails on a harness project, return a helpful explanation."""
+    h_path = await _get_active_harness_path()
+    if h_path:
+        return json.dumps({
+            "error": (
+                f"Command '{tool_name}' requires an active PCB layout document (.PcbDoc), "
+                f"but the active project is an Altium Harness project ({h_path.name}). "
+                "For harness wiring, connectors, pinouts, and layout data, use "
+                "'get_harness_data', 'get_project_components', 'get_schematic_data', or 'get_all_nets'."
+            ),
+            "project_type": "harness",
+            "project_path": str(h_path.resolve()),
+            "original_error": original_error,
+        }, indent=2)
+    return None
+
+
 @mcp.tool()
 async def get_all_component_property_names(ctx: Context) -> str:
     """
@@ -439,15 +491,25 @@ async def get_all_component_property_names(ctx: Context) -> str:
     )
     
     # Check for success
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting component data: {error_msg}")
-        return json.dumps({"error": f"Failed to get component data: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            property_list = get_harness_property_names(h_path)
+            logger.info(f"Found {len(property_list)} unique harness property names")
+            return json.dumps(property_list, indent=2)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting component data: {error_msg}")
+            return json.dumps({"error": f"Failed to get component data: {error_msg}"})
     
     # Get the component data
     components_data = response.get("result", [])
     
     if not components_data:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            property_list = get_harness_property_names(h_path)
+            return json.dumps(property_list, indent=2)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
     
@@ -492,15 +554,25 @@ async def get_component_property_values(ctx: Context, property_name: str) -> str
     )
     
     # Check for success
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting component data: {error_msg}")
-        return json.dumps({"error": f"Failed to get component data: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            property_values = get_harness_property_values(h_path, property_name)
+            logger.info(f"Found {len(property_values)} harness components with property '{property_name}'")
+            return json.dumps(property_values, indent=2)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting component data: {error_msg}")
+            return json.dumps({"error": f"Failed to get component data: {error_msg}"})
     
     # Get the component data
     components_data = response.get("result", [])
     
     if not components_data:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            property_values = get_harness_property_values(h_path, property_name)
+            return json.dumps(property_values, indent=2)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
     
@@ -781,15 +853,27 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
     )
     
     # Check for success
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting schematic data: {error_msg}")
-        return json.dumps({"error": f"Failed to get schematic data: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_components = get_harness_schematic_data(h_path, cmp_designators)
+            if h_components:
+                logger.info(f"Retrieved {len(h_components)} harness schematic components as fallback")
+                return json.dumps({"components": h_components}, indent=2, ensure_ascii=False)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting schematic data: {error_msg}")
+            return json.dumps({"error": f"Failed to get schematic data: {error_msg}"})
     
     # Get the schematic data
     schematic_data = response.get("result", [])
     
     if not schematic_data:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_components = get_harness_schematic_data(h_path, cmp_designators)
+            if h_components:
+                return json.dumps({"components": h_components}, indent=2, ensure_ascii=False)
         logger.info("No schematic data found")
         return json.dumps({"error": "No schematic data found"})
     
@@ -815,6 +899,13 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
             if not found:
                 missing_designators.append(designator)
         
+        if not components and missing_designators:
+            h_path = await _get_active_harness_path()
+            if h_path:
+                h_components = get_harness_schematic_data(h_path, cmp_designators)
+                if h_components:
+                    return json.dumps({"components": h_components}, indent=2, ensure_ascii=False)
+
         result = {
             "components": components,
         }
@@ -849,6 +940,9 @@ async def get_pcb_layers(ctx: Context) -> str:
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("get_pcb_layers", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error getting PCB layers: {error_msg}")
         return json.dumps({"error": f"Failed to get PCB layers: {error_msg}"})
     
@@ -888,6 +982,9 @@ async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: boo
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("set_pcb_layer_visibility", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error setting layer visibility: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to set layer visibility: {error_msg}"})
     
@@ -917,15 +1014,27 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
     )
     
     # Check for success
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting component data: {error_msg}")
-        return json.dumps({"error": f"Failed to get component data: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_data = get_harness_component_data(h_path, cmp_designators)
+            if h_data.get("components"):
+                logger.info(f"Retrieved {len(h_data['components'])} harness components as fallback")
+                return json.dumps(h_data, indent=2, ensure_ascii=False)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting component data: {error_msg}")
+            return json.dumps({"error": f"Failed to get component data: {error_msg}"})
     
     # Get the component data
     component_data = response.get("result", [])
     
     if not component_data:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_data = get_harness_component_data(h_path, cmp_designators)
+            if h_data.get("components"):
+                return json.dumps(h_data, indent=2, ensure_ascii=False)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
     
@@ -951,6 +1060,13 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
             if not found:
                 missing_designators.append(designator)
         
+        if not components and missing_designators:
+            h_path = await _get_active_harness_path()
+            if h_path:
+                h_data = get_harness_component_data(h_path, cmp_designators)
+                if h_data.get("components"):
+                    return json.dumps(h_data, indent=2, ensure_ascii=False)
+
         result = {
             "components": components,
         }
@@ -984,6 +1100,9 @@ async def get_selected_components_coordinates(ctx: Context) -> str:
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("get_selected_components_coordinates", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error getting selected components coordinates: {error_msg}")
         return json.dumps({"error": f"Failed to get selected components coordinates: {error_msg}"})
     
@@ -1000,10 +1119,10 @@ async def get_selected_components_coordinates(ctx: Context) -> str:
 @mcp.tool()
 async def get_all_designators(ctx: Context) -> str:
     """
-    Get all component designators from the current Altium board
+    Get all component designators from the current Altium board or harness
     
     Returns:
-        str: JSON array of all component designators on the current board
+        str: JSON array of all component designators on the current board/harness
     """
     logger.info("Getting all component designators")
     
@@ -1014,15 +1133,27 @@ async def get_all_designators(ctx: Context) -> str:
     )
     
     # Check for success
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting component data: {error_msg}")
-        return json.dumps({"error": f"Failed to get component data: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_designators = get_harness_designators(h_path)
+            if h_designators:
+                logger.info(f"Retrieved {len(h_designators)} harness designators as fallback")
+                return json.dumps(h_designators)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting component data: {error_msg}")
+            return json.dumps({"error": f"Failed to get component data: {error_msg}"})
     
     # Get the component data
     component_data = response.get("result", [])
     
     if not component_data:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_designators = get_harness_designators(h_path)
+            if h_designators:
+                return json.dumps(h_designators)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
     
@@ -1035,6 +1166,12 @@ async def get_all_designators(ctx: Context) -> str:
         
         # Extract designators
         designators = [comp.get("designator") for comp in component_list if "designator" in comp]
+        if not designators:
+            h_path = await _get_active_harness_path()
+            if h_path:
+                h_designators = get_harness_designators(h_path)
+                if h_designators:
+                    return json.dumps(h_designators)
         
         logger.info(f"Found {len(designators)} designators")
         return json.dumps(designators)
@@ -1046,22 +1183,12 @@ async def get_all_designators(ctx: Context) -> str:
 async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
     """
     Get pin data for components in Altium
-
+    
     Args:
         cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "U3"])
 
     Returns:
-        str: JSON array, one entry per component with its placement info
-             (x/y in mils relative to the board origin, rotation in degrees
-             counterclockwise, layer) and a "pins" list. Per pin:
-             - x/y: absolute pad position (mils, relative to board origin)
-             - dx/dy: pad offset from the component origin in the footprint's
-               rotation-0 frame. To predict a pad position for a planned
-               placement: mirror dx (dx = -dx) if placing on the bottom layer,
-               rotate (dx, dy) counterclockwise by the planned rotation, then
-               add the planned component x/y.
-             - rotation: the pad's own rotation (NOT the component rotation)
-             - net, layer, width, height, shape
+        str: JSON array, one entry per component with pins list
     """
     logger.info(f"Getting pin data for components: {cmp_designators}")
     
@@ -1072,15 +1199,27 @@ async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
     )
     
     # Check for success
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting pin data: {error_msg}")
-        return json.dumps({"error": f"Failed to get pin data: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_pins = get_harness_component_pins(h_path, cmp_designators)
+            if h_pins:
+                logger.info(f"Retrieved pin data for {len(h_pins)} harness components as fallback")
+                return json.dumps(h_pins, indent=2, ensure_ascii=False)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting pin data: {error_msg}")
+            return json.dumps({"error": f"Failed to get pin data: {error_msg}"})
     
     # Get the components pins data
     pins_data = response.get("result", [])
     
     if not pins_data:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_pins = get_harness_component_pins(h_path, cmp_designators)
+            if h_pins:
+                return json.dumps(h_pins, indent=2, ensure_ascii=False)
         logger.info(f"No pin data found for designators: {cmp_designators}")
         return json.dumps({"message": "No pin data found for the specified components"})
     
@@ -1657,7 +1796,7 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
 @mcp.tool()
 async def get_all_nets(ctx: Context) -> str:
     """
-    Return every unique net name in the active PCB document.
+    Return every unique net name in the active PCB document or harness.
 
     Returns
     -------
@@ -1668,10 +1807,17 @@ async def get_all_nets(ctx: Context) -> str:
 
     response = await altium_bridge.execute_command("get_all_nets", {})
 
-    if not response.get("success", False):
-        error_msg = response.get("error", "Unknown error")
-        logger.error(f"Error getting nets: {error_msg}")
-        return json.dumps({"error": f"Failed to get nets: {error_msg}"})
+    if not response.get("success", False) or not response.get("result"):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            nets = get_harness_nets(h_path)
+            if nets:
+                logger.info(f"Retrieved {len(nets)} harness nets as fallback")
+                return json.dumps(nets, indent=2)
+        if not response.get("success", False):
+            error_msg = response.get("error", "Unknown error")
+            logger.error(f"Error getting nets: {error_msg}")
+            return json.dumps({"error": f"Failed to get nets: {error_msg}"})
 
     # Result is already a JSON‑serialisable Python list
     return json.dumps(response.get("result", []), indent=2)
@@ -1702,6 +1848,9 @@ async def create_net_class(ctx: Context, class_name: str, net_names: list) -> st
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("create_net_class", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error creating net class: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to create net class: {error_msg}"})
     
@@ -1739,6 +1888,9 @@ async def set_component_position(ctx: Context, cmp_designator: str, x: float, y:
     
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("set_component_position", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error setting component position: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to set component position: {error_msg}"})
     
@@ -1779,6 +1931,9 @@ async def move_components(ctx: Context, cmp_designators: list, x_offset: float, 
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("move_components", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error moving components: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to move components: {error_msg}"})
     
@@ -1867,6 +2022,9 @@ async def place_components(ctx: Context, placements: list) -> str:
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("place_components", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error placing components: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to place components: {error_msg}"})
 
@@ -1933,6 +2091,35 @@ async def get_net_connections(ctx: Context, cmp_designators: list = None, max_pa
     response = await altium_bridge.execute_command("get_net_connections", params)
 
     if not response.get("success", False):
+        h_path = await _get_active_harness_path()
+        if h_path:
+            h_conns = get_harness_net_connections(h_path)
+            if cmp_designators:
+                des_set = set(cmp_designators)
+                h_conns = [
+                    c for c in h_conns
+                    if any(p["designator"] in des_set for p in c["pins"])
+                ]
+            out_nets = []
+            for c in h_conns:
+                out_nets.append({
+                    "net": c["net"],
+                    "pad_count": c["pin_count"],
+                    "airline_mst_mils": None,
+                    "pads": [
+                        {
+                            "designator": p["designator"],
+                            "pin": p["pin"],
+                            "name": p["pin_name"],
+                            "sheet": p.get("sheet", ""),
+                        }
+                        for p in c["pins"]
+                    ],
+                    "source": "harness_wiring",
+                })
+            logger.info(f"Retrieved {len(out_nets)} harness net connections as fallback")
+            return json.dumps({"nets": out_nets, "source": "harness_parser"}, indent=2)
+
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error getting net connections: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to get net connections: {error_msg}"})
@@ -2029,6 +2216,9 @@ async def check_orientation(ctx: Context, cmp_designators: list = None, min_impr
     if not cmp_designators:
         sel_resp = await altium_bridge.execute_command("get_selected_components_coordinates", {})
         if not sel_resp.get("success", False):
+            h_err = await _pcb_only_tool_error("check_orientation", sel_resp.get("error", "Unknown error"))
+            if h_err:
+                return h_err
             return json.dumps({"success": False, "error": sel_resp.get("error", "Unknown error")})
         sel = sel_resp.get("result", [])
         if isinstance(sel, str):
@@ -2039,6 +2229,9 @@ async def check_orientation(ctx: Context, cmp_designators: list = None, min_impr
 
     pins_resp = await altium_bridge.execute_command("get_component_pins", {"designators": cmp_designators})
     if not pins_resp.get("success", False):
+        h_err = await _pcb_only_tool_error("check_orientation", pins_resp.get("error", "Unknown error"))
+        if h_err:
+            return h_err
         return json.dumps({"success": False, "error": pins_resp.get("error", "Unknown error")})
     comps = pins_resp.get("result", [])
     if isinstance(comps, str):
@@ -2159,6 +2352,9 @@ async def check_placement(ctx: Context, cmp_designators: list = None, clearance_
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("check_placement", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error checking placement: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to check placement: {error_msg}"})
 
@@ -2474,6 +2670,9 @@ async def layout_duplicator(ctx: Context) -> str:
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("layout_duplicator", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error in layout duplication selection: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to start layout duplication: {error_msg}"})
     
@@ -2523,6 +2722,9 @@ async def layout_duplicator_apply(ctx: Context, source_designators: list, destin
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("layout_duplicator_apply", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error applying layout duplication: {error_msg}")
         return json.dumps({"success": False, "error": f"Failed to apply layout duplication: {error_msg}"})
     
@@ -2551,6 +2753,9 @@ async def get_pcb_rules(ctx: Context) -> str:
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("get_pcb_rules", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error getting PCB rules: {error_msg}")
         return json.dumps({"error": f"Failed to get PCB rules: {error_msg}"})
     
@@ -2584,6 +2789,9 @@ async def get_pcb_layer_stackup(ctx: Context) -> str:
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("get_pcb_layer_stackup", error_msg)
+        if h_err:
+            return h_err
         logger.error(f"Error getting PCB layer stackup: {error_msg}")
         return json.dumps({"error": f"Failed to get PCB layer stackup: {error_msg}"})
     
@@ -2667,15 +2875,18 @@ async def get_outjob_settings(ctx: Context, outjob_path: str) -> str:
 
 
 @mcp.tool()
-async def get_harness_data(ctx: Context, file_path: str) -> str:
+async def get_harness_data(ctx: Context, file_path: str = "") -> str:
     """
     Read an Altium Harness Wiring Diagram (.WirDoc) or Harness Project (.PrjHar).
 
     Works without Altium GUI and on files that are not open. It extracts
     connectors, pins, wires, and connected net labels directly from the document.
+    If file_path is omitted or empty, it automatically detects the active harness
+    project or wiring diagram in the workspace.
 
     Args:
-        file_path (str): Full path to the .WirDoc, .LdrDoc, or .PrjHar file
+        file_path (str, optional): Full path to the .WirDoc, .LdrDoc, or .PrjHar file.
+            Defaults to empty string (auto-detect).
 
     Returns:
         str: JSON with file_path, summary (connector_count, total_pins,
@@ -2684,9 +2895,20 @@ async def get_harness_data(ctx: Context, file_path: str) -> str:
              and net_labels.
     """
     try:
-        p = Path(file_path)
-        if not p.exists():
-            return json.dumps({"error": f"File not found: {file_path}"})
+        p: Optional[Path] = None
+        if file_path and file_path.strip():
+            p = Path(file_path.strip())
+        else:
+            p = await _get_active_harness_path()
+
+        if not p or not p.exists():
+            return json.dumps({
+                "error": (
+                    f"File not found: '{file_path}'. No active harness project (.PrjHar) "
+                    "or wiring diagram (.WirDoc) detected in the current workspace."
+                )
+            })
+
         if p.suffix.lower() == ".prjhar":
             data = parse_prjhar(p)
         elif p.suffix.lower() in [".wirdoc", ".ldrdoc"]:
@@ -2727,7 +2949,41 @@ async def get_project_info(ctx: Context) -> str:
              [{name, variations [{designator, kind}]}] where kind is
              "not_fitted" or "alternate"
     """
-    return await _simple_command("get_project_info", {}, "project info")
+    response = await altium_bridge.execute_command("get_project_info", {})
+    if response.get("success", False):
+        result = response.get("result", {})
+        global _last_known_project_path
+        if isinstance(result, str):
+            try:
+                res_dict = json.loads(result)
+                if "project_path" in res_dict:
+                    _last_known_project_path = res_dict["project_path"]
+            except Exception:
+                pass
+        elif isinstance(result, dict) and "project_path" in result:
+            _last_known_project_path = result["project_path"]
+        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+
+    # Fallback for offline harness projects
+    try:
+        h_path = await _get_active_harness_path()
+        if h_path and h_path.suffix.lower() == ".prjhar":
+            data = parse_prjhar(h_path)
+            return json.dumps({
+                "project_path": data["project_path"],
+                "parameters": [{"name": k, "value": v} for k, v in data["parameters"].items()],
+                "schematic_sheet_count": len([d for d in data["documents"] if d["kind"] == "HarnessWiringDiagram"]),
+                "modified_document_count": 0,
+                "documents": [{"path": d["path"], "kind": d["kind"], "state": "closed"} for d in data["documents"]],
+                "variants": [],
+                "source": "harness_parser_fallback",
+            }, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Project info harness fallback failed: {e}")
+
+    error_msg = response.get("error", "Unknown error")
+    logger.error(f"Error getting project info: {error_msg}")
+    return json.dumps({"error": f"Failed to get project info: {error_msg}"})
 
 
 @mcp.tool()
@@ -2755,21 +3011,16 @@ async def get_project_components(ctx: Context, include_parameters: bool = False)
         result = response.get("result", {})
         return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
 
-    # Fallback for Harness projects (.PrjHar) where compile returns no flattened document
+    # Fallback for Harness projects (.PrjHar / .WirDoc)
     try:
-        info_resp = await altium_bridge.execute_command("get_project_info", {})
-        if info_resp.get("success", False):
-            info_result = info_resp.get("result", {})
-            if isinstance(info_result, str):
-                info_result = json.loads(info_result)
-            prj_path = info_result.get("project_path", "")
-            if prj_path and Path(prj_path).suffix.lower() == ".prjhar":
-                components = get_harness_components(prj_path)
-                return json.dumps({
-                    "component_count": len(components),
-                    "components": components,
-                    "source": "harness_parser",
-                }, indent=2, ensure_ascii=False)
+        h_path = await _get_active_harness_path()
+        if h_path:
+            components = get_harness_components(h_path, include_parameters=include_parameters)
+            return json.dumps({
+                "component_count": len(components),
+                "components": components,
+                "source": "harness_parser",
+            }, indent=2, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"Harness fallback failed: {e}")
 
@@ -2784,7 +3035,9 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
     Compile the focused project and list its ERC/compiler violations.
 
     Compiling works in memory and does not save any document (Altium may
-    refresh the derived .PrjPcbStructure file).
+    refresh the derived .PrjPcbStructure file). For harness projects (.PrjHar),
+    performs native rule-checking (unconnected pins, single pin nets, unannotated
+    connectors).
 
     Args:
         compile (bool): Compile before reading (default True). False returns
@@ -2794,25 +3047,65 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
         str: JSON with total, fatal, errors, warnings and violations
              [{level, type, detail}]
     """
-    return await _simple_command("get_erc_violations", {"compile": compile}, "ERC violations")
+    response = await altium_bridge.execute_command("get_erc_violations", {"compile": compile})
+    if response.get("success", False):
+        result = response.get("result", {})
+        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+
+    # Fallback for harness projects where compilation returns no flattened document
+    try:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            violations = get_harness_erc_violations(h_path)
+            return json.dumps(violations, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"ERC harness fallback failed: {e}")
+
+    error_msg = response.get("error", "Unknown error")
+    logger.error(f"Error getting ERC violations: {error_msg}")
+    return json.dumps({"error": f"Failed to get ERC violations: {error_msg}"})
 
 
 @mcp.tool()
 async def get_board_summary(ctx: Context) -> str:
     """
-    Summarise the focused PCB for fabrication checks.
+    Summarise the focused PCB for fabrication checks (or harness overview).
 
     Read-only. Coordinates are millimetres relative to the board origin.
+    If the active project is an Altium Harness project, returns a harness
+    system summary instead.
 
     Returns:
-        str: JSON with pcb_path, board origin (absolute), board_outline
-             (bounding box, width, height, vertex count), dimensions (cotas)
-             with their extents, via_count and vias_by_hole, components per
-             side, layer_contents (primitive count per layer, split into free
-             objects and objects inside components) and overlay_texts (free
-             texts on Top/Bottom Overlay, e.g. board name and revision)
+        str: JSON with PCB or Harness summary metrics.
     """
-    return await _simple_command("get_board_summary", {}, "board summary")
+    response = await altium_bridge.execute_command("get_board_summary", {})
+    if response.get("success", False):
+        result = response.get("result", {})
+        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+
+    # Fallback for harness projects
+    try:
+        h_path = await _get_active_harness_path()
+        if h_path:
+            w_docs = get_harness_wiring_docs(h_path)
+            components = get_harness_components(h_path)
+            nets = get_harness_nets(h_path)
+            return json.dumps({
+                "project_type": "harness",
+                "message": "Active project is an Altium Harness project (no PCB board)",
+                "project_path": str(h_path.resolve()),
+                "harness_documents": [d.name for d in w_docs],
+                "connector_count": len(components),
+                "unique_nets_count": len(nets),
+                "connectors": [c["designator"] for c in components],
+                "source": "harness_summary",
+            }, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Board summary harness fallback failed: {e}")
+
+    error_msg = response.get("error", "Unknown error")
+    logger.error(f"Error getting board summary: {error_msg}")
+    return json.dumps({"error": f"Failed to get board summary: {error_msg}"})
 
 
 @mcp.tool()
@@ -2832,8 +3125,16 @@ async def get_component_primitives(ctx: Context, designators: list) -> str:
              rotation, primitives [{type, layer, ...}]}] and
              missing_designators
     """
-    return await _simple_command("get_component_primitives", {"designators": designators},
-                                 "component primitives")
+    response = await altium_bridge.execute_command("get_component_primitives", {"designators": designators})
+    if not response.get("success", False):
+        error_msg = response.get("error", "Unknown error")
+        h_err = await _pcb_only_tool_error("get_component_primitives", error_msg)
+        if h_err:
+            return h_err
+        logger.error(f"Error getting component primitives: {error_msg}")
+        return json.dumps({"error": f"Failed to get component primitives: {error_msg}"})
+    result = response.get("result", {})
+    return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
 
 
 @mcp.tool()

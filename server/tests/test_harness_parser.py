@@ -102,6 +102,99 @@ class TestHarnessParser(unittest.TestCase):
         self.assertIn("P1", des_list)
         self.assertIn("P2", des_list)
 
+    def test_get_harness_designators(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import get_harness_designators
+        designators = get_harness_designators(MAIN_WIRDOC)
+        self.assertIn("P1", designators)
+        self.assertIn("P2", designators)
+        self.assertIn("P3", designators)
+
+    def test_get_harness_component_data(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import get_harness_component_data
+        res = get_harness_component_data(MAIN_WIRDOC, ["P1", "NON_EXISTENT"])
+        self.assertEqual(len(res["components"]), 1)
+        self.assertEqual(res["components"][0]["designator"], "P1")
+        self.assertIn("parameters", res["components"][0])
+        self.assertEqual(res["components"][0]["parameters"].get("PartNumber"), "1376360-1")
+        self.assertIn("NON_EXISTENT", res.get("missing_designators", []))
+
+    def test_get_harness_schematic_data(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import get_harness_schematic_data
+        res = get_harness_schematic_data(MAIN_WIRDOC, ["P1"])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["designator"], "P1")
+        self.assertEqual(res[0]["sheet"], "P42C-1_Main_Harness.WirDoc")
+        self.assertGreaterEqual(len(res[0]["pins"]), 26)
+
+    def test_get_harness_component_pins(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import get_harness_component_pins
+        res = get_harness_component_pins(MAIN_WIRDOC, ["P1"])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["designator"], "P1")
+        self.assertEqual(len(res[0]["pins"]), 26)
+        pin1 = [p for p in res[0]["pins"] if p["designator"] == "1"][0]
+        self.assertEqual(pin1["net"], "BMSM1_ALWAYS_ON_PWR")
+
+    def test_get_harness_nets_and_connections(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import get_harness_net_connections, get_harness_nets
+        nets = get_harness_nets(MAIN_WIRDOC)
+        self.assertIn("BMSM1_CAN1_H", nets)
+        self.assertIn("BMSM1_ALWAYS_ON_PWR", nets)
+
+        conns = get_harness_net_connections(MAIN_WIRDOC, ["BMSM1_CAN1_H"])
+        self.assertEqual(len(conns), 1)
+        self.assertEqual(conns[0]["net"], "BMSM1_CAN1_H")
+        self.assertEqual(conns[0]["pins"][0]["designator"], "P1")
+
+    def test_get_harness_property_names_and_values(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import (
+            get_harness_property_names,
+            get_harness_property_values,
+        )
+        prop_names = get_harness_property_names(MAIN_WIRDOC)
+        self.assertIn("PartNumber", prop_names)
+        self.assertIn("Manufacturer 1", prop_names)
+        self.assertIn("designator", prop_names)
+
+        values = get_harness_property_values(MAIN_WIRDOC, "PartNumber")
+        p1_val = [v["PartNumber"] for v in values if v["designator"] == "P1"]
+        self.assertEqual(p1_val, ["1376360-1"])
+
+    def test_get_harness_erc_violations(self):
+        if not MAIN_WIRDOC.exists():
+            self.skipTest("Sample WirDoc not found in workspace")
+
+        from harness_parser import get_harness_erc_violations
+        erc = get_harness_erc_violations(MAIN_WIRDOC)
+        self.assertGreater(erc["total"], 0)
+        self.assertGreaterEqual(erc["errors"], 1)  # P? unannotated
+        unannotated = [v for v in erc["violations"] if v["type"] == "Unannotated Designator"]
+        self.assertTrue(any("P?" in v["detail"] for v in unannotated))
+
+    def test_find_workspace_harness(self):
+        from harness_parser import find_workspace_harness
+        found = find_workspace_harness()
+        self.assertIsNotNone(found)
+        self.assertTrue(found.name.endswith((".PrjHar", ".WirDoc")))
+
 
 if __name__ == "__main__":
     unittest.main()
