@@ -36,6 +36,10 @@
       "description": "List every component of the compiled project with comment, footprint, library reference, sheet and optional parameters"
     },
     {
+      "name": "get_harness_data",
+      "description": "Parse an Altium harness document (.WirDoc, .LdrDoc) or project (.PrjHar) directly from disk to extract harness connectors, pinouts, nets, parameters, and metadata"
+    },
+    {
       "name": "get_erc_violations",
       "description": "Compile the focused project in memory and list ERC/compiler violations by level"
     },

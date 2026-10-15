@@ -23,6 +23,7 @@ import glob
 import re
 
 from altium_files import read_altium_text, write_altium_text
+from harness_parser import get_harness_components, parse_prjhar, parse_wirdoc
 from outjob_parser import parse_outjob
 
 # Configure logging
@@ -2665,6 +2666,40 @@ async def get_outjob_settings(ctx: Context, outjob_path: str) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
+@mcp.tool()
+async def get_harness_data(ctx: Context, file_path: str) -> str:
+    """
+    Read an Altium Harness Wiring Diagram (.WirDoc) or Harness Project (.PrjHar).
+
+    Works without Altium GUI and on files that are not open. It extracts
+    connectors, pins, wires, and connected net labels directly from the document.
+
+    Args:
+        file_path (str): Full path to the .WirDoc, .LdrDoc, or .PrjHar file
+
+    Returns:
+        str: JSON with file_path, summary (connector_count, total_pins,
+             connected_pins, net_label_count), connectors (designator,
+             lib_reference, description, location, unique_id, pins with nets),
+             and net_labels.
+    """
+    try:
+        p = Path(file_path)
+        if not p.exists():
+            return json.dumps({"error": f"File not found: {file_path}"})
+        if p.suffix.lower() == ".prjhar":
+            data = parse_prjhar(p)
+        elif p.suffix.lower() in [".wirdoc", ".ldrdoc"]:
+            data = parse_wirdoc(p)
+        else:
+            return json.dumps({
+                "error": f"Unsupported file type '{p.suffix}'. Expected .WirDoc, .LdrDoc, or .PrjHar"
+            })
+    except Exception as e:
+        return json.dumps({"error": f"Could not parse harness document: {e}"})
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
 async def _simple_command(command: str, params: dict, what: str) -> str:
     """Run a bridge command and return its result as JSON text."""
     response = await altium_bridge.execute_command(command, params)
@@ -2698,11 +2733,11 @@ async def get_project_info(ctx: Context) -> str:
 @mcp.tool()
 async def get_project_components(ctx: Context, include_parameters: bool = False) -> str:
     """
-    List every component of the compiled project (schematic side).
+    List every component of the compiled project (schematic or harness side).
 
-    Compiles the focused project in memory first (nothing is saved). Unlike
-    the PCB component tools, this returns the schematic Comment of each
-    instance, which is where values of generic passives usually live.
+    Compiles the focused project in memory first (nothing is saved). If the focused
+    project is an Altium Harness project (.PrjHar), it automatically parses the wiring
+    diagrams (.WirDoc) directly.
 
     Args:
         include_parameters (bool): Also return every component parameter
@@ -2711,10 +2746,36 @@ async def get_project_components(ctx: Context, include_parameters: bool = False)
 
     Returns:
         str: JSON with component_count and components [{designator, comment,
-             footprint, library_reference, sheet, parameters?}]
+             footprint, library_reference, sheet, parameters?, pins?}]
     """
-    return await _simple_command("get_project_components",
-                                 {"include_parameters": include_parameters}, "project components")
+    response = await altium_bridge.execute_command(
+        "get_project_components", {"include_parameters": include_parameters}
+    )
+    if response.get("success", False):
+        result = response.get("result", {})
+        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+
+    # Fallback for Harness projects (.PrjHar) where compile returns no flattened document
+    try:
+        info_resp = await altium_bridge.execute_command("get_project_info", {})
+        if info_resp.get("success", False):
+            info_result = info_resp.get("result", {})
+            if isinstance(info_result, str):
+                info_result = json.loads(info_result)
+            prj_path = info_result.get("project_path", "")
+            if prj_path and Path(prj_path).suffix.lower() == ".prjhar":
+                components = get_harness_components(prj_path)
+                return json.dumps({
+                    "component_count": len(components),
+                    "components": components,
+                    "source": "harness_parser",
+                }, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"Harness fallback failed: {e}")
+
+    error_msg = response.get("error", "Unknown error")
+    logger.error(f"Error getting project components: {error_msg}")
+    return json.dumps({"error": f"Failed to get project components: {error_msg}"})
 
 
 @mcp.tool()
