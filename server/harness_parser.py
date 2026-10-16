@@ -119,8 +119,10 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
             count = int(props.get("LocationCount", 0))
             pts = []
             for vi in range(1, count + 1):
-                if f"X{vi}" in props and f"Y{vi}" in props:
-                    pts.extend([int(props[f"X{vi}"]), int(props[f"Y{vi}"])])
+                x_val = props.get(f"X{vi}") or props.get(f"X{vi}_Frac")
+                y_val = props.get(f"Y{vi}") or props.get(f"Y{vi}_Frac")
+                if x_val is not None and y_val is not None:
+                    pts.extend([int(x_val), int(y_val)])
             wires_dict[idx] = {
                 "index": idx,
                 "designator": "?",
@@ -130,20 +132,24 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 "parameters": {},
             }
         elif rtype == "108":  # Harness Splice
+            sx = props.get("Location.X") or props.get("Location.X_Frac", 0)
+            sy = props.get("Location.Y") or props.get("Location.Y_Frac", 0)
             splices_dict[idx] = {
                 "index": idx,
                 "designator": "?",
                 "location": {
-                    "x": int(props.get("Location.X", 0)),
-                    "y": int(props.get("Location.Y", 0)),
+                    "x": int(sx),
+                    "y": int(sy),
                 },
                 "unique_id": props.get("UniqueID", ""),
                 "connected_wires_count": int(props.get("ConnectedWiresUniqueIdsCount", 0)),
             }
         elif rtype == "119":  # Harness No-Connect
+            ncx = props.get("Location.X") or props.get("Location.X_Frac", 0)
+            ncy = props.get("Location.Y") or props.get("Location.Y_Frac", 0)
             no_connects_list.append({
-                "x": int(props.get("Location.X", 0)),
-                "y": int(props.get("Location.Y", 0)),
+                "x": int(ncx),
+                "y": int(ncy),
                 "unique_id": props.get("UniqueID", ""),
             })
         elif rtype in ["34", "41"]:  # Component / Wire / Splice Parameter
