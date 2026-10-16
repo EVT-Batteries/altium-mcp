@@ -44,14 +44,7 @@ begin
 
     try
         // === BEGIN EXPERIMENT (rewritten by the run_altium_script tool) ===
-        Obj1 := Client.OpenDocument('HarnessWiringDiagram', 'C:\evt_gits\electrical-p42c-1\P42C-1_Slave_Harness\P42C-1_Slave_Sense_Harness.WirDoc');
-        if Obj1 <> nil then Client.ShowDocument(Obj1);
-        Obj2 := SchServer.GetCurrentSchDocument;
-        if Obj2 <> nil then
-            SandboxLog('CurrentSchDocument: ' + Obj2.DocumentName)
-        else
-            SandboxLog('CurrentSchDocument is nil');
-        ResultText := '{"done": true}';
+        SandboxLog('no script loaded');
         // === END EXPERIMENT ===
     except
         SandboxLog('EXCEPTION escaped the script body');
