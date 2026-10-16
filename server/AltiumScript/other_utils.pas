@@ -247,15 +247,8 @@ begin
     // ShowMessage(LogMessage); // For debugging
     
     FocusFailure := '';
-    // Retrieve the current project
-    Project := GetWorkspace.DM_FocusedProject;
-    If Project = Nil Then
-    begin
-        FocusFailure := 'No project is open';
-        Exit;
-    end;
 
-    // Check if the correct document type is already focused
+    // Check if the correct document type is already focused first
     if (DocumentKind = 'PCB') and (PCBServer <> Nil) then
     begin
         if GetBoardSafe(0) <> Nil then
@@ -300,6 +293,9 @@ begin
         end;
     end;
 
+    // Retrieve the current project if needed for searching
+    Project := GetWorkspace.DM_FocusedProject;
+
     // Try to find and focus the required document type. The focused project
     // is searched first, then every other open project: after a script run
     // the focused project is often the script project itself, which has no
@@ -313,13 +309,19 @@ begin
         Project := GetWorkspace.DM_Projects(P);
         if (Project = Nil) or (Project = GetWorkspace.DM_FocusedProject) then Continue;
       end;
+      if (Project = Nil) then Continue;
       For I := 0 to Project.DM_LogicalDocumentCount - 1 Do
       Begin
         Doc := Project.DM_LogicalDocuments(I);
-        If (Doc.DM_DocumentKind = DocumentKind) or ((DocumentKind = 'SCH') and (Doc.DM_DocumentKind = 'HarnessWiringDiagram')) Then
+        If (Doc.DM_DocumentKind = DocumentKind) or 
+           ((DocumentKind = 'SCH') and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or 
+                                        (AnsiUpperCase(ExtractFileExt(Doc.DM_FullPath)) = '.WIRDOC'))) Then
         Begin
             DocFound := True;
-            CurrentDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
+            if AnsiUpperCase(ExtractFileExt(Doc.DM_FullPath)) = '.WIRDOC' then
+                CurrentDoc := Client.OpenDocument('HarnessWiringDiagram', Doc.DM_FullPath)
+            else
+                CurrentDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
             if CurrentDoc <> nil then Client.ShowDocument(CurrentDoc)
             else Doc.DM_OpenAndFocusDocument;
             Sleep(500);
@@ -387,7 +389,8 @@ begin
                     CurrentDoc := Module.Documents[J];
                     if CurrentDoc <> nil then
                     begin
-                        if (DocumentKind = 'SCH') and ((CurrentDoc.Kind = 'SCH') or (CurrentDoc.Kind = 'HarnessWiringDiagram')) then
+                        if (DocumentKind = 'SCH') and ((Pos('.SCH', AnsiUpperCase(CurrentDoc.FileName)) > 0) or 
+                                                       (Pos('.WIR', AnsiUpperCase(CurrentDoc.FileName)) > 0)) then
                         begin
                             DocFound := True;
                             Client.ShowDocument(CurrentDoc);
@@ -395,7 +398,7 @@ begin
                             Result := True;
                             Exit;
                         end;
-                        if (DocumentKind = 'PCB') and (CurrentDoc.Kind = 'PCB') then
+                        if (DocumentKind = 'PCB') and (Pos('.PCB', AnsiUpperCase(CurrentDoc.FileName)) > 0) then
                         begin
                             DocFound := True;
                             Client.ShowDocument(CurrentDoc);
