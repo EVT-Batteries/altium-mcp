@@ -2235,10 +2235,10 @@ begin
                     begin
                         mid_x := CoordToMils((Obj.Vertex[1].X + Obj.Vertex[2].X) div 2);
                         mid_y := CoordToMils(Obj.Vertex[1].Y);
-                        des_x := mid_x;
-                        des_y := mid_y + 30;
-                        com_x := mid_x;
-                        com_y := mid_y + 10;
+                        des_x := mid_x - 200;
+                        des_y := mid_y + 15;
+                        com_x := mid_x + 200;
+                        com_y := mid_y + 15;
                     end;
 
                     try

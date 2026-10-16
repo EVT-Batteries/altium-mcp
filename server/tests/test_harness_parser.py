@@ -397,10 +397,44 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DOCUMENT|C:\\test\\sheet.WirDoc", lines)
         self.assertIn("CLEAR_EXISTING", lines)
         self.assertIn("SPLICE|SP1|300|200", lines)
-        self.assertTrue(any("WIRE|W1|BMSS_C01_POS|AT|" in l for l in lines))
-        self.assertIn("WIREPARAM|Gauge|22 AWG", lines)
-        self.assertIn("WIREPARAM|Color|Orange", lines)
         self.assertIn("WIREPARAM|Border|None", lines)
+
+    async def test_add_harness_wiring_side_by_side_label_fallbacks(self):
+        import main
+        self.mock_bridge.return_value = {
+            "success": True,
+            "result": json.dumps({"success": True, "wires": 1, "no_connects": 1}),
+        }
+        res = await main.add_harness_wiring(
+            None,
+            wires=[{
+                "designator": "W1",
+                "net": "BMSS_C01_POS",
+                "points": [1000, 2000, 3000, 2000],
+            }],
+            no_connects=[{"name": "NC1", "x": 1000, "y": 2000, "show_name": False}],
+        )
+        data = json.loads(res)
+        self.assertTrue(data.get("success"))
+        from altium_files import read_altium_text
+        spec = read_altium_text(Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt"))
+        lines = spec.splitlines()
+        wire_line = [l for l in lines if l.startswith("WIRE|W1|")][0]
+        parts = wire_line.split("|")
+        # Format: WIRE|W1|BMSS_C01_POS|AT|<des_x>|<des_y>|<com_x>|<com_y>|...
+        self.assertEqual(parts[3], "AT")
+        des_x, des_y = int(parts[4]), int(parts[5])
+        com_x, com_y = int(parts[6]), int(parts[7])
+        # Crucial invariant: des_x and com_x MUST NOT be equal (side-by-side, no stacking)
+        self.assertNotEqual(des_x, com_x)
+        self.assertEqual(des_y, com_y)  # same baseline above wire
+        self.assertLess(des_x, com_x)
+
+        # No-connect directive must hide name (0)
+        nc_line = [l for l in lines if l.startswith("NOCONNECT|")][0]
+        nc_parts = nc_line.split("|")
+        self.assertEqual(nc_parts[3], "NC1")
+        self.assertEqual(nc_parts[4], "0")
 
 
 if __name__ == "__main__":

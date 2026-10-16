@@ -1721,30 +1721,37 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
     """
     Add wires, splices, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
 
+    Coordinates Convention:
+        All coordinates (points, splices, no-connects, label positions) MUST be specified in true mils
+        (1 DXP schematic unit = 10 mils, e.g., X=1640 in Altium -> 16400 in API).
+
     Args:
         wires (list): List of wire dicts, e.g.:
             [
                 {
                     "designator": "W1",
                     "net": "BMSS_C01_POS",
-                    "points": [1670, 840, 1160, 840, 1160, 1320, 650, 1320],
+                    "points": [16700, 8400, 11600, 8400, 11600, 13200, 6500, 13200],
                     "parameters": {"Gauge": "22 AWG", "Color": "Orange", "Border": "None"},
-                    "designator_pos": [1350, 864],  # optional
-                    "comment_pos": [1350, 850]      # optional
+                    "label_position": "above",       # "above" (default) or "below"
+                    "designator_pos": [13500, 8415], # optional [x, y] in mils (side-by-side with comment)
+                    "comment_pos": [13900, 8415]     # optional [x, y] in mils
                 }
             ]
-            points are alternating x, y coordinates in mils (even length >= 4).
+            points are alternating x, y coordinates in true mils (even length >= 4).
+            If designator_pos / comment_pos are omitted, labels are automatically positioned side-by-side
+            along the longest horizontal segment (offset by +/-200 mils horizontally) to prevent text overlap.
         splices (list, optional): List of splice dicts, e.g.:
             [
-                {"designator": "SP1", "x": 780, "y": 1330}
+                {"designator": "SP1", "x": 7800, "y": 13300}
             ]
         no_connects (list): List of no-connect dicts, e.g.:
             [
-                {"x": 1670, "y": 810}
+                {"x": 16700, "y": 8100, "name": "NC1", "show_name": False}
             ]
         net_labels (list): List of net label dicts, e.g.:
             [
-                {"x": 1670, "y": 840, "orientation": 0, "text": "BMSS_C01_POS"}
+                {"x": 16700, "y": 8400, "orientation": 0, "text": "BMSS_C01_POS"}
             ]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
             and no-connect directives from the sheet before adding new ones. Defaults to False.
@@ -1804,14 +1811,14 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                 y_wire = best_seg[2]
                 if label_pos_mode == "below":
                     if not des_pos:
-                        des_pos = [mid_x, y_wire - 20]
+                        des_pos = [mid_x - 200, y_wire - 85]
                     if not com_pos:
-                        com_pos = [mid_x, y_wire - 40]
+                        com_pos = [mid_x + 200, y_wire - 85]
                 else:
                     if not des_pos:
-                        des_pos = [mid_x, y_wire + 30]
+                        des_pos = [mid_x - 200, y_wire + 15]
                     if not com_pos:
-                        com_pos = [mid_x, y_wire + 10]
+                        com_pos = [mid_x + 200, y_wire + 15]
             else:
                 xa, ya = pts[0], pts[1]
                 xb, yb = pts[2], pts[3]
