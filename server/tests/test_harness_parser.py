@@ -354,6 +354,23 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data.get("wires"), 2)
         self.assertEqual(data.get("no_connects"), 1)
 
+    async def test_add_harness_wiring_with_document_path(self):
+        import main
+        self.mock_bridge.return_value = {
+            "success": True,
+            "result": json.dumps({"success": True, "wires": 1, "no_connects": 0, "sheet": "P42C-1_Slave_Sense_Harness.WirDoc"}),
+        }
+        res = await main.add_harness_wiring(
+            None,
+            wires=[{"designator": "W1", "net": "NET1", "points": [100, 200, 300, 400]}],
+            document_path=r"C:\test\sheet.WirDoc",
+        )
+        data = json.loads(res)
+        self.assertTrue(data.get("success"))
+        from altium_files import read_altium_text
+        spec = read_altium_text(Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt"))
+        self.assertTrue(spec.startswith("DOCUMENT|C:\\test\\sheet.WirDoc"))
+
 
 if __name__ == "__main__":
     unittest.main()
