@@ -2050,6 +2050,11 @@ begin
             ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
             if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
             TargetDoc := SchServer.GetCurrentSchDocument;
+            if (TargetDoc = nil) or (AnsiUpperCase(TargetDoc.DocumentName) <> AnsiUpperCase(TargetDocPath)) then
+            begin
+                Result := '{"success": false, "error": "could not focus requested document: ' + TargetDocPath + '"}';
+                Exit;
+            end;
         end;
 
         if (TargetDoc = nil) then
