@@ -91,9 +91,12 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
     records = raw_records[1:]  # 0-indexed matches internal Altium OwnerIndex
 
     connectors: dict[int, dict[str, Any]] = {}
+    wires_dict: dict[int, dict[str, Any]] = {}
+    splices_dict: dict[int, dict[str, Any]] = {}
+    no_connects_list: list[dict[str, Any]] = []
     net_labels: list[dict[str, Any]] = []
 
-    # First pass: collect connectors, parameters, pins, and net labels
+    # First pass: collect connectors, wires, splices, parameters, pins, and net labels
     for idx, props in enumerate(records):
         rtype = props.get("RECORD")
 
@@ -112,7 +115,38 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 "pins": [],
                 "parameters": {},
             }
-        elif rtype in ["34", "41"]:  # Component Parameter (Designator, Comment, PartNumber, etc.)
+        elif rtype == "107":  # Harness Wire
+            count = int(props.get("LocationCount", 0))
+            pts = []
+            for vi in range(1, count + 1):
+                if f"X{vi}" in props and f"Y{vi}" in props:
+                    pts.extend([int(props[f"X{vi}"]), int(props[f"Y{vi}"])])
+            wires_dict[idx] = {
+                "index": idx,
+                "designator": "?",
+                "net": "?",
+                "points": pts,
+                "unique_id": props.get("UniqueID", ""),
+                "parameters": {},
+            }
+        elif rtype == "108":  # Harness Splice
+            splices_dict[idx] = {
+                "index": idx,
+                "designator": "?",
+                "location": {
+                    "x": int(props.get("Location.X", 0)),
+                    "y": int(props.get("Location.Y", 0)),
+                },
+                "unique_id": props.get("UniqueID", ""),
+                "connected_wires_count": int(props.get("ConnectedWiresUniqueIdsCount", 0)),
+            }
+        elif rtype == "119":  # Harness No-Connect
+            no_connects_list.append({
+                "x": int(props.get("Location.X", 0)),
+                "y": int(props.get("Location.Y", 0)),
+                "unique_id": props.get("UniqueID", ""),
+            })
+        elif rtype in ["34", "41"]:  # Component / Wire / Splice Parameter
             owner = int(props.get("OwnerIndex", -1))
             name = props.get("Name", "")
             val = props.get("Text", "")
@@ -124,6 +158,16 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                         connectors[owner]["parameters"][name] = val
                     if name == "Comment" and val:
                         connectors[owner]["comment"] = val
+            elif owner in wires_dict:
+                if name == "Designator" and val:
+                    wires_dict[owner]["designator"] = val
+                elif name == "Comment" and val:
+                    wires_dict[owner]["net"] = val
+                elif name:
+                    wires_dict[owner]["parameters"][name] = val
+            elif owner in splices_dict:
+                if name == "Designator" and val:
+                    splices_dict[owner]["designator"] = val
         elif rtype == "113":  # Harness Connector Pin
             owner = int(props.get("OwnerIndex", -1))
             if owner in connectors:
@@ -196,6 +240,9 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
         list(set(nl["text"] for nl in net_labels).union(nets_to_pins.keys()))
     )
 
+    wires_list = sorted(wires_dict.values(), key=lambda w: w["designator"])
+    splices_list = sorted(splices_dict.values(), key=lambda s: s["designator"])
+
     return {
         "file_path": str(Path(file_path).resolve()),
         "header": {
@@ -205,12 +252,18 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
         },
         "summary": {
             "connector_count": len(connector_list),
+            "wire_count": len(wires_list),
+            "splice_count": len(splices_list),
+            "no_connect_count": len(no_connects_list),
             "total_pins": total_pins,
             "connected_pins": connected_pins,
             "net_label_count": len(net_labels),
             "unique_net_count": len(unique_nets),
         },
         "connectors": connector_list,
+        "wires": wires_list,
+        "splices": splices_list,
+        "no_connects": no_connects_list,
         "net_labels": net_labels,
         "nets": unique_nets,
         "net_connections": nets_to_pins,

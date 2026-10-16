@@ -2012,25 +2012,55 @@ begin
     Placement.Free;
 end;
 
-// Add wires, no-connect directives, and net labels to the current wiring diagram or schematic
+function HarnessColorToTColor(ColorName: String): Integer;
+var
+    C: String;
+begin
+    C := AnsiUpperCase(ColorName);
+    if C = 'BLACK' then Result := 0
+    else if C = 'BROWN' then Result := 2763429
+    else if C = 'RED' then Result := 255
+    else if C = 'ORANGE' then Result := 42495
+    else if C = 'YELLOW' then Result := 65535
+    else if C = 'GREEN' then Result := 32768
+    else if C = 'BLUE' then Result := 16711680
+    else if C = 'VIOLET' then Result := 15631086
+    else if C = 'GRAY' then Result := 8421504
+    else if C = 'WHITE' then Result := 16777215
+    else Result := 8388608;
+end;
+
+// Add wires, splices, no-connect directives, and net labels to the current wiring diagram or schematic
 function ExecuteAddHarnessWiring(ROOT_DIR: String, SpecPath: String): String;
 var
-    Spec        : TStringList;
-    TargetDoc   : ISch_Document;
-    Rec         : String;
-    Kind        : String;
-    WireDes     : String;
-    NetName     : String;
-    i, fld, vtx : Integer;
-    P, DocIdx   : Integer;
-    Project     : IProject;
-    Doc         : IDocument;
-    ServerDoc   : IServerDocument;
-    Obj         : ISch_GraphicalObject;
-    WireCount   : Integer;
-    NcCount     : Integer;
+    Spec          : TStringList;
+    TargetDoc     : ISch_Document;
+    Rec           : String;
+    Kind          : String;
+    WireDes       : String;
+    NetName       : String;
+    i, fld, vtx   : Integer;
+    P, DocIdx     : Integer;
+    Project       : IProject;
+    Doc           : IDocument;
+    ServerDoc     : IServerDocument;
+    Obj           : ISch_GraphicalObject;
+    LastWire      : ISch_GraphicalObject;
+    WireCount     : Integer;
+    SpliceCount   : Integer;
+    NcCount       : Integer;
     NetCount      : Integer;
     TargetDocPath : String;
+    Param         : ISch_Parameter;
+    PName, PVal   : String;
+    des_x, des_y  : Integer;
+    com_x, com_y  : Integer;
+    start_fld     : Integer;
+    mid_x, mid_y  : Integer;
+    ClearExisting : Boolean;
+    DelList       : TInterfaceList;
+    Iter          : ISch_Iterator;
+    DelObj        : ISch_GraphicalObject;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
@@ -2044,19 +2074,26 @@ begin
     try
         Spec.LoadFromFile(SpecPath);
         TargetDoc := nil;
-        if (Spec.Count > 0) and (GetFieldFromPipeString(Spec[0], 0) = 'DOCUMENT') then
+        ClearExisting := False;
+
+        for i := 0 to Spec.Count - 1 do
         begin
-            TargetDocPath := GetFieldFromPipeString(Spec[0], 1);
-            ServerDoc := FindOpenDocument(TargetDocPath);
-            if (ServerDoc = nil) then
-                ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
-            if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
-            TargetDoc := SchServer.GetCurrentSchDocument;
-            if (TargetDoc = nil) or (AnsiUpperCase(TargetDoc.DocumentName) <> AnsiUpperCase(TargetDocPath)) then
+            if (GetFieldFromPipeString(Spec[i], 0) = 'DOCUMENT') then
             begin
-                Result := '{"success": false, "error": "could not focus requested document: ' + TargetDocPath + '"}';
-                Exit;
-            end;
+                TargetDocPath := GetFieldFromPipeString(Spec[i], 1);
+                ServerDoc := FindOpenDocument(TargetDocPath);
+                if (ServerDoc = nil) then
+                    ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
+                if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
+                TargetDoc := SchServer.GetCurrentSchDocument;
+                if (TargetDoc = nil) or (AnsiUpperCase(TargetDoc.DocumentName) <> AnsiUpperCase(TargetDocPath)) then
+                begin
+                    Result := '{"success": false, "error": "could not focus requested document: ' + TargetDocPath + '"}';
+                    Exit;
+                end;
+            end
+            else if (GetFieldFromPipeString(Spec[i], 0) = 'CLEAR_EXISTING') then
+                ClearExisting := True;
         end;
 
         if (TargetDoc = nil) then
@@ -2104,21 +2141,67 @@ begin
 
         SchServer.ProcessControl.PreProcess(TargetDoc, '');
 
+        if ClearExisting then
+        begin
+            DelList := TInterfaceList.Create;
+            try
+                Iter := TargetDoc.SchIterator_Create;
+                Iter.AddFilter_ObjectSet(MkSet(82, 83, 94)); // Wires, Splices, NoConnects
+                DelObj := Iter.FirstSchObject;
+                while (DelObj <> nil) do
+                begin
+                    DelList.Add(DelObj);
+                    DelObj := Iter.NextSchObject;
+                end;
+                TargetDoc.SchIterator_Destroy(Iter);
+
+                for i := 0 to DelList.Count - 1 do
+                begin
+                    DelObj := DelList[i];
+                    TargetDoc.RemoveSchObject(DelObj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, DelObj.I_ObjectAddress);
+                end;
+            finally
+                DelList.Free;
+            end;
+        end;
+
         WireCount := 0;
+        SpliceCount := 0;
         NcCount := 0;
         NetCount := 0;
+        LastWire := nil;
 
         for i := 0 to Spec.Count - 1 do
         begin
             Rec := Spec[i];
             Kind := GetFieldFromPipeString(Rec, 0);
-            if (Kind = 'DOCUMENT') then Continue;
+            if (Kind = 'DOCUMENT') or (Kind = 'CLEAR_EXISTING') then Continue;
 
             if (Kind = 'WIRE') then
             begin
-                // WIRE|<Designator>|<NetName>|x1|y1|x2|y2|...
+                // WIRE|<Designator>|<NetName>|x1|y1|... OR
+                // WIRE|<Designator>|<NetName>|AT|<des_x>|<des_y>|<com_x>|<com_y>|x1|y1|...
                 WireDes := GetFieldFromPipeString(Rec, 1);
                 NetName := GetFieldFromPipeString(Rec, 2);
+
+                if (GetFieldFromPipeString(Rec, 3) = 'AT') then
+                begin
+                    des_x := StrToInt(GetFieldFromPipeString(Rec, 4));
+                    des_y := StrToInt(GetFieldFromPipeString(Rec, 5));
+                    com_x := StrToInt(GetFieldFromPipeString(Rec, 6));
+                    com_y := StrToInt(GetFieldFromPipeString(Rec, 7));
+                    fld := 8;
+                end
+                else
+                begin
+                    des_x := 0;
+                    des_y := 0;
+                    com_x := 0;
+                    com_y := 0;
+                    fld := 3;
+                end;
 
                 Obj := SchServer.SchObjectFactory(82, 1); // eHarnessWire
                 if (Obj = nil) then
@@ -2126,9 +2209,9 @@ begin
 
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 4))));
-                    fld := 3;
+                    start_fld := fld;
+                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, start_fld))),
+                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, start_fld + 1))));
                     vtx := 0;
                     while (GetFieldFromPipeString(Rec, fld) <> '') do
                     begin
@@ -2138,7 +2221,7 @@ begin
 
                     try
                         Obj.VerticesCount := vtx;
-                        fld := 3;
+                        fld := start_fld;
                         for vtx := 1 to Obj.VerticesCount do
                         begin
                             Obj.Vertex[vtx] := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
@@ -2148,15 +2231,33 @@ begin
                     except
                     end;
 
+                    if (des_x = 0) and (des_y = 0) and (Obj.VerticesCount >= 2) then
+                    begin
+                        mid_x := CoordToMils((Obj.Vertex[1].X + Obj.Vertex[2].X) div 2);
+                        mid_y := CoordToMils(Obj.Vertex[1].Y);
+                        des_x := mid_x;
+                        des_y := mid_y + 24;
+                        com_x := mid_x;
+                        com_y := mid_y + 10;
+                    end;
+
                     try
                         if (WireDes <> '') and (Obj.Designator <> nil) then
+                        begin
                             Obj.Designator.Text := WireDes;
+                            if (des_x <> 0) or (des_y <> 0) then
+                                Obj.Designator.Location := Point(MilsToCoord(des_x), MilsToCoord(des_y));
+                        end;
                     except
                     end;
 
                     try
                         if (NetName <> '') and (Obj.Comment <> nil) then
+                        begin
                             Obj.Comment.Text := NetName;
+                            if (com_x <> 0) or (com_y <> 0) then
+                                Obj.Comment.Location := Point(MilsToCoord(com_x), MilsToCoord(com_y));
+                        end;
                     except
                     end;
 
@@ -2164,6 +2265,62 @@ begin
                     SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
                         SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
                     WireCount := WireCount + 1;
+                    LastWire := Obj;
+                end;
+            end
+            else if (Kind = 'WIREPARAM') and (LastWire <> nil) then
+            begin
+                // WIREPARAM|<ParamName>|<ParamValue>
+                PName := GetFieldFromPipeString(Rec, 1);
+                PVal  := GetFieldFromPipeString(Rec, 2);
+                try
+                    Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                    if (Param <> nil) then
+                    begin
+                        Param.Name := PName;
+                        Param.Text := PVal;
+                        Param.ParamType := eParameterType_String;
+                        Param.ReadOnlyState := eReadOnly_None;
+                        Param.IsHidden := True;
+                        LastWire.AddSchObject(Param);
+                        SchServer.RobotManager.SendMessage(LastWire.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                    end;
+                except
+                end;
+                if (AnsiUpperCase(PName) = 'COLOR') then
+                begin
+                    try
+                        LastWire.Color := HarnessColorToTColor(PVal);
+                    except
+                    end;
+                end;
+            end
+            else if (Kind = 'SPLICE') then
+            begin
+                // SPLICE|<Designator>|<x>|<y>
+                Obj := SchServer.SchObjectFactory(83, 1); // eHarnessSplice
+                if (Obj = nil) then
+                    Obj := SchServer.SchObjectFactory(eJunction, eCreate_GlobalCopy);
+
+                if (Obj <> nil) then
+                begin
+                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))),
+                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3))));
+                    try
+                        if (Obj.Designator <> nil) then
+                        begin
+                            Obj.Designator.Text := GetFieldFromPipeString(Rec, 1);
+                            Obj.Designator.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2)) + 15),
+                                                             MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3)) + 15));
+                        end;
+                    except
+                    end;
+
+                    TargetDoc.RegisterSchObjectInContainer(Obj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    SpliceCount := SpliceCount + 1;
                 end;
             end
             else if (Kind = 'NOCONNECT') then
@@ -2224,6 +2381,7 @@ begin
 
         Result := '{"success": true, "sheet": "' + ExtractFileName(TargetDoc.DocumentName) +
                   '", "wires": ' + IntToStr(WireCount) +
+                  ', "splices": ' + IntToStr(SpliceCount) +
                   ', "no_connects": ' + IntToStr(NcCount) +
                   ', "net_labels": ' + IntToStr(NetCount) + '}';
     finally

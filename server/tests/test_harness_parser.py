@@ -371,6 +371,37 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         spec = read_altium_text(Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt"))
         self.assertTrue(spec.startswith("DOCUMENT|C:\\test\\sheet.WirDoc"))
 
+    async def test_add_harness_wiring_with_splices_and_parameters(self):
+        import main
+        self.mock_bridge.return_value = {
+            "success": True,
+            "result": json.dumps({"success": True, "wires": 1, "splices": 1, "no_connects": 0}),
+        }
+        res = await main.add_harness_wiring(
+            None,
+            wires=[{
+                "designator": "W1",
+                "net": "BMSS_C01_POS",
+                "points": [100, 200, 300, 200],
+                "parameters": {"Gauge": "22 AWG", "Color": "Orange", "Border": "None"},
+            }],
+            splices=[{"designator": "SP1", "x": 300, "y": 200}],
+            clear_existing=True,
+            document_path=r"C:\test\sheet.WirDoc",
+        )
+        data = json.loads(res)
+        self.assertTrue(data.get("success"))
+        from altium_files import read_altium_text
+        spec = read_altium_text(Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt"))
+        lines = spec.splitlines()
+        self.assertIn("DOCUMENT|C:\\test\\sheet.WirDoc", lines)
+        self.assertIn("CLEAR_EXISTING", lines)
+        self.assertIn("SPLICE|SP1|300|200", lines)
+        self.assertTrue(any("WIRE|W1|BMSS_C01_POS|AT|" in l for l in lines))
+        self.assertIn("WIREPARAM|Gauge|22 AWG", lines)
+        self.assertIn("WIREPARAM|Color|Orange", lines)
+        self.assertIn("WIREPARAM|Border|None", lines)
+
 
 if __name__ == "__main__":
     unittest.main()

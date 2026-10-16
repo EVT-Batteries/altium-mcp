@@ -1713,11 +1713,13 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
 
 @mcp.tool()
 async def add_harness_wiring(ctx: Context, wires: list = None,
+                            splices: list = None,
                             no_connects: list = None,
                             net_labels: list = None,
+                            clear_existing: bool = False,
                             document_path: str = None) -> str:
     """
-    Add wires, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
+    Add wires, splices, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
 
     Args:
         wires (list): List of wire dicts, e.g.:
@@ -1725,10 +1727,17 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                 {
                     "designator": "W1",
                     "net": "BMSS_C01_POS",
-                    "points": [1670, 840, 1160, 840, 1160, 1320, 650, 1320]
+                    "points": [1670, 840, 1160, 840, 1160, 1320, 650, 1320],
+                    "parameters": {"Gauge": "22 AWG", "Color": "Orange", "Border": "None"},
+                    "designator_pos": [1350, 864],  # optional
+                    "comment_pos": [1350, 850]      # optional
                 }
             ]
             points are alternating x, y coordinates in mils (even length >= 4).
+        splices (list, optional): List of splice dicts, e.g.:
+            [
+                {"designator": "SP1", "x": 780, "y": 1330}
+            ]
         no_connects (list): List of no-connect dicts, e.g.:
             [
                 {"x": 1670, "y": 810}
@@ -1737,6 +1746,8 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
             [
                 {"x": 1670, "y": 840, "orientation": 0, "text": "BMSS_C01_POS"}
             ]
+        clear_existing (bool, optional): If True, removes existing harness wires, splices,
+            and no-connect directives from the sheet before adding new ones. Defaults to False.
         document_path (str, optional): Target document path. If omitted, uses active document.
 
     Returns:
@@ -1744,6 +1755,7 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
     """
     logger.info(
         f"Adding harness wiring: {len(wires or [])} wires, "
+        f"{len(splices or [])} splices, "
         f"{len(no_connects or [])} no-connects, "
         f"{len(net_labels or [])} net labels"
     )
@@ -1751,6 +1763,14 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
     lines = []
     if document_path:
         lines.append(f"DOCUMENT|{document_path}")
+    if clear_existing:
+        lines.append("CLEAR_EXISTING")
+
+    for s in (splices or []):
+        s_des = str(s.get("designator", "SP?")).strip()
+        sx = int(s.get("x", 0))
+        sy = int(s.get("y", 0))
+        lines.append(f"SPLICE|{s_des}|{sx}|{sy}")
 
     for w in (wires or []):
         des = str(w.get("designator", "")).strip()
@@ -1761,8 +1781,55 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                 "success": False,
                 "error": f"wire needs an even count of >=4 coords: {w}"
             })
-        pts_str = "|".join(str(int(v)) for v in pts)
-        lines.append(f"WIRE|{des}|{net}|{pts_str}")
+        pts = [int(v) for v in pts]
+        pts_str = "|".join(str(v) for v in pts)
+
+        # Compute label positions above the wire if not provided
+        des_pos = w.get("designator_pos")
+        com_pos = w.get("comment_pos")
+        if not des_pos or not com_pos:
+            best_seg = None
+            max_dx = -1
+            for k in range(0, len(pts) - 2, 2):
+                xa, ya = pts[k], pts[k + 1]
+                xb, yb = pts[k + 2], pts[k + 3]
+                if ya == yb:
+                    dx = abs(xb - xa)
+                    if dx > max_dx:
+                        max_dx = dx
+                        best_seg = (min(xa, xb), max(xa, xb), ya)
+            if best_seg and max_dx >= 40:
+                mid_x = (best_seg[0] + best_seg[1]) // 2
+                y_wire = best_seg[2]
+                if not des_pos:
+                    des_pos = [mid_x, y_wire + 24]
+                if not com_pos:
+                    com_pos = [mid_x, y_wire + 10]
+            else:
+                xa, ya = pts[0], pts[1]
+                xb, yb = pts[2], pts[3]
+                mid_y = (ya + yb) // 2
+                if not des_pos:
+                    des_pos = [xa + 15, mid_y + 12]
+                if not com_pos:
+                    com_pos = [xa + 15, mid_y - 12]
+
+        lines.append(
+            f"WIRE|{des}|{net}|AT|{int(des_pos[0])}|{int(des_pos[1])}|"
+            f"{int(com_pos[0])}|{int(com_pos[1])}|{pts_str}"
+        )
+
+        params = dict(w.get("parameters", {}))
+        if "gauge" in w and "Gauge" not in params:
+            params["Gauge"] = w["gauge"]
+        if "color" in w and "Color" not in params:
+            params["Color"] = w["color"]
+        if "border" in w and "Border" not in params:
+            params["Border"] = w["border"]
+
+        for pk, pv in params.items():
+            if pv is not None and str(pv).strip():
+                lines.append(f"WIREPARAM|{pk}|{pv}")
 
     for nc in (no_connects or []):
         x = int(nc.get("x", 0))
