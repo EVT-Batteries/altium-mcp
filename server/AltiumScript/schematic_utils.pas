@@ -2029,7 +2029,8 @@ var
     Obj         : ISch_GraphicalObject;
     WireCount   : Integer;
     NcCount     : Integer;
-    NetCount    : Integer;
+    NetCount      : Integer;
+    TargetDocPath : String;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
@@ -2039,47 +2040,61 @@ begin
         Exit;
     end;
 
-    TargetDoc := SchServer.GetCurrentSchDocument;
-    if (TargetDoc = nil) then
-    begin
-        for P := -1 to GetWorkspace.DM_ProjectCount - 1 do
-        begin
-            if P < 0 then
-                Project := GetWorkspace.DM_FocusedProject
-            else
-            begin
-                Project := GetWorkspace.DM_Projects(P);
-                if (Project = nil) or (Project = GetWorkspace.DM_FocusedProject) then Continue;
-            end;
-            if Project <> nil then
-            begin
-                for DocIdx := 0 to Project.DM_LogicalDocumentCount - 1 do
-                begin
-                    Doc := Project.DM_LogicalDocuments(DocIdx);
-                    if (Doc <> nil) and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or (Doc.DM_DocumentKind = 'SCH')) then
-                    begin
-                        ServerDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
-                        if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
-                        TargetDoc := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
-                        if TargetDoc = nil then
-                            TargetDoc := SchServer.GetCurrentSchDocument;
-                        if TargetDoc <> nil then Break;
-                    end;
-                end;
-            end;
-            if TargetDoc <> nil then Break;
-        end;
-    end;
-
-    if (TargetDoc = nil) then
-    begin
-        Result := '{"success": false, "error": "no active schematic or harness document open"}';
-        Exit;
-    end;
-
     Spec := TStringList.Create;
     try
         Spec.LoadFromFile(SpecPath);
+        TargetDoc := nil;
+        if (Spec.Count > 0) and (GetFieldFromPipeString(Spec[0], 0) = 'DOCUMENT') then
+        begin
+            TargetDocPath := GetFieldFromPipeString(Spec[0], 1);
+            ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
+            if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
+            TargetDoc := SchServer.GetCurrentSchDocument;
+        end;
+
+        if (TargetDoc = nil) then
+            TargetDoc := SchServer.GetCurrentSchDocument;
+
+        if (TargetDoc = nil) then
+        begin
+            for P := -1 to GetWorkspace.DM_ProjectCount - 1 do
+            begin
+                if P < 0 then
+                    Project := GetWorkspace.DM_FocusedProject
+                else
+                begin
+                    Project := GetWorkspace.DM_Projects(P);
+                    if (Project = nil) or (Project = GetWorkspace.DM_FocusedProject) then Continue;
+                end;
+                if Project <> nil then
+                begin
+                    for DocIdx := 0 to Project.DM_LogicalDocumentCount - 1 do
+                    begin
+                        Doc := Project.DM_LogicalDocuments(DocIdx);
+                        if (Doc <> nil) and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or (Doc.DM_DocumentKind = 'SCH')) then
+                        begin
+                            ServerDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
+                            if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
+                            if (Doc.DM_DocumentKind = 'HarnessWiringDiagram') then
+                                TargetDoc := SchServer.GetCurrentSchDocument
+                            else
+                                TargetDoc := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
+                            if TargetDoc = nil then
+                                TargetDoc := SchServer.GetCurrentSchDocument;
+                            if TargetDoc <> nil then Break;
+                        end;
+                    end;
+                end;
+                if TargetDoc <> nil then Break;
+            end;
+        end;
+
+        if (TargetDoc = nil) then
+        begin
+            Result := '{"success": false, "error": "no active schematic or harness document open"}';
+            Exit;
+        end;
+
         SchServer.ProcessControl.PreProcess(TargetDoc, '');
 
         WireCount := 0;
@@ -2090,6 +2105,7 @@ begin
         begin
             Rec := Spec[i];
             Kind := GetFieldFromPipeString(Rec, 0);
+            if (Kind = 'DOCUMENT') then Continue;
 
             if (Kind = 'WIRE') then
             begin
@@ -2187,7 +2203,7 @@ begin
         SchServer.ProcessControl.PostProcess(TargetDoc, '');
         TargetDoc.GraphicallyInvalidate;
 
-        Result := '{"success": true, "sheet": "' + TargetDoc.DocumentName +
+        Result := '{"success": true, "sheet": "' + ExtractFileName(TargetDoc.DocumentName) +
                   '", "wires": ' + IntToStr(WireCount) +
                   ', "no_connects": ' + IntToStr(NcCount) +
                   ', "net_labels": ' + IntToStr(NetCount) + '}';

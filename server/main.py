@@ -1714,7 +1714,8 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
 @mcp.tool()
 async def add_harness_wiring(ctx: Context, wires: list = None,
                             no_connects: list = None,
-                            net_labels: list = None) -> str:
+                            net_labels: list = None,
+                            document_path: str = None) -> str:
     """
     Add wires, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
 
@@ -1736,6 +1737,7 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
             [
                 {"x": 1670, "y": 840, "orientation": 0, "text": "BMSS_C01_POS"}
             ]
+        document_path (str, optional): Target document path. If omitted, uses active document.
 
     Returns:
         str: JSON string reporting placement counts and document name.
@@ -1747,6 +1749,9 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
     )
 
     lines = []
+    if document_path:
+        lines.append(f"DOCUMENT|{document_path}")
+
     for w in (wires or []):
         des = str(w.get("designator", "")).strip()
         net = str(w.get("net", "")).strip()
