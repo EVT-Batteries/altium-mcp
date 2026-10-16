@@ -1798,21 +1798,21 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                     if dx > max_dx:
                         max_dx = dx
                         best_seg = (min(xa, xb), max(xa, xb), ya)
-            if best_seg and max_dx >= 40:
+            if best_seg and max_dx >= 400:
                 mid_x = (best_seg[0] + best_seg[1]) // 2
                 y_wire = best_seg[2]
                 if not des_pos:
-                    des_pos = [mid_x, y_wire + 3]
+                    des_pos = [mid_x, y_wire + 30]
                 if not com_pos:
-                    com_pos = [mid_x, y_wire + 1]
+                    com_pos = [mid_x, y_wire + 10]
             else:
                 xa, ya = pts[0], pts[1]
                 xb, yb = pts[2], pts[3]
                 mid_y = (ya + yb) // 2
                 if not des_pos:
-                    des_pos = [xa + 2, mid_y + 2]
+                    des_pos = [xa + 20, mid_y + 20]
                 if not com_pos:
-                    com_pos = [xa + 2, mid_y - 2]
+                    com_pos = [xa + 20, mid_y - 20]
 
         lines.append(
             f"WIRE|{des}|{net}|AT|{int(des_pos[0])}|{int(des_pos[1])}|"
