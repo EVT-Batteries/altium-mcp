@@ -2047,7 +2047,9 @@ begin
         if (Spec.Count > 0) and (GetFieldFromPipeString(Spec[0], 0) = 'DOCUMENT') then
         begin
             TargetDocPath := GetFieldFromPipeString(Spec[0], 1);
-            ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
+            ServerDoc := FindOpenDocument(TargetDocPath);
+            if (ServerDoc = nil) then
+                ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
             if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
             TargetDoc := SchServer.GetCurrentSchDocument;
             if (TargetDoc = nil) or (AnsiUpperCase(TargetDoc.DocumentName) <> AnsiUpperCase(TargetDocPath)) then
@@ -2207,6 +2209,18 @@ begin
 
         SchServer.ProcessControl.PostProcess(TargetDoc, '');
         TargetDoc.GraphicallyInvalidate;
+
+        if (ServerDoc = nil) and (TargetDoc <> nil) then
+            ServerDoc := FindOpenDocument(TargetDoc.DocumentName);
+
+        if (ServerDoc <> nil) then
+        begin
+            ServerDoc.Modified := True;
+            try
+                ServerDoc.DoFileSave('');
+            except
+            end;
+        end;
 
         Result := '{"success": true, "sheet": "' + ExtractFileName(TargetDoc.DocumentName) +
                   '", "wires": ' + IntToStr(WireCount) +
