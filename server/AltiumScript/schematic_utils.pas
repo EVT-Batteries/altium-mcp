@@ -2338,6 +2338,20 @@ begin
                         Obj.Style := 1; // Thick Cross
                     except
                     end;
+                    try
+                        if (GetFieldFromPipeString(Rec, 3) <> '') then
+                            Obj.Text := GetFieldFromPipeString(Rec, 3)
+                        else
+                            Obj.Text := 'NC' + IntToStr(NcCount + 1);
+                    except
+                    end;
+                    try
+                        if (GetFieldFromPipeString(Rec, 4) = '1') or (GetFieldFromPipeString(Rec, 4) = 'True') then
+                            Obj.ShowName := True
+                        else
+                            Obj.ShowName := False;
+                    except
+                    end;
 
                     TargetDoc.RegisterSchObjectInContainer(Obj);
                     SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,

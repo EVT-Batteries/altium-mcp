@@ -1787,6 +1787,7 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         # Compute label positions above the wire if not provided
         des_pos = w.get("designator_pos")
         com_pos = w.get("comment_pos")
+        label_pos_mode = str(w.get("label_position", "above")).lower()
         if not des_pos or not com_pos:
             best_seg = None
             max_dx = -1
@@ -1798,21 +1799,33 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                     if dx > max_dx:
                         max_dx = dx
                         best_seg = (min(xa, xb), max(xa, xb), ya)
-            if best_seg and max_dx >= 400:
+            if best_seg and max_dx >= 300:
                 mid_x = (best_seg[0] + best_seg[1]) // 2
                 y_wire = best_seg[2]
-                if not des_pos:
-                    des_pos = [mid_x, y_wire + 30]
-                if not com_pos:
-                    com_pos = [mid_x, y_wire + 10]
+                if label_pos_mode == "below":
+                    if not des_pos:
+                        des_pos = [mid_x, y_wire - 20]
+                    if not com_pos:
+                        com_pos = [mid_x, y_wire - 40]
+                else:
+                    if not des_pos:
+                        des_pos = [mid_x, y_wire + 30]
+                    if not com_pos:
+                        com_pos = [mid_x, y_wire + 10]
             else:
                 xa, ya = pts[0], pts[1]
                 xb, yb = pts[2], pts[3]
                 mid_y = (ya + yb) // 2
-                if not des_pos:
-                    des_pos = [xa + 20, mid_y + 20]
-                if not com_pos:
-                    com_pos = [xa + 20, mid_y - 20]
+                if label_pos_mode == "below":
+                    if not des_pos:
+                        des_pos = [xa + 20, mid_y - 20]
+                    if not com_pos:
+                        com_pos = [xa + 20, mid_y - 40]
+                else:
+                    if not des_pos:
+                        des_pos = [xa + 20, mid_y + 20]
+                    if not com_pos:
+                        com_pos = [xa + 20, mid_y - 20]
 
         lines.append(
             f"WIRE|{des}|{net}|AT|{int(des_pos[0])}|{int(des_pos[1])}|"
@@ -1831,10 +1844,12 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
             if pv is not None and str(pv).strip():
                 lines.append(f"WIREPARAM|{pk}|{pv}")
 
-    for nc in (no_connects or []):
+    for i, nc in enumerate(no_connects or []):
         x = int(nc.get("x", 0))
         y = int(nc.get("y", 0))
-        lines.append(f"NOCONNECT|{x}|{y}")
+        nc_name = nc.get("name") or nc.get("designator") or f"NC{i+1}"
+        show_name = "1" if nc.get("show_name", False) else "0"
+        lines.append(f"NOCONNECT|{x}|{y}|{nc_name}|{show_name}")
 
     for nl in (net_labels or []):
         x = int(nl.get("x", 0))
