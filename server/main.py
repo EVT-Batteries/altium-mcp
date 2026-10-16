@@ -1887,6 +1887,81 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
 
 
 @mcp.tool()
+async def reroute_harness_wiring(
+    ctx: Context,
+    document_path: str = None,
+    trunk_x_start: int = None,
+    splice_x: int = None,
+    channel_spacing_mils: int = 100,
+    clear_existing: bool = True,
+) -> str:
+    """Automatically clean up, un-rubber-band, and reroute an Altium Harness Wiring Diagram (.WirDoc).
+
+    Extracts connector positions from the active or specified .WirDoc, resolves net
+    connectivity, calculates optimal orthogonal routing with topological vertical
+    trunk channels, places splices with certified runways, positions side-by-side
+    staggered labels without collisions, and commits directly to Altium Designer.
+
+    Args:
+        document_path: Full path to target .WirDoc file. If omitted, uses active harness.
+        trunk_x_start: Optional X coordinate in mils for vertical trunk start.
+        splice_x: Optional X coordinate in mils for harness splices.
+        channel_spacing_mils: Distance between vertical trunk channels (default 100 mils).
+        clear_existing: Whether to clear existing wires before rerouting (default True).
+
+    Returns:
+        JSON string reporting reroute execution details and primitive counts.
+    """
+    import harness_router
+
+    target_path = document_path
+    if not target_path:
+        h_path = await _get_active_harness_path()
+        if not h_path:
+            return json.dumps({
+                "success": False,
+                "error": "No active harness project or document_path provided",
+            })
+        target_path = str(h_path)
+
+    try:
+        routing_data = harness_router.calculate_harness_reroute(
+            document_path=target_path,
+            trunk_x_start=trunk_x_start,
+            splice_x=splice_x,
+            channel_spacing_mils=channel_spacing_mils,
+        )
+    except Exception as e:
+        logger.error(f"Error calculating harness reroute: {e}")
+        return json.dumps({
+            "success": False,
+            "error": f"Failed to calculate reroute: {str(e)}",
+        })
+
+    # Execute wiring placement
+    res_str = await add_harness_wiring(
+        ctx,
+        wires=routing_data["wires"],
+        splices=routing_data["splices"],
+        no_connects=routing_data["no_connects"],
+        clear_existing=clear_existing,
+        document_path=target_path,
+    )
+
+    try:
+        res_json = json.loads(res_str)
+    except Exception:
+        res_json = {"raw": res_str}
+
+    return json.dumps({
+        "success": res_json.get("success", False),
+        "document_path": target_path,
+        "summary": routing_data["summary"],
+        "altium_response": res_json,
+    }, indent=2)
+
+
+@mcp.tool()
 async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     """
     Create many schematic symbols in a single Altium script run.
