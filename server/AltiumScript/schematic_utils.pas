@@ -2210,8 +2210,8 @@ begin
                 if (Obj <> nil) then
                 begin
                     start_fld := fld;
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, start_fld))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, start_fld + 1))));
+                    Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, start_fld)),
+                                          StrToInt(GetFieldFromPipeString(Rec, start_fld + 1)));
                     vtx := 0;
                     while (GetFieldFromPipeString(Rec, fld) <> '') do
                     begin
@@ -2224,8 +2224,8 @@ begin
                         fld := start_fld;
                         for vtx := 1 to Obj.VerticesCount do
                         begin
-                            Obj.Vertex[vtx] := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
-                                                     MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
+                            Obj.Vertex[vtx] := Point(StrToInt(GetFieldFromPipeString(Rec, fld)),
+                                                     StrToInt(GetFieldFromPipeString(Rec, fld + 1)));
                             fld := fld + 2;
                         end;
                     except
@@ -2233,12 +2233,12 @@ begin
 
                     if (des_x = 0) and (des_y = 0) and (Obj.VerticesCount >= 2) then
                     begin
-                        mid_x := CoordToMils((Obj.Vertex[1].X + Obj.Vertex[2].X) div 2);
-                        mid_y := CoordToMils(Obj.Vertex[1].Y);
+                        mid_x := (Obj.Vertex[1].X + Obj.Vertex[2].X) div 2;
+                        mid_y := Obj.Vertex[1].Y;
                         des_x := mid_x;
-                        des_y := mid_y + 24;
+                        des_y := mid_y + 3;
                         com_x := mid_x;
-                        com_y := mid_y + 10;
+                        com_y := mid_y + 1;
                     end;
 
                     try
@@ -2246,7 +2246,7 @@ begin
                         begin
                             Obj.Designator.Text := WireDes;
                             if (des_x <> 0) or (des_y <> 0) then
-                                Obj.Designator.Location := Point(MilsToCoord(des_x), MilsToCoord(des_y));
+                                Obj.Designator.Location := Point(des_x, des_y);
                         end;
                     except
                     end;
@@ -2256,7 +2256,7 @@ begin
                         begin
                             Obj.Comment.Text := NetName;
                             if (com_x <> 0) or (com_y <> 0) then
-                                Obj.Comment.Location := Point(MilsToCoord(com_x), MilsToCoord(com_y));
+                                Obj.Comment.Location := Point(com_x, com_y);
                         end;
                     except
                     end;
@@ -2305,14 +2305,14 @@ begin
 
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3))));
+                    Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 2)),
+                                          StrToInt(GetFieldFromPipeString(Rec, 3)));
                     try
                         if (Obj.Designator <> nil) then
                         begin
                             Obj.Designator.Text := GetFieldFromPipeString(Rec, 1);
-                            Obj.Designator.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2)) + 15),
-                                                             MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3)) + 15));
+                            Obj.Designator.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 2)) + 2,
+                                                             StrToInt(GetFieldFromPipeString(Rec, 3)) + 2);
                         end;
                     except
                     end;
@@ -2332,8 +2332,8 @@ begin
 
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+                    Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                          StrToInt(GetFieldFromPipeString(Rec, 2)));
                     try
                         Obj.Style := 1; // Thick Cross
                     except
@@ -2351,8 +2351,8 @@ begin
                 Obj := SchServer.SchObjectFactory(eNetLabel, eCreate_GlobalCopy);
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+                    Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                          StrToInt(GetFieldFromPipeString(Rec, 2)));
                     Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
                     Obj.Text := GetFieldFromPipeString(Rec, 4);
 

@@ -1802,17 +1802,17 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                 mid_x = (best_seg[0] + best_seg[1]) // 2
                 y_wire = best_seg[2]
                 if not des_pos:
-                    des_pos = [mid_x, y_wire + 24]
+                    des_pos = [mid_x, y_wire + 3]
                 if not com_pos:
-                    com_pos = [mid_x, y_wire + 10]
+                    com_pos = [mid_x, y_wire + 1]
             else:
                 xa, ya = pts[0], pts[1]
                 xb, yb = pts[2], pts[3]
                 mid_y = (ya + yb) // 2
                 if not des_pos:
-                    des_pos = [xa + 15, mid_y + 12]
+                    des_pos = [xa + 2, mid_y + 2]
                 if not com_pos:
-                    com_pos = [xa + 15, mid_y - 12]
+                    com_pos = [xa + 2, mid_y - 2]
 
         lines.append(
             f"WIRE|{des}|{net}|AT|{int(des_pos[0])}|{int(des_pos[1])}|"
