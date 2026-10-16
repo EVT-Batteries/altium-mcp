@@ -2110,20 +2110,19 @@ begin
                     while (GetFieldFromPipeString(Rec, fld) <> '') do
                     begin
                         vtx := vtx + 1;
-                        try
-                            Obj.InsertVertex(vtx);
+                        fld := fld + 2;
+                    end;
+
+                    try
+                        Obj.VerticesCount := vtx;
+                        fld := 3;
+                        for vtx := 1 to Obj.VerticesCount do
+                        begin
                             Obj.Vertex[vtx] := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
                                                      MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
-                        except
-                            try
-                                Obj.InsertVertex := vtx;
-                                Obj.SetState_Vertex(vtx,
-                                    Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1)))));
-                            except
-                            end;
+                            fld := fld + 2;
                         end;
-                        fld := fld + 2;
+                    except
                     end;
 
                     try
