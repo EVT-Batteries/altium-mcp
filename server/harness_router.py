@@ -98,113 +98,255 @@ def calculate_harness_reroute(
         trunk_x_start = 9700
 
     # 1. Splices Configuration
-    # SP1: Mod 4 Voltage Taps -> P1 (pins 1, 12)
-    # SP2: Mod 2 Voltage Taps -> P1 (pins 6, 17)
-    # SP3: Mod 1 Voltage Taps -> P1 (pins 10, 21, 11, 22)
+    # Splices adhere strictly to: "Splices should be two wires in one wire out max!
+    # use multiple splices inline for more wires than that."
+    # SP1: Module 2 V4 -> BMSS C8 (Pin 16) & BMSS C9 (Pin 6)
+    # SP2: Module 4 V4 -> BMSS C17 (Pin 21) & BMSS C18 (Pin 11)
     splices = [
-        {"designator": "SP1", "x": splice_x, "y": 13400, "color": "Orange"},
-        {"designator": "SP2", "x": splice_x, "y": 12500, "color": "Orange"},
-        {"designator": "SP3", "x": splice_x, "y": 11700, "color": "Red"},
+        {"designator": "SP1", "x": splice_x, "y": 12550, "color": "Orange"},
+        {"designator": "SP2", "x": splice_x, "y": 11550, "color": "Red"},
     ]
 
-    # 2. No-Connects Configuration (15 unpopulated cavities across Modules P3..P6)
+    # 2. No-Connects Configuration (12 unpopulated cavities across Modules P3..P6)
     # Coordinates in mils
     no_connects = [
-        # Mod 4 (P6)
-        {"designator": "NC1", "name": "NC1", "x": 16500, "y": 7100, "show_name": False},
-        {"designator": "NC2", "name": "NC2", "x": 16400, "y": 7000, "show_name": False},
-        {"designator": "NC3", "name": "NC3", "x": 16500, "y": 6500, "show_name": False},
-        # Mod 3 (P5)
-        {"designator": "NC4", "name": "NC4", "x": 16500, "y": 9100, "show_name": False},
-        {"designator": "NC5", "name": "NC5", "x": 16400, "y": 9000, "show_name": False},
-        {"designator": "NC6", "name": "NC6", "x": 16500, "y": 8500, "show_name": False},
-        {"designator": "NC7", "name": "NC7", "x": 16400, "y": 8400, "show_name": False},
-        # Mod 2 (P4)
-        {"designator": "NC8", "name": "NC8", "x": 16500, "y": 11100, "show_name": False},
-        {"designator": "NC9", "name": "NC9", "x": 16400, "y": 11000, "show_name": False},
-        {"designator": "NC10", "name": "NC10", "x": 16500, "y": 10500, "show_name": False},
-        {"designator": "NC11", "name": "NC11", "x": 16400, "y": 10400, "show_name": False},
         # Mod 1 (P3)
-        {"designator": "NC12", "name": "NC12", "x": 16500, "y": 13100, "show_name": False},
-        {"designator": "NC13", "name": "NC13", "x": 16400, "y": 13000, "show_name": False},
-        {"designator": "NC14", "name": "NC14", "x": 16500, "y": 12500, "show_name": False},
-        {"designator": "NC15", "name": "NC15", "x": 16400, "y": 12400, "show_name": False},
+        {"designator": "NC1", "name": "NC1", "x": 16500, "y": 13100, "show_name": False},
+        {"designator": "NC2", "name": "NC2", "x": 16400, "y": 13000, "show_name": False},
+        # Mod 2 (P4)
+        {"designator": "NC3", "name": "NC3", "x": 16400, "y": 10400, "show_name": False},
+        {"designator": "NC4", "name": "NC4", "x": 16500, "y": 11100, "show_name": False},
+        {"designator": "NC5", "name": "NC5", "x": 16500, "y": 10500, "show_name": False},
+        {"designator": "NC6", "name": "NC6", "x": 16400, "y": 11000, "show_name": False},
+        # Mod 3 (P5)
+        {"designator": "NC7", "name": "NC7", "x": 16500, "y": 9100, "show_name": False},
+        {"designator": "NC8", "name": "NC8", "x": 16500, "y": 8500, "show_name": False},
+        {"designator": "NC9", "name": "NC9", "x": 16400, "y": 9000, "show_name": False},
+        # Mod 4 (P6)
+        {"designator": "NC10", "name": "NC10", "x": 16400, "y": 6400, "show_name": False},
+        {"designator": "NC11", "name": "NC11", "x": 16500, "y": 6500, "show_name": False},
+        {"designator": "NC12", "name": "NC12", "x": 16400, "y": 7000, "show_name": False},
     ]
 
-    # 3. Main Wires Configuration (34 wires)
-    # (id, net, sx, sy, dx, dy, gauge, color, border) in mils
+    # 3. Main Wires Configuration (36 wires)
+    # (id, net/comment, sx, sy, dx, dy, gauge, color, border) in mils
     sp_x = splice_x
     wires_io = [
-        # Mod 4 Voltage Taps -> P1 / SP1
-        ('W1', 'BMSS_C01_NEG', 16400, 6400, sp_x, 13400, '22 AWG', 'Black', 'None'),
-        ('W2', 'BMSS_C01_POS', 16400, 7400, 4500, 13300, '22 AWG', 'Orange', 'None'),
-        ('W3', 'BMSS_C02_POS', 16500, 6900, 4600, 13200, '22 AWG', 'Orange', 'None'),
-        ('W4', 'BMSS_C03_POS', 16500, 7300, 4500, 13100, '22 AWG', 'Orange', 'None'),
-        ('W5', 'BMSS_C04_POS', 16400, 6800, 4600, 13000, '22 AWG', 'Orange', 'None'),
-
-        # Mod 4 Thermistors -> P2
-        ('W6', 'BMSS_THERM1_SIG', 16400, 6600, 4500, 9200, '22 AWG (Twisted Pair)', 'Blue', 'None'),
-        ('W7', 'BMSS_THERM1_GND', 16500, 6700, 4600, 9100, '22 AWG (Twisted Pair)', 'Black', 'None'),
-        ('W8', 'BMSS_THERM2_SIG', 16400, 7200, 4500, 9400, '22 AWG (Twisted Pair)', 'Red', 'None'),
-        ('W9', 'BMSS_THERM2_GND', 16500, 7500, 4600, 9300, '22 AWG (Twisted Pair)', 'Black', 'None'),
-
-        # Mod 3 Voltage Taps -> P1
-        ('W10', 'BMSS_C05_POS', 16400, 9400, 4500, 12900, '22 AWG', 'Orange', 'None'),
-        ('W11', 'BMSS_C06_POS', 16500, 8900, 4600, 12800, '22 AWG', 'Orange', 'None'),
-        ('W12', 'BMSS_C07_POS', 16500, 9300, 4500, 12700, '22 AWG', 'Orange', 'None'),
-        ('W13', 'BMSS_C08_POS', 16400, 8800, 4600, 12600, '22 AWG', 'Orange', 'None'),
-
-        # Mod 3 Thermistors -> P2
-        ('W14', 'BMSS_THERM3_SIG', 16400, 8600, 4500, 9600, '22 AWG (Twisted Pair)', 'Brown', 'None'),
-        ('W15', 'BMSS_THERM3_GND', 16500, 8700, 4600, 9500, '22 AWG (Twisted Pair)', 'Black', 'None'),
-        ('W16', 'BMSS_THERM4_SIG', 16400, 9200, 4500, 9800, '22 AWG (Twisted Pair)', 'Orange', 'None'),
-        ('W17', 'BMSS_THERM4_GND', 16500, 9500, 4600, 9700, '22 AWG (Twisted Pair)', 'Black', 'None'),
-
-        # Mod 2 Voltage Taps -> P1 / SP2
-        ('W18', 'BMSS_C09_POS', 16400, 11400, sp_x, 12500, '22 AWG', 'Orange', 'None'),
-        ('W19', 'BMSS_C10_POS', 16500, 10900, 4500, 12300, '22 AWG', 'Red', 'None'),
-        ('W20', 'BMSS_C11_POS', 16500, 11300, 4600, 12200, '22 AWG', 'Red', 'None'),
-        ('W21', 'BMSS_C12_POS', 16400, 10800, 4500, 12100, '22 AWG', 'Red', 'None'),
-
-        # Mod 2 Thermistors -> P2
-        ('W22', 'BMSS_THERM5_SIG', 16400, 10600, 4500, 10000, '22 AWG (Twisted Pair)', 'Green', 'None'),
-        ('W23', 'BMSS_THERM5_GND', 16500, 10700, 4600, 9900, '22 AWG (Twisted Pair)', 'Black', 'None'),
-        ('W24', 'BMSS_THERM6_SIG', 16400, 11200, 4500, 10200, '22 AWG (Twisted Pair)', 'White', 'None'),
-        ('W25', 'BMSS_THERM6_GND', 16500, 11500, 4600, 10100, '22 AWG (Twisted Pair)', 'Black', 'None'),
-
-        # Mod 1 Voltage Taps -> P1 / SP3
-        ('W26', 'BMSS_C13_POS', 16400, 13400, 4600, 12000, '22 AWG', 'Red', 'None'),
-        ('W27', 'BMSS_C14_POS', 16500, 12900, 4500, 11900, '22 AWG', 'Red', 'None'),
-        ('W28', 'BMSS_C15_POS', 16500, 13300, 4600, 11800, '22 AWG', 'Red', 'None'),
-        ('W29', 'BMSS_C16_POS', 16400, 12800, sp_x, 11700, '22 AWG', 'Red', 'None'),
-
-        # Mod 1 Thermistors -> J1
-        ('W30', 'BMSM_THERM1_SIG', 16400, 12600, 4500, 8000, '22 AWG (Twisted Pair)', 'Blue', 'None'),
-        ('W31', 'BMSM_THERM1_GND', 16500, 12700, 4600, 7900, '22 AWG (Twisted Pair)', 'Black', 'None'),
-        ('W32', 'BMSM_THERM2_SIG', 16400, 13200, 4500, 8200, '22 AWG (Twisted Pair)', 'Red', 'None'),
-        ('W33', 'BMSM_THERM2_GND', 16500, 13500, 4600, 8100, '22 AWG (Twisted Pair)', 'Black', 'None'),
+        # Mod 1 Voltage Taps -> P1 (BMSS C0..C4)
+        ("W1", "MOD1_V0", 16400, 12400, 4600, 13400, "22 AWG", "Black", "None"),
+        ("W2", "MOD1_V1", 16400, 13400, 4500, 13300, "22 AWG", "Orange", "None"),
+        ("W3", "MOD1_V2", 16500, 12900, 4600, 13200, "22 AWG", "Orange", "None"),
+        ("W4", "MOD1_V3", 16500, 13300, 4500, 13100, "22 AWG", "Orange", "None"),
+        ("W5", "MOD1_V4", 16400, 12800, 4600, 13000, "22 AWG", "Orange", "None"),
+        # Mod 1 GND -> P1 (BMSS NEG_PWR)
+        ("W6", "MOD1_GND", 16500, 12500, 4500, 13500, "22 AWG", "Black", "None"),
+        # Mod 1 Thermistors (NTC1 -> BMSM Therm 1, NTC2 -> BMSS Therm 1)
+        (
+            "W7",
+            "MOD1_NTC1_SIG",
+            16400,
+            12600,
+            4500,
+            8200,
+            "22 AWG (Twisted Pair)",
+            "Blue",
+            "None",
+        ),
+        (
+            "W8",
+            "MOD1_NTC1_GND",
+            16500,
+            12700,
+            4600,
+            8100,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        (
+            "W9",
+            "MOD1_NTC2_SIG",
+            16400,
+            13200,
+            4500,
+            9200,
+            "22 AWG (Twisted Pair)",
+            "Blue",
+            "None",
+        ),
+        (
+            "W10",
+            "MOD1_NTC2_GND",
+            16500,
+            13500,
+            4600,
+            9100,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        # Mod 2 Voltage Taps -> P1 (BMSS C5..C7, and C8/C9 via SP1)
+        ("W11", "MOD2_V1", 16400, 11400, 4500, 12900, "22 AWG", "Orange", "None"),
+        ("W12", "MOD2_V2", 16500, 10900, 4600, 12800, "22 AWG", "Orange", "None"),
+        ("W13", "MOD2_V3", 16500, 11300, 4500, 12700, "22 AWG", "Orange", "None"),
+        ("W14", "MOD2_V4", 16400, 10800, sp_x, 12550, "22 AWG", "Orange", "None"),
+        # Mod 2 Thermistors (NTC1 -> BMSS Therm 2, NTC2 -> BMSM Therm 2)
+        (
+            "W15",
+            "MOD2_NTC1_SIG",
+            16400,
+            10600,
+            4500,
+            9400,
+            "22 AWG (Twisted Pair)",
+            "Red",
+            "None",
+        ),
+        (
+            "W16",
+            "MOD2_NTC1_GND",
+            16500,
+            10700,
+            4600,
+            9300,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        (
+            "W17",
+            "MOD2_NTC2_SIG",
+            16400,
+            11200,
+            4500,
+            8000,
+            "22 AWG (Twisted Pair)",
+            "Red",
+            "None",
+        ),
+        (
+            "W18",
+            "MOD2_NTC2_GND",
+            16500,
+            11500,
+            4600,
+            7900,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        # Mod 3 Voltage Taps -> P1 (BMSS C10- Busbar Bypass, C10..C13)
+        ("W19", "MOD3_V0", 16400, 8400, 4600, 12400, "22 AWG", "Black", "None"),
+        ("W20", "MOD3_V1", 16400, 9400, 4500, 12300, "22 AWG", "Red", "None"),
+        ("W21", "MOD3_V2", 16500, 8900, 4600, 12200, "22 AWG", "Red", "None"),
+        ("W22", "MOD3_V3", 16500, 9300, 4500, 12100, "22 AWG", "Red", "None"),
+        ("W23", "MOD3_V4", 16400, 8800, 4600, 12000, "22 AWG", "Red", "None"),
+        # Mod 3 Thermistors (NTC1 -> BMSS Therm 3, NTC2 -> BMSS Therm 4)
+        (
+            "W24",
+            "MOD3_NTC1_SIG",
+            16400,
+            8600,
+            4500,
+            9600,
+            "22 AWG (Twisted Pair)",
+            "Brown",
+            "None",
+        ),
+        (
+            "W25",
+            "MOD3_NTC1_GND",
+            16500,
+            8700,
+            4600,
+            9500,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        (
+            "W26",
+            "MOD3_NTC2_SIG",
+            16400,
+            9200,
+            4500,
+            9800,
+            "22 AWG (Twisted Pair)",
+            "Orange",
+            "None",
+        ),
+        (
+            "W27",
+            "MOD3_NTC2_GND",
+            16500,
+            9500,
+            4600,
+            9700,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        # Mod 4 Voltage Taps -> P1 (BMSS C14..C16, and C17/C18 via SP2)
+        ("W28", "MOD4_V1", 16400, 7400, 4500, 11900, "22 AWG", "Red", "None"),
+        ("W29", "MOD4_V2", 16500, 6900, 4600, 11800, "22 AWG", "Red", "None"),
+        ("W30", "MOD4_V3", 16500, 7300, 4500, 11700, "22 AWG", "Red", "None"),
+        ("W31", "MOD4_V4", 16400, 6800, sp_x, 11550, "22 AWG", "Red", "None"),
+        # Mod 4 PWR -> P1 (BMSS POS_PWR)
+        ("W32", "MOD4_PWR", 16500, 7100, 4600, 11400, "22 AWG", "Red", "None"),
+        # Mod 4 Thermistors (NTC1 -> BMSS Therm 5, NTC2 -> BMSS Therm 6)
+        (
+            "W33",
+            "MOD4_NTC1_SIG",
+            16400,
+            6600,
+            4500,
+            10000,
+            "22 AWG (Twisted Pair)",
+            "Green",
+            "None",
+        ),
+        (
+            "W34",
+            "MOD4_NTC1_GND",
+            16500,
+            6700,
+            4600,
+            9900,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
+        (
+            "W35",
+            "MOD4_NTC2_SIG",
+            16400,
+            7200,
+            4500,
+            10200,
+            "22 AWG (Twisted Pair)",
+            "White",
+            "None",
+        ),
+        (
+            "W36",
+            "MOD4_NTC2_GND",
+            16500,
+            7500,
+            4600,
+            10100,
+            "22 AWG (Twisted Pair)",
+            "Black",
+            "None",
+        ),
     ]
 
-    # Topological DAG channel allocation for vertical trunk lines
-    graph: dict[str, set[str]] = {w[0]: set() for w in wires_io}
-    edges = [
-        ('W31', 'W5'), ('W30', 'W3'),
-        ('W17', 'W14'), ('W16', 'W15'),
-        ('W23', 'W13'), ('W22', 'W11'),
-        ('W29', 'W22'), ('W28', 'W23'),
-        ('W27', 'W21'), ('W26', 'W19'),
-        ('W19', 'W24'), ('W13', 'W25'),
-        ('W18', 'W22'), ('W18', 'W23'),
-    ]
-    for u, v in edges:
-        if u in graph and v in graph:
-            graph[v].add(u)
-
-    ts = graphlib.TopologicalSorter(graph)
-    order = list(ts.static_order())
+    # Topological sorting: sy ascending groups wires by module and eliminates same-module crossings
+    order = [w[0] for w in sorted(wires_io, key=lambda w: w[3])]
 
     # Map each wire to a vertical channel X
-    tx_map = {w: trunk_x_start + i * channel_spacing_mils for i, w in enumerate(order)}
+    # Using 85 mils spacing allows 36 trunk channels to span [9700, 12675] mils cleanly
+    ch_spacing = min(channel_spacing_mils, 85)
+    tx_map = {w: trunk_x_start + i * ch_spacing for i, w in enumerate(order)}
 
     # Sort wires by sy for 2-phase staggering
     all_main = sorted(wires_io, key=lambda w: w[3])
@@ -243,38 +385,13 @@ def calculate_harness_reroute(
     # Splice branch wires (connecting splices at X=splice_x to Left Connector P1 at X=4500/4600)
     # Staggered chess-board layout: Slot 0 (X_des=6700) vs Slot 1 (X_des=7450)
     # Clear of connector box (X=6400) and clear of splice circle (X=splice_x)
+    # SP1 Branches (Mod 2 V4 -> BMSS C8 & C9)
     wires.append({
-        "designator": "W1B",
-        "net": "BMSS_C01_NEG_PWR",
-        "points": [sp_x, 13400, sp_x, 13500, 4500, 13500],
-        "designator_pos": [6700, 13515],
-        "comment_pos": [7050, 13515],
-        "parameters": {
-            "Gauge": "22 AWG",
-            "Color": "Black",
-            "VoltageRating": "600V",
-            "Border": "None",
-        },
-    })
-    wires.append({
-        "designator": "W1A",
-        "net": "BMSS_C01_NEG_SENSE",
-        "points": [sp_x, 13400, 4600, 13400],
-        "designator_pos": [7450, 13415],
-        "comment_pos": [7800, 13415],
-        "parameters": {
-            "Gauge": "22 AWG",
-            "Color": "Black",
-            "VoltageRating": "600V",
-            "Border": "None",
-        },
-    })
-    wires.append({
-        "designator": "W18A",
-        "net": "BMSS_C09_POS",
-        "points": [sp_x, 12500, 4500, 12500],
-        "designator_pos": [6700, 12515],
-        "comment_pos": [7050, 12515],
+        "designator": "W14A",
+        "net": "MOD2_V4_C8",
+        "points": [sp_x, 12550, sp_x, 12600, 4600, 12600],
+        "designator_pos": [6700, 12615],
+        "comment_pos": [7050, 12615],
         "parameters": {
             "Gauge": "22 AWG",
             "Color": "Orange",
@@ -283,35 +400,23 @@ def calculate_harness_reroute(
         },
     })
     wires.append({
-        "designator": "W18B",
-        "net": "BMSS_C10_NEG_BYPASS",
-        "points": [sp_x, 12500, sp_x, 12400, 4600, 12400],
-        "designator_pos": [7450, 12415],
-        "comment_pos": [7800, 12415],
+        "designator": "W14B",
+        "net": "MOD2_V4_C9",
+        "points": [sp_x, 12550, sp_x, 12500, 4500, 12500],
+        "designator_pos": [7450, 12515],
+        "comment_pos": [7800, 12515],
         "parameters": {
             "Gauge": "22 AWG",
-            "Color": "Black",
+            "Color": "Orange",
             "VoltageRating": "600V",
             "Border": "None",
         },
     })
+    # SP2 Branches (Mod 4 V4 -> BMSS C17 & C18)
     wires.append({
-        "designator": "W29A",
-        "net": "BMSS_C17_POS",
-        "points": [sp_x, 11700, 4500, 11700],
-        "designator_pos": [7450, 11715],
-        "comment_pos": [7800, 11715],
-        "parameters": {
-            "Gauge": "22 AWG",
-            "Color": "Red",
-            "VoltageRating": "600V",
-            "Border": "None",
-        },
-    })
-    wires.append({
-        "designator": "W29B",
-        "net": "BMSS_C16_POS",
-        "points": [sp_x, 11700, sp_x, 11600, 4600, 11600],
+        "designator": "W31A",
+        "net": "MOD4_V4_C17",
+        "points": [sp_x, 11550, sp_x, 11600, 4600, 11600],
         "designator_pos": [6700, 11615],
         "comment_pos": [7050, 11615],
         "parameters": {
@@ -322,24 +427,11 @@ def calculate_harness_reroute(
         },
     })
     wires.append({
-        "designator": "W29C",
-        "net": "BMSS_C18_POS_PWR",
-        "points": [sp_x, 11700, sp_x, 11500, 4500, 11500],
+        "designator": "W31B",
+        "net": "MOD4_V4_C18",
+        "points": [sp_x, 11550, sp_x, 11500, 4500, 11500],
         "designator_pos": [7450, 11515],
         "comment_pos": [7800, 11515],
-        "parameters": {
-            "Gauge": "22 AWG",
-            "Color": "Red",
-            "VoltageRating": "600V",
-            "Border": "None",
-        },
-    })
-    wires.append({
-        "designator": "W29D",
-        "net": "BMSS_C18_POS",
-        "points": [sp_x, 11700, sp_x, 11400, 4600, 11400],
-        "designator_pos": [6700, 11315],
-        "comment_pos": [7050, 11315],
         "parameters": {
             "Gauge": "22 AWG",
             "Color": "Red",

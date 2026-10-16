@@ -157,6 +157,7 @@ begin
     if (CommandName = 'search_library_symbol') or
        (CommandName = 'build_circuit') or
        (CommandName = 'add_harness_wiring') or
+       (CommandName = 'take_view_screenshot') or
        (CommandName = 'get_symbol_primitives') or
        (CommandName = 'create_symbols_batch') or
        (CommandName = 'get_footprint_primitives') or

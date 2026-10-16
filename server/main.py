@@ -2611,7 +2611,7 @@ async def check_placement(ctx: Context, cmp_designators: list = None, clearance_
     return json.dumps(result, indent=2)
 
 @mcp.tool()
-async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = None):
+async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = None, document_path: str = None):
     """
     Take a screenshot of the Altium window, returned as viewable image content.
 
@@ -2621,12 +2621,14 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             PCB view only: Altium zooms to the bounding box of these components
             (plus a margin) before the capture, so the components fill the frame.
             Omit to capture at the current zoom level.
+        document_path (str, optional): Absolute or relative path to a schematic or
+            harness document to focus and capture.
 
     Returns:
         Image content of the captured window plus a JSON metadata text block
         (window title, size, zoomed component count)
     """
-    logger.info(f"Taking screenshot of Altium {view_type} window (zoom_to={zoom_to})")
+    logger.info(f"Taking screenshot of Altium {view_type} window (zoom_to={zoom_to}, doc={document_path})")
 
     try:
         # First, execute the Altium command to ensure the right document type
@@ -2634,38 +2636,54 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         params = {"view_type": view_type.lower()}
         if zoom_to:
             params["designators"] = zoom_to
+        if document_path:
+            params["document_path"] = str(Path(document_path).resolve())
         response = await altium_bridge.execute_command(
             "take_view_screenshot",
             params
         )
         
+        focused_kind = ""
+        focused_document = ""
         # Check for success
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
-            logger.error(f"Error focusing {view_type} document: {error_msg}")
-            return json.dumps({"success": False, "error": f"Failed to focus the correct document type: {error_msg}"})
-
-        # Altium reports which document ended up focused. If it is not the
-        # kind that was asked for (typically: no document of that kind is
-        # open), say so instead of returning the wrong editor labelled as
-        # the requested view.
-        focus_info = response.get("result", {})
-        focus_info = focus_info if isinstance(focus_info, dict) else {}
-        focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
-        focused_document = focus_info.get("focused_document", "")
-        wanted_kind = {"pcb": "PCB", "sch": "SCH"}.get(view_type.lower())
-        is_sch_match = (wanted_kind == "SCH" and focused_kind in ("SCH", "HARNESSWIRINGDIAGRAM", "HARNESSLAYOUT"))
-        is_pcb_match = (wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB"))
-        if wanted_kind and focused_kind and not (is_sch_match or is_pcb_match):
-            logger.error(f"Requested {view_type} view but {focused_kind} document is focused")
-            return json.dumps({
-                "success": False,
-                "error": f"Requested a '{view_type}' view but Altium has a {focused_kind} "
-                         f"document focused ({focused_document}). Is a "
-                         f"{wanted_kind} document open in the active project?",
-                "requested_view_type": view_type,
-                "focused_kind": focused_kind,
-                "focused_document": focused_document})
+            logger.warning(
+                f"Could not focus {view_type} document via API ({error_msg}); "
+                "capturing currently active Altium window"
+            )
+        else:
+            # Altium reports which document ended up focused. If it is not the
+            # kind that was asked for (typically: no document of that kind is
+            # open), say so instead of returning the wrong editor labelled as
+            # the requested view.
+            focus_info = response.get("result", {})
+            focus_info = focus_info if isinstance(focus_info, dict) else {}
+            focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
+            focused_document = focus_info.get("focused_document", "")
+            wanted_kind = {"pcb": "PCB", "sch": "SCH"}.get(view_type.lower())
+            is_sch_match = (
+                wanted_kind == "SCH"
+                and focused_kind in ("SCH", "HARNESSWIRINGDIAGRAM", "HARNESSLAYOUT")
+            )
+            is_pcb_match = (
+                wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB")
+            )
+            if wanted_kind and focused_kind and not (is_sch_match or is_pcb_match):
+                logger.error(
+                    f"Requested {view_type} view but {focused_kind} document is focused"
+                )
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Requested a '{view_type}' view but Altium has a "
+                        f"{focused_kind} document focused ({focused_document}). Is a "
+                        f"{wanted_kind} document open in the active project?"
+                    ),
+                    "requested_view_type": view_type,
+                    "focused_kind": focused_kind,
+                    "focused_document": focused_document,
+                })
 
         # Run the screenshot capture in a separate thread
         import threading
@@ -2744,23 +2762,36 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     return bool(fg) and win32process.GetWindowThreadProcessId(fg)[1] == altium_pid
 
                 try:
-                    for attempt in range(2):
-                        if attempt:
-                            import ctypes
-                            ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
-                            ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
+                    import ctypes
+                    fg_hwnd = win32gui.GetForegroundWindow()
+                    if fg_hwnd:
+                        fg_tid = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
+                        cur_tid = win32api.GetCurrentThreadId()
+                        if fg_tid != cur_tid:
+                            try:
+                                win32process.AttachThreadInput(fg_tid, cur_tid, True)
+                            except Exception:
+                                pass
+                    ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWMAXIMIZED)
+                    ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+                    try:
+                        win32gui.SetForegroundWindow(hwnd)
+                        win32gui.BringWindowToTop(hwnd)
+                    except Exception:
+                        pass
+                    deadline = time.time() + 2.0
+                    while time.time() < deadline:
+                        time.sleep(0.1)
+                        if altium_is_foreground():
+                            activated = True
+                            break
+                    if fg_hwnd and fg_tid != cur_tid:
                         try:
-                            win32gui.SetForegroundWindow(hwnd)
+                            win32process.AttachThreadInput(fg_tid, cur_tid, False)
                         except Exception:
                             pass
-                        deadline = time.time() + 1.5
-                        while time.time() < deadline:
-                            time.sleep(0.1)
-                            if altium_is_foreground():
-                                activated = True
-                                break
-                        if activated:
-                            break
                 except Exception as e:
                     logger.warning(f"Could not bring window to foreground: {e}")
                 if not activated:
@@ -2789,8 +2820,16 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
                     saveDC.SelectObject(saveBitMap)
                     
-                    # Copy the screen into the bitmap
-                    saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
+                    # Copy the screen into the bitmap using PrintWindow (works even in background)
+                    pw_success = False
+                    try:
+                        import ctypes
+                        pw_res = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
+                        pw_success = bool(pw_res)
+                    except Exception:
+                        pass
+                    if not pw_success:
+                        saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
                     
                     # Convert the bitmap to an Image
                     bmpinfo = saveBitMap.GetInfo()

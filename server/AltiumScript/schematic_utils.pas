@@ -2150,7 +2150,8 @@ begin
                 DelObj := Iter.FirstSchObject;
                 while (DelObj <> nil) do
                 begin
-                    DelList.Add(DelObj);
+                    if (DelObj.ObjectId = 82) or (DelObj.ObjectId = 83) or (DelObj.ObjectId = 94) then
+                        DelList.Add(DelObj);
                     DelObj := Iter.NextSchObject;
                 end;
                 TargetDoc.SchIterator_Destroy(Iter);

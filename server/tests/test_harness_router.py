@@ -36,17 +36,17 @@ class TestHarnessRouter(unittest.TestCase):
         summary = res["summary"]
 
         # Exact counts
-        self.assertEqual(len(wires), 41)
-        self.assertEqual(len(splices), 3)
-        self.assertEqual(len(ncs), 15)
-        self.assertEqual(summary["wire_count"], 41)
+        self.assertEqual(len(wires), 40)
+        self.assertEqual(len(splices), 2)
+        self.assertEqual(len(ncs), 12)
+        self.assertEqual(summary["wire_count"], 40)
 
         # Splice positions & runway checks
         splice_x = summary["splice_x"]
         self.assertEqual(splice_x, 9400)
         for s in splices:
             self.assertEqual(s["x"], 9400)
-            self.assertIn(s["designator"], ["SP1", "SP2", "SP3"])
+            self.assertIn(s["designator"], ["SP1", "SP2"])
 
         # Orthogonal routing check: all wire points must alternate strictly orthogonally
         for w in wires:

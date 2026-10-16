@@ -149,10 +149,15 @@ var
     ParamValue: String;
     i, ValueStart: Integer;
     ViewType: String;
+    DocPath: String;
+    PrjPath: String;
+    ServerDoc: IServerDocument;
     DesignatorsList: TStringList;
 begin
     // Extract the view type parameter
     ViewType := 'pcb';  // Default to PCB
+    DocPath := '';
+    PrjPath := '';
     DesignatorsList := TStringList.Create;
 
     try
@@ -166,6 +171,12 @@ begin
                 ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
                 ParamValue := TrimJSON(ParamValue);
                 ViewType := ParamValue;
+            end
+            else if (Pos('"document_path"', RequestData[i]) > 0) then
+            begin
+                ValueStart := Pos(':', RequestData[i]) + 1;
+                ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
+                DocPath := TrimJSON(ParamValue);
             end
             // Look for optional designators array to zoom to before capture
             else if (Pos('"designators"', RequestData[i]) > 0) then
@@ -186,6 +197,30 @@ begin
                     i := i + 1;
                 end;
             end;
+        end;
+
+        if (DocPath <> '') then
+        begin
+            PrjPath := ChangeFileExt(DocPath, '.PrjHar');
+            if not FileExists(PrjPath) then
+                PrjPath := ChangeFileExt(DocPath, '.PrjPcb');
+
+            if FileExists(PrjPath) then
+            begin
+                ResetParameters;
+                AddStringParameter('FileName', PrjPath);
+                RunProcess('WorkspaceManager:OpenObject');
+                Sleep(800);
+            end;
+
+            ResetParameters;
+            AddStringParameter('FileName', DocPath);
+            RunProcess('WorkspaceManager:OpenObject');
+            Sleep(800);
+            ResetParameters;
+            AddStringParameter('Action', 'All');
+            RunProcess('Schematic:Zoom');
+            Sleep(500);
         end;
 
         Result := TakeViewScreenshot(ViewType, DesignatorsList);
