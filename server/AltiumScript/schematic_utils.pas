@@ -2701,6 +2701,128 @@ begin
                     end;
                 except
                 end;
+            end
+            else if (Kind = 'UPDATE_WIREPARAM') then
+            begin
+                // UPDATE_WIREPARAM|<WireDesignator>|<ParamName>|<ParamValue>
+                WireDes := GetFieldFromPipeString(Rec, 1);
+                PName   := GetFieldFromPipeString(Rec, 2);
+                PVal    := GetFieldFromPipeString(Rec, 3);
+                Iter := TargetDoc.SchIterator_Create;
+                Iter.AddFilter_ObjectSet(MkSet(82));
+                Obj := Iter.FirstSchObject;
+                while (Obj <> nil) do
+                begin
+                    FoundDes := '';
+                    try
+                        if (Obj.Designator <> nil) then FoundDes := Obj.Designator.Text;
+                    except
+                    end;
+                    if (AnsiUpperCase(FoundDes) = AnsiUpperCase(WireDes)) then
+                    begin
+                        Param := nil;
+                        try
+                            ChildIter := Obj.SchIterator_Create;
+                            ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+                            Prim := ChildIter.FirstSchObject;
+                            while (Prim <> nil) do
+                            begin
+                                if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
+                                begin
+                                    Param := Prim;
+                                    Break;
+                                end;
+                                Prim := ChildIter.NextSchObject;
+                            end;
+                            Obj.SchIterator_Destroy(ChildIter);
+                        except
+                        end;
+
+                        if (Param <> nil) then
+                        begin
+                            Param.Text := PVal;
+                        end
+                        else
+                        begin
+                            try
+                                Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                                if (Param <> nil) then
+                                begin
+                                    Param.Name := PName;
+                                    Param.Text := PVal;
+                                    Param.ParamType := eParameterType_String;
+                                    Param.ReadOnlyState := eReadOnly_None;
+                                    Param.IsHidden := True;
+                                    Obj.AddSchObject(Param);
+                                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast,
+                                        SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                                end;
+                            except
+                            end;
+                        end;
+                        if (AnsiUpperCase(PName) = 'COLOR') then
+                        begin
+                            try
+                                Obj.Color := HarnessColorToTColor(PVal);
+                            except
+                            end;
+                        end;
+                        Break;
+                    end;
+                    Obj := Iter.NextSchObject;
+                end;
+                TargetDoc.SchIterator_Destroy(Iter);
+            end
+            else if (Kind = 'CAVITYCRIMP') then
+            begin
+                // CAVITYCRIMP|<ConnDes>|<PinDes>|<CrimpPartNumber>
+                ConnDes := GetFieldFromPipeString(Rec, 1);
+                PName   := GetFieldFromPipeString(Rec, 2);
+                PVal    := GetFieldFromPipeString(Rec, 3);
+                Iter := TargetDoc.SchIterator_Create;
+                Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
+                Obj := Iter.FirstSchObject;
+                while (Obj <> nil) do
+                begin
+                    FoundDes := '';
+                    try
+                        if (Obj.Designator <> nil) then FoundDes := Obj.Designator.Text;
+                    except
+                    end;
+                    if (AnsiUpperCase(FoundDes) = AnsiUpperCase(ConnDes)) then
+                    begin
+                        ChildIter := Obj.SchIterator_Create;
+                        ChildIter.AddFilter_ObjectSet(MkSet(88, ePin));
+                        Prim := ChildIter.FirstSchObject;
+                        while (Prim <> nil) do
+                        begin
+                            if (Prim.Designator = PName) or (Prim.Name = PName) then
+                            begin
+                                try
+                                    Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                                    if (Param <> nil) then
+                                    begin
+                                        Param.Name := 'Crimp';
+                                        Param.Text := PVal;
+                                        Param.ParamType := eParameterType_String;
+                                        Param.ReadOnlyState := eReadOnly_None;
+                                        Param.IsHidden := True;
+                                        Prim.AddSchObject(Param);
+                                        SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast,
+                                            SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                                    end;
+                                except
+                                end;
+                                Break;
+                            end;
+                            Prim := ChildIter.NextSchObject;
+                        end;
+                        Obj.SchIterator_Destroy(ChildIter);
+                        Break;
+                    end;
+                    Obj := Iter.NextSchObject;
+                end;
+                TargetDoc.SchIterator_Destroy(Iter);
             end;
         end;
 

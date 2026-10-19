@@ -1925,6 +1925,8 @@ async def add_harness_wiring(
     connectors: list | None = None,
     rectangles: list | None = None,
     parts: list | None = None,
+    wire_updates: list | None = None,
+    cavity_crimps: list | None = None,
     clear_existing: bool = False,
     document_path: str | None = None,
 ) -> str:
@@ -2113,6 +2115,19 @@ async def add_harness_wiring(
         for pk, pv in (p.get("parameters") or {}).items():
             if pv is not None and str(pv).strip():
                 lines.append(f"PARTPARAM|{pk}|{pv}")
+
+    for wu in wire_updates or []:
+        w_des = str(wu.get("designator", "")).strip()
+        for pk, pv in (wu.get("parameters") or {}).items():
+            if pv is not None and str(pv).strip():
+                lines.append(f"UPDATE_WIREPARAM|{w_des}|{pk}|{pv}")
+
+    for cc in cavity_crimps or []:
+        conn_des = str(cc.get("connector", "")).strip()
+        pin_des = str(cc.get("pin") or cc.get("cavity", "")).strip()
+        terminal = str(cc.get("terminal") or cc.get("crimp", "")).strip()
+        if conn_des and pin_des and terminal:
+            lines.append(f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}")
 
     spec_path = Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt")
     spec_path.parent.mkdir(parents=True, exist_ok=True)

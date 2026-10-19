@@ -44,22 +44,10 @@ begin
 
     try
         // === BEGIN EXPERIMENT (rewritten by the run_altium_script tool) ===
-        S1 := '';
-        I1 := GetWorkspace.DM_ProjectCount;
-        SandboxLog('ProjectCount=' + IntToStr(I1));
-        for I2 := 0 to I1 - 1 do begin
-            Obj1 := GetWorkspace.DM_Projects(I2);
-            if Obj1 <> nil then begin
-                S1 := S1 + Obj1.DM_ProjectFileName + ': ';
-                for I3 := 0 to Obj1.DM_LogicalDocumentCount - 1 do begin
-                    Obj2 := Obj1.DM_LogicalDocuments(I3);
-                    if Obj2 <> nil then
-                        S1 := S1 + ExtractFileName(Obj2.DM_FullPath) + ', ';
-                end;
-                S1 := S1 + ' | ';
-            end;
-        end;
-        ResultText := S1;
+        ResetParameters;
+        AddStringParameter('Action', 'All');
+        RunProcess('Sch:Zoom');
+        ResultText := 'Zoomed';
         // === END EXPERIMENT ===
     except
         SandboxLog('EXCEPTION escaped the script body');
