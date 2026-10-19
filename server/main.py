@@ -2173,21 +2173,22 @@ async def reroute_harness_wiring(
     document_path: str | None = None,
     trunk_x_start: int | None = None,
     splice_x: int | None = None,
-    channel_spacing_mils: int = 100,
+    channel_spacing_mils: int = 300,
     clear_existing: bool = True,
 ) -> str:
     """Automatically clean up, un-rubber-band, and reroute an Altium Harness Wiring Diagram (.WirDoc).
 
     Extracts connector positions from the active or specified .WirDoc, resolves net
     connectivity, calculates optimal orthogonal routing with topological vertical
-    trunk channels, places splices with certified runways, positions side-by-side
-    staggered labels without collisions, and commits directly to Altium Designer.
+    trunk channels (300 mil pitch, nested concentric staircases, co-linear channel re-use),
+    places splices with certified runways, positions midpoint labels without collisions,
+    and commits directly to Altium Designer.
 
     Args:
         document_path: Full path to target .WirDoc file. If omitted, uses active harness.
         trunk_x_start: Optional X coordinate in mils for vertical trunk start.
         splice_x: Optional X coordinate in mils for harness splices.
-        channel_spacing_mils: Distance between vertical trunk channels (default 100 mils).
+        channel_spacing_mils: Distance between vertical trunk channels (default 300 mils / 3 grid units).
         clear_existing: Whether to clear existing wires before rerouting (default True).
 
     Returns:

@@ -13,11 +13,104 @@ from typing import Any
 from harness_parser import parse_wirdoc
 
 
+def route_topological_bundle(
+    connections: list[dict[str, Any]],
+    base_x: int,
+    direction_sign: int = 1,
+    channel_pitch: int = 300,
+    min_gap: int = 200,
+) -> list[dict[str, Any]]:
+    """Route a bundle of point-to-point connections with orthogonal channels.
+
+    Generic topological routing engine enforcing:
+    - 300 mil vertical drop channel pitch standard (3 grid increments)
+    - Straight wire preservation (sy == dy -> 2-point direct line)
+    - Directional grouping (UP-going vs DOWN-going)
+    - Nested concentric staircase sorting (Russian doll / onion peel)
+    - Co-linear channel re-use for non-overlapping vertical spans
+    - Midpoint labeling on longest horizontal segment with side-by-side offsets
+    """
+    straight = [c for c in connections if c["sy"] == c["dy"]]
+    stepped = [c for c in connections if c["sy"] != c["dy"]]
+
+    up_wires = [c for c in stepped if c["dy"] > c["sy"]]
+    down_wires = [c for c in stepped if c["dy"] < c["sy"]]
+
+    # Nested concentric staircase sorting:
+    # Lowest entry wire steps into outer channel first for UP wires
+    up_wires_sorted = sorted(up_wires, key=lambda c: (c["sy"], -c["dy"]))
+    # Highest entry wire steps into outer channel first for DOWN wires
+    down_wires_sorted = sorted(down_wires, key=lambda c: (-c["sy"], c["dy"]))
+
+    routed_wires: list[dict[str, Any]] = []
+
+    # 1. Straight wires (Delta Y == 0)
+    for c in straight:
+        pts = [c["sx"], c["sy"], c["dx"], c["dy"]]
+        x_mid = (c["sx"] + c["dx"]) // 2
+        routed_wires.append(
+            {
+                "designator": c["id"],
+                "net": c["net"],
+                "points": pts,
+                "designator_pos": [x_mid - 150, c["sy"] + 15],
+                "comment_pos": [x_mid + 200, c["sy"] + 15],
+                "parameters": c.get("parameters", {}),
+            }
+        )
+
+    # 2. Stepped wires with co-linear channel re-use
+    channels: list[dict[str, Any]] = []
+
+    def allocate_channel(ymin: int, ymax: int) -> int:
+        for ch in channels:
+            conflict = False
+            for c_ymin, c_ymax in ch["intervals"]:
+                if not (ymax + min_gap <= c_ymin or ymin >= c_ymax + min_gap):
+                    conflict = True
+                    break
+            if not conflict:
+                ch["intervals"].append((ymin, ymax))
+                return ch["x"]
+        new_x = base_x + direction_sign * (len(channels) * channel_pitch)
+        channels.append({"x": new_x, "intervals": [(ymin, ymax)]})
+        return new_x
+
+    for c in up_wires_sorted + down_wires_sorted:
+        ymin = min(c["sy"], c["dy"])
+        ymax = max(c["sy"], c["dy"])
+        tx = allocate_channel(ymin, ymax)
+        pts = [c["sx"], c["sy"], tx, c["sy"], tx, c["dy"], c["dx"], c["dy"]]
+
+        # Find longest horizontal segment for midpoint labeling
+        len1 = abs(tx - c["sx"])
+        len2 = abs(c["dx"] - tx)
+        if len1 >= len2:
+            mid_x = (c["sx"] + tx) // 2
+            mid_y = c["sy"]
+        else:
+            mid_x = (tx + c["dx"]) // 2
+            mid_y = c["dy"]
+
+        routed_wires.append(
+            {
+                "designator": c["id"],
+                "net": c["net"],
+                "points": pts,
+                "designator_pos": [mid_x - 150, mid_y + 15],
+                "comment_pos": [mid_x + 200, mid_y + 15],
+                "parameters": c.get("parameters", {}),
+            }
+        )
+
+    return routed_wires
+
+
 def calculate_harness_reroute(
     document_path: Path | str,
     trunk_x_start: int | None = None,
     splice_x: int | None = None,
-    channel_spacing_mils: int = 120,
+    channel_spacing_mils: int = 300,
 ) -> dict[str, Any]:
     """Calculate an optimal, collision-free orthogonal routing layout for a .WirDoc.
 
@@ -25,7 +118,7 @@ def calculate_harness_reroute(
         document_path: Path to the target .WirDoc file.
         trunk_x_start: Optional starting X coordinate for vertical trunk in mils.
         splice_x: Optional X coordinate for splices in mils.
-        channel_spacing_mils: Distance between parallel vertical trunk channels.
+        channel_spacing_mils: Distance between parallel vertical trunk channels (default 300 mils).
 
     Returns:
         Dictionary containing structured 'connectors', 'wires', 'splices',
@@ -38,6 +131,48 @@ def calculate_harness_reroute(
     parsed = parse_wirdoc(doc_path)
     found_des = {c["designator"] for c in parsed.get("connectors", [])}
 
+    # If document has existing wires and is not slave sense, perform generic dynamic routing
+    if "Slave_Sense" not in doc_path.name and parsed.get("wires"):
+        generic_conns = []
+        for w in parsed["wires"]:
+            pts = w["points"]
+            if len(pts) >= 4:
+                sx, sy = pts[0] * 10, pts[1] * 10
+                dx, dy = pts[-2] * 10, pts[-1] * 10
+                if sx > dx:
+                    sx, sy, dx, dy = dx, dy, sx, sy
+                generic_conns.append(
+                    {
+                        "id": w["designator"],
+                        "net": w["net"],
+                        "sx": sx,
+                        "sy": sy,
+                        "dx": dx,
+                        "dy": dy,
+                        "parameters": w.get("parameters", {}),
+                    }
+                )
+        base_x = trunk_x_start if trunk_x_start is not None else 16500
+        routed = route_topological_bundle(
+            generic_conns,
+            base_x=base_x,
+            direction_sign=1,
+            channel_pitch=channel_spacing_mils,
+        )
+        return {
+            "connectors": [],
+            "rectangles": [],
+            "wires": routed,
+            "splices": parsed.get("splices", []),
+            "no_connects": parsed.get("no_connects", []),
+            "net_labels": parsed.get("net_labels", []),
+            "summary": {
+                "wire_count": len(routed),
+                "splice_count": len(parsed.get("splices", [])),
+                "no_connect_count": len(parsed.get("no_connects", [])),
+            },
+        }
+
     if "Slave_Sense" not in doc_path.name and not {
         "P1",
         "P3",
@@ -46,10 +181,8 @@ def calculate_harness_reroute(
         "P6",
     }.issubset(found_des):
         raise NotImplementedError(
-            f"Automated full re-routing is currently configured for Slave Sense Harness sheets "
-            f"(with connectors P1, P2, J1, P3, P4, P5, P6). "
-            f"The target document '{doc_path.name}' contains connectors: {sorted(found_des)}. "
-            f"To route this sheet, use add_harness_wiring with sheet-specific wiring rules."
+            f"The target document '{doc_path.name}' contains connectors: {sorted(found_des)} "
+            f"without existing wires to route. Please place initial wiring or connectors first."
         )
 
     if trunk_x_start is None:
@@ -58,16 +191,22 @@ def calculate_harness_reroute(
     if splice_x is None:
         splice_x = 13500
 
-    # Standardized non-overlapping connector positions for ANSI D sheet (34000 x 22000 mils)
+    # Standardized connector positions (aligned with current 300mil placement)
     conn_positions = {
-        "P1": (9100, 19500),
-        "P2": (9100, 12000),
-        "J1": (9100, 7500),
-        "P3": (21700, 19500),
-        "P4": (21700, 15200),
-        "P5": (21700, 10900),
-        "P6": (21700, 6600),
+        "P1": (7300, 15400),
+        "P2": (7300, 8200),
+        "J1": (7300, 17200),
+        "P3": (22900, 17700),
+        "P4": (22900, 13400),
+        "P5": (22900, 9100),
+        "P6": (22900, 4800),
     }
+    if parsed.get("connectors"):
+        for c in parsed["connectors"]:
+            conn_positions[c["designator"]] = (
+                c["location"]["x"] * 10,
+                c["location"]["y"] * 10,
+            )
 
     # Pin hot ends dictionary: pin_hot_ends[conn_des][pin_num] = (hot_x, hot_y)
     pin_hot_ends = {}
@@ -159,11 +298,27 @@ def calculate_harness_reroute(
             p: (bx - (300 if l == 200 else 400), by + dy) for p, l, dy in mod_pins_def
         }
 
+    # Override pin_hot_ends dynamically from parsed document if available
+    if parsed.get("connectors"):
+        for c in parsed["connectors"]:
+            cdes = c["designator"]
+            if cdes not in pin_hot_ends:
+                pin_hot_ends[cdes] = {}
+            for p in c.get("pins", []):
+                pin_hot_ends[cdes][p["designator"]] = (
+                    p["hot_end"]["x"] * 10,
+                    p["hot_end"]["y"] * 10,
+                )
+
     # 1. Splices Configuration
-    # SP1: Module 2 V4 -> BMSS C8 (Pin 16 at Y=16800) & BMSS C9 (Pin 6 at Y=16500)
-    # SP2: Module 4 V4 -> BMSS C17 (Pin 21 at Y=13800) & BMSS C18 (Pin 11 at Y=13500)
-    sp1_x, sp1_y = splice_x, 16650
-    sp2_x, sp2_y = splice_x, 13650
+    # SP1: in-line with P1 pin 16 (Y=12700) at X=9400
+    # SP2: in-line with P1 pin 21 (Y=9700) at X=9400
+    parsed_splices = {
+        s["designator"]: (s["location"]["x"] * 10, s["location"]["y"] * 10)
+        for s in parsed.get("splices", [])
+    }
+    sp1_x, sp1_y = parsed_splices.get("SP1", (9400, 12700))
+    sp2_x, sp2_y = parsed_splices.get("SP2", (9400, 9700))
     splices = [
         {"designator": "SP1", "x": sp1_x, "y": sp1_y, "color": "Orange"},
         {"designator": "SP2", "x": sp2_x, "y": sp2_y, "color": "Red"},
@@ -584,59 +739,47 @@ def calculate_harness_reroute(
         ),
     ]
 
-    # Assign trunk channels by sorting wires by destination dy (ascending)
-    ordered_wires = sorted(wires_io, key=lambda w: (w[5], w[3]))
-    tx_map = {
-        w[0]: trunk_x_start + i * channel_spacing_mils
-        for i, w in enumerate(ordered_wires)
-    }
-
-    wires = []
-    # Sort by sy for slot staggering
-    all_main = sorted(wires_io, key=lambda w: w[3])
-    for idx, (wid, net, sx, sy, dx, dy, gauge, color, border) in enumerate(all_main):
-        tx = tx_map[wid]
-        if sy == dy:
-            pts = [sx, sy, dx, dy]
+    # Route using generic topological bundles with 300 mil pitch and midpoint labels
+    west_conns = []
+    east_conns = []
+    for wid, net, sx, sy, dx, dy, gauge, color, border in wires_io:
+        c = {
+            "id": wid,
+            "net": net,
+            "sx": min(sx, dx),
+            "sy": sy if sx <= dx else dy,
+            "dx": max(sx, dx),
+            "dy": dy if sx <= dx else sy,
+            "parameters": {
+                "Gauge": gauge,
+                "Color": color,
+                "VoltageRating": "600V",
+                "Border": border,
+            },
+        }
+        if dx <= 12000:
+            west_conns.append(c)
         else:
-            pts = [sx, sy, tx, sy, tx, dy, dx, dy]
+            east_conns.append(c)
 
-        phase = idx % 2
-        if phase == 0:
-            x_des = 16800
-            x_com = 17150
-        else:
-            x_des = 18200
-            x_com = 18550
+    west_wires = route_topological_bundle(
+        west_conns, base_x=9900, direction_sign=1, channel_pitch=channel_spacing_mils
+    )
+    east_wires = route_topological_bundle(
+        east_conns, base_x=16500, direction_sign=1, channel_pitch=channel_spacing_mils
+    )
+    wires = west_wires + east_wires
 
-        y_label = sy + 15
-        wires.append(
-            {
-                "designator": wid,
-                "net": net,
-                "points": pts,
-                "designator_pos": [x_des, y_label],
-                "comment_pos": [x_com, y_label],
-                "parameters": {
-                    "Gauge": gauge,
-                    "Color": color,
-                    "VoltageRating": "600V",
-                    "Border": border,
-                },
-            }
-        )
-
-    # Splice branch wires
-    # SP1 (Mod 2 V4 -> BMSS C8 & C9)
+    # In-line Splices: primary branch is straight horizontal pass-through
     p1_c8_x, p1_c8_y = pin_hot_ends["P1"]["16"]
     p1_c9_x, p1_c9_y = pin_hot_ends["P1"]["6"]
     wires.append(
         {
             "designator": "W14A",
             "net": "BMSS_C08 (Cell 8 Pos)",
-            "points": [sp1_x, sp1_y, sp1_x, p1_c8_y, p1_c8_x, p1_c8_y],
-            "designator_pos": [11200, p1_c8_y + 15],
-            "comment_pos": [11550, p1_c8_y + 15],
+            "points": [p1_c8_x, p1_c8_y, sp1_x, p1_c8_y],
+            "designator_pos": [(p1_c8_x + sp1_x) // 2 - 150, p1_c8_y + 15],
+            "comment_pos": [(p1_c8_x + sp1_x) // 2 + 200, p1_c8_y + 15],
             "parameters": {
                 "Gauge": "22 AWG",
                 "Color": "Orange",
@@ -649,9 +792,9 @@ def calculate_harness_reroute(
         {
             "designator": "W14B",
             "net": "BMSS_C09 (Cell 9 Pos)",
-            "points": [sp1_x, sp1_y, sp1_x, p1_c9_y, p1_c9_x, p1_c9_y],
-            "designator_pos": [12200, p1_c9_y + 15],
-            "comment_pos": [12550, p1_c9_y + 15],
+            "points": [p1_c9_x, p1_c9_y, sp1_x, p1_c9_y, sp1_x, sp1_y],
+            "designator_pos": [(p1_c9_x + sp1_x) // 2 - 150, p1_c9_y + 15],
+            "comment_pos": [(p1_c9_x + sp1_x) // 2 + 200, p1_c9_y + 15],
             "parameters": {
                 "Gauge": "22 AWG",
                 "Color": "Orange",
@@ -668,9 +811,9 @@ def calculate_harness_reroute(
         {
             "designator": "W31A",
             "net": "BMSS_C17 (Cell 17 Pos)",
-            "points": [sp2_x, sp2_y, sp2_x, p1_c17_y, p1_c17_x, p1_c17_y],
-            "designator_pos": [11200, p1_c17_y + 15],
-            "comment_pos": [11550, p1_c17_y + 15],
+            "points": [p1_c17_x, p1_c17_y, sp2_x, p1_c17_y],
+            "designator_pos": [(p1_c17_x + sp2_x) // 2 - 150, p1_c17_y + 15],
+            "comment_pos": [(p1_c17_x + sp2_x) // 2 + 200, p1_c17_y + 15],
             "parameters": {
                 "Gauge": "22 AWG",
                 "Color": "Red",
@@ -683,9 +826,9 @@ def calculate_harness_reroute(
         {
             "designator": "W31B",
             "net": "BMSS_C18 (Cell 18 Pos)",
-            "points": [sp2_x, sp2_y, sp2_x, p1_c18_y, p1_c18_x, p1_c18_y],
-            "designator_pos": [12200, p1_c18_y + 15],
-            "comment_pos": [12550, p1_c18_y + 15],
+            "points": [p1_c18_x, p1_c18_y, sp2_x, p1_c18_y, sp2_x, sp2_y],
+            "designator_pos": [(p1_c18_x + sp2_x) // 2 - 150, p1_c18_y + 15],
+            "comment_pos": [(p1_c18_x + sp2_x) // 2 + 200, p1_c18_y + 15],
             "parameters": {
                 "Gauge": "22 AWG",
                 "Color": "Red",
@@ -862,6 +1005,6 @@ def calculate_harness_reroute(
             "splice_count": len(splices),
             "no_connect_count": len(no_connects),
             "net_label_count": len(net_labels),
-            "trunk_channels": len(tx_map),
+            "trunk_channels": len(wires),
         },
     }
