@@ -4,11 +4,12 @@ Enables reading, inspecting, and rule-checking Altium Harness Wiring Diagrams,
 Layout Drawings, and Project files directly without requiring Altium GUI
 compilation or licensing.
 """
+
 from __future__ import annotations
 
 import configparser
-from pathlib import Path
 import struct
+from pathlib import Path
 from typing import Any
 
 import olefile
@@ -41,9 +42,7 @@ def extract_ole_records(
         raise FileNotFoundError(f"File not found: {path}")
 
     if not olefile.isOleFile(str(path)):
-        raise ValueError(
-            f"File is not a valid Altium OLE compound document: {path}"
-        )
+        raise ValueError(f"File is not a valid Altium OLE compound document: {path}")
 
     with olefile.OleFileIO(str(path)) as ole:
         if not ole.exists(stream_name):
@@ -129,11 +128,23 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 "net": "?",
                 "points": pts,
                 "unique_id": props.get("UniqueID", ""),
+                "end_vertex1_conn_uid": props.get(
+                    "EndVertex1ConnectedObjectUniqueID", ""
+                ),
+                "end_vertex2_conn_uid": props.get(
+                    "EndVertex2ConnectedObjectUniqueID", ""
+                ),
                 "parameters": {},
             }
         elif rtype == "108":  # Harness Splice
             sx = props.get("Location.X") or props.get("Location.X_Frac", 0)
             sy = props.get("Location.Y") or props.get("Location.Y_Frac", 0)
+            conn_count = int(props.get("ConnectedWiresUniqueIdsCount", 0))
+            conn_wire_uids = [
+                props[f"ConnectedWireUniqueId{ci}"]
+                for ci in range(1, conn_count + 1)
+                if f"ConnectedWireUniqueId{ci}" in props
+            ]
             splices_dict[idx] = {
                 "index": idx,
                 "designator": "?",
@@ -142,16 +153,20 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                     "y": int(sy),
                 },
                 "unique_id": props.get("UniqueID", ""),
-                "connected_wires_count": int(props.get("ConnectedWiresUniqueIdsCount", 0)),
+                "connected_wires_count": conn_count,
+                "connected_wire_uids": conn_wire_uids,
             }
         elif rtype == "119":  # Harness No-Connect
             ncx = props.get("Location.X") or props.get("Location.X_Frac", 0)
             ncy = props.get("Location.Y") or props.get("Location.Y_Frac", 0)
-            no_connects_list.append({
-                "x": int(ncx),
-                "y": int(ncy),
-                "unique_id": props.get("UniqueID", ""),
-            })
+            no_connects_list.append(
+                {
+                    "x": int(ncx),
+                    "y": int(ncy),
+                    "name": props.get("Text", ""),
+                    "unique_id": props.get("UniqueID", ""),
+                }
+            )
         elif rtype in ["34", "41"]:  # Component / Wire / Splice Parameter
             owner = int(props.get("OwnerIndex", -1))
             name = props.get("Name", "")
@@ -171,59 +186,199 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                     wires_dict[owner]["net"] = val
                 elif name:
                     wires_dict[owner]["parameters"][name] = val
-            elif owner in splices_dict:
-                if name == "Designator" and val:
-                    splices_dict[owner]["designator"] = val
+            elif owner in splices_dict and name == "Designator" and val:
+                splices_dict[owner]["designator"] = val
         elif rtype == "113":  # Harness Connector Pin
             owner = int(props.get("OwnerIndex", -1))
             if owner in connectors:
-                connectors[owner]["pins"].append({
-                    "designator": props.get("Designator", ""),
-                    "name": props.get("Name", ""),
-                    "electrical": int(props.get("Electrical", 0)),
-                    "location": {
-                        "x": int(props.get("Location.X", 0)),
-                        "y": int(props.get("Location.Y", 0)),
-                    },
-                    "unique_id": props.get("UniqueID", ""),
-                    "net": None,
-                })
-        elif rtype in ["4", "25"]:  # Net Label (4: Harness/Text Label, 25: Standard Net Label)
+                x_base = int(props.get("Location.X", 0))
+                y_base = int(props.get("Location.Y", 0))
+                length = int(props.get("PinLength", 0))
+                cong = int(props.get("PinConglomerate", 0))
+                orient = cong & 0x03
+                if orient == 0:
+                    hx, hy = x_base + length, y_base
+                elif orient == 1:
+                    hx, hy = x_base, y_base + length
+                elif orient == 2:
+                    hx, hy = x_base - length, y_base
+                else:
+                    hx, hy = x_base, y_base - length
+
+                conn_count = int(props.get("ConnectedWiresUniqueIdsCount", 0))
+                conn_wire_uids = [
+                    props[f"ConnectedWireUniqueId{ci}"]
+                    for ci in range(1, conn_count + 1)
+                    if f"ConnectedWireUniqueId{ci}" in props
+                ]
+
+                connectors[owner]["pins"].append(
+                    {
+                        "designator": props.get("Designator", ""),
+                        "name": props.get("Name", ""),
+                        "electrical": int(props.get("Electrical", 0)),
+                        "location": {
+                            "x": x_base,
+                            "y": y_base,
+                        },
+                        "hot_end": {
+                            "x": hx,
+                            "y": hy,
+                        },
+                        "length": length,
+                        "orientation": orient,
+                        "unique_id": props.get("UniqueID", ""),
+                        "connected_wire_uids": conn_wire_uids,
+                        "connected_wire": None,
+                        "net": None,
+                        "is_no_connect": False,
+                        "no_connect_id": None,
+                    }
+                )
+        elif rtype in [
+            "4",
+            "25",
+        ]:  # Net Label (4: Harness/Text Label, 25: Standard Net Label)
             text = props.get("Text", "").strip()
             if text:
-                net_labels.append({
-                    "text": text,
-                    "x": int(props.get("Location.X", 0)),
-                    "y": int(props.get("Location.Y", 0)),
-                    "color": props.get("Color", ""),
-                    "unique_id": props.get("UniqueID", ""),
-                })
+                net_labels.append(
+                    {
+                        "text": text,
+                        "x": int(props.get("Location.X", 0)),
+                        "y": int(props.get("Location.Y", 0)),
+                        "color": props.get("Color", ""),
+                        "unique_id": props.get("UniqueID", ""),
+                    }
+                )
 
     # Resolve comment if "=PartNumber" or empty
     for c in connectors.values():
         if c.get("comment") == "=PartNumber" or not c.get("comment"):
             c["comment"] = c["parameters"].get(
                 "PartNumber",
-                c["parameters"].get("Manufacturer Part Number 1", c["description"])
+                c["parameters"].get("Manufacturer Part Number 1", c["description"]),
             )
 
-    # Second pass: Associate net labels to pins by spatial proximity
-    # In Altium wiring diagrams, net labels are attached directly at pin wire endpoints
+    # Second pass: Associate No-Connect directives to pins
     for c in connectors.values():
         for pin in c["pins"]:
-            px, py = pin["location"]["x"], pin["location"]["y"]
-            candidates = [
-                nl["text"]
-                for nl in net_labels
-                if abs(nl["y"] - py) <= 8 and abs(nl["x"] - px) <= 45
-            ]
-            if candidates:
-                pin["net"] = candidates[0]
+            hx, hy = pin["hot_end"]["x"], pin["hot_end"]["y"]
+            for nc in no_connects_list:
+                if (nc["x"] == hx and nc["y"] == hy) or (
+                    nc["unique_id"] and nc["unique_id"] == pin["unique_id"]
+                ):
+                    pin["is_no_connect"] = True
+                    pin["no_connect_id"] = nc["name"]
+                    break
+
+    # Third pass: Associate wires to pins and splices
+    pin_by_uid = {}
+    pin_by_hotend = {}
+    for c in connectors.values():
+        for pin in c["pins"]:
+            pin_by_uid[pin["unique_id"]] = (c, pin)
+            pin_by_hotend[(pin["hot_end"]["x"], pin["hot_end"]["y"])] = (c, pin)
+
+    splice_by_uid = {}
+    splice_by_loc = {}
+    for s in splices_dict.values():
+        splice_by_uid[s["unique_id"]] = s
+        splice_by_loc[(s["location"]["x"], s["location"]["y"])] = s
+
+    for w in wires_dict.values():
+        pts = w["points"]
+        if len(pts) >= 4:
+            e1 = (pts[0], pts[1])
+            e2 = (pts[-2], pts[-1])
+            w_net = w["net"] if w["net"] != "?" else None
+
+            # Endpoint 1
+            matched_pin1 = pin_by_uid.get(
+                w["end_vertex1_conn_uid"]
+            ) or pin_by_hotend.get(e1)
+            if matched_pin1:
+                _, p1 = matched_pin1
+                p1["connected_wire"] = w["designator"]
+                if w_net and not p1["net"]:
+                    p1["net"] = w_net
+
+            # Endpoint 2
+            matched_pin2 = pin_by_uid.get(
+                w["end_vertex2_conn_uid"]
+            ) or pin_by_hotend.get(e2)
+            if matched_pin2:
+                _, p2 = matched_pin2
+                p2["connected_wire"] = w["designator"]
+                if w_net and not p2["net"]:
+                    p2["net"] = w_net
+
+    # Fourth pass: Trace and propagate nets across splices
+    for s in splices_dict.values():
+        s_loc = (s["location"]["x"], s["location"]["y"])
+        s_uid = s["unique_id"]
+        splice_wires = []
+        for w in wires_dict.values():
+            pts = w["points"]
+            if len(pts) >= 4:
+                e1 = (pts[0], pts[1])
+                e2 = (pts[-2], pts[-1])
+                if (
+                    w["end_vertex1_conn_uid"] == s_uid
+                    or w["end_vertex2_conn_uid"] == s_uid
+                    or e1 == s_loc
+                    or e2 == s_loc
+                    or w["unique_id"] in s["connected_wire_uids"]
+                ):
+                    splice_wires.append(w)
+
+        splice_pins = []
+        splice_net_names = []
+        for w in splice_wires:
+            if w["net"] != "?":
+                splice_net_names.append(w["net"])
+            for pt in [
+                (w["points"][0], w["points"][1]),
+                (w["points"][-2], w["points"][-1]),
+            ]:
+                if pt in pin_by_hotend:
+                    splice_pins.append(pin_by_hotend[pt][1])
+
+        chosen_net = None
+        if splice_net_names:
+            chosen_net = splice_net_names[0]
+        else:
+            for p in splice_pins:
+                if p["net"]:
+                    chosen_net = p["net"]
+                    break
+
+        if chosen_net:
+            for p in splice_pins:
+                p["net"] = chosen_net
+
+    # Fifth pass: Spatial fallback for net labels touching pins
+    for c in connectors.values():
+        for pin in c["pins"]:
+            if not pin["net"]:
+                hx, hy = pin["hot_end"]["x"], pin["hot_end"]["y"]
+                px, py = pin["location"]["x"], pin["location"]["y"]
+                candidates = [
+                    nl["text"]
+                    for nl in net_labels
+                    if (abs(nl["y"] - hy) <= 8 and abs(nl["x"] - hx) <= 45)
+                    or (abs(nl["y"] - py) <= 8 and abs(nl["x"] - px) <= 45)
+                ]
+                if candidates:
+                    pin["net"] = candidates[0]
 
     connector_list = sorted(connectors.values(), key=lambda c: c["designator"])
     total_pins = sum(len(c["pins"]) for c in connector_list)
     connected_pins = sum(
-        sum(1 for p in c["pins"] if p["net"] is not None)
+        sum(
+            1
+            for p in c["pins"]
+            if p["net"] is not None or p.get("connected_wire") is not None
+        )
         for c in connector_list
     )
 
@@ -235,16 +390,16 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 net_name = pin["net"]
                 if net_name not in nets_to_pins:
                     nets_to_pins[net_name] = []
-                nets_to_pins[net_name].append({
-                    "connector": c["designator"],
-                    "pin": pin["designator"],
-                    "pin_name": pin["name"],
-                    "electrical": pin["electrical"],
-                })
+                nets_to_pins[net_name].append(
+                    {
+                        "connector": c["designator"],
+                        "pin": pin["designator"],
+                        "pin_name": pin["name"],
+                        "electrical": pin["electrical"],
+                    }
+                )
 
-    unique_nets = sorted(
-        list(set(nl["text"] for nl in net_labels).union(nets_to_pins.keys()))
-    )
+    unique_nets = sorted({nl["text"] for nl in net_labels}.union(nets_to_pins.keys()))
 
     wires_list = sorted(wires_dict.values(), key=lambda w: w["designator"])
     splices_list = sorted(splices_dict.values(), key=lambda s: s["designator"])
@@ -306,10 +461,12 @@ def parse_prjhar(file_path: Path | str) -> dict[str, Any]:
                     ".bomdoc": "BOM",
                     ".hardwf": "HarnessDrawing",
                 }
-                documents.append({
-                    "path": doc_path,
-                    "kind": kind_map.get(ext, "Unknown"),
-                })
+                documents.append(
+                    {
+                        "path": doc_path,
+                        "kind": kind_map.get(ext, "Unknown"),
+                    }
+                )
         elif section.lower().startswith("parameter"):
             name = config.get(section, "Name", fallback="")
             val = config.get(section, "Value", fallback="")
@@ -456,15 +613,17 @@ def get_harness_component_pins(
     for c in all_components:
         if des_set is not None and c["designator"] not in des_set:
             continue
-        result.append({
-            "designator": c["designator"],
-            "x": c["location"]["x"],
-            "y": c["location"]["y"],
-            "rotation": 0,
-            "layer": "HarnessWiringDiagram",
-            "sheet": c["sheet"],
-            "pins": c["pins"],
-        })
+        result.append(
+            {
+                "designator": c["designator"],
+                "x": c["location"]["x"],
+                "y": c["location"]["y"],
+                "rotation": 0,
+                "layer": "HarnessWiringDiagram",
+                "sheet": c["sheet"],
+                "pins": c["pins"],
+            }
+        )
     return result
 
 
@@ -475,7 +634,7 @@ def get_harness_nets(file_path: Path | str) -> list[str]:
     for w_path in wiring_docs:
         data = parse_wirdoc(w_path)
         nets.update(data.get("nets", []))
-    return sorted(list(nets))
+    return sorted(nets)
 
 
 def get_harness_net_connections(
@@ -494,14 +653,16 @@ def get_harness_net_connections(
             if net not in all_connections:
                 all_connections[net] = []
             for p in pins:
-                all_connections[net].append({
-                    "component": p["connector"],
-                    "designator": p["connector"],
-                    "pin": p["pin"],
-                    "pad": p["pin"],
-                    "pin_name": p["pin_name"],
-                    "sheet": w_path.name,
-                })
+                all_connections[net].append(
+                    {
+                        "component": p["connector"],
+                        "designator": p["connector"],
+                        "pin": p["pin"],
+                        "pad": p["pin"],
+                        "pin_name": p["pin_name"],
+                        "sheet": w_path.name,
+                    }
+                )
 
     net_filter = set(net_names) if net_names else None
     results: list[dict[str, Any]] = []
@@ -509,11 +670,13 @@ def get_harness_net_connections(
     for net_name in sorted(all_connections.keys()):
         if net_filter is not None and net_name not in net_filter:
             continue
-        results.append({
-            "net": net_name,
-            "pins": all_connections[net_name],
-            "pin_count": len(all_connections[net_name]),
-        })
+        results.append(
+            {
+                "net": net_name,
+                "pins": all_connections[net_name],
+                "pin_count": len(all_connections[net_name]),
+            }
+        )
 
     return results
 
@@ -523,12 +686,12 @@ def get_harness_property_names(file_path: Path | str) -> list[str]:
     components = get_harness_components(file_path, include_parameters=True)
     prop_names: set[str] = set()
     for comp in components:
-        for k in comp.keys():
+        for k in comp:
             if k != "parameters":
                 prop_names.add(k)
-        for pk in comp.get("parameters", {}).keys():
+        for pk in comp.get("parameters", {}):
             prop_names.add(pk)
-    return sorted(list(prop_names))
+    return sorted(prop_names)
 
 
 def get_harness_property_values(
@@ -546,10 +709,12 @@ def get_harness_property_values(
             val = comp["parameters"][property_name]
 
         if val is not None:
-            values.append({
-                "designator": des,
-                property_name: val,
-            })
+            values.append(
+                {
+                    "designator": des,
+                    property_name: val,
+                }
+            )
     return values
 
 
@@ -575,23 +740,27 @@ def get_harness_erc_violations(file_path: Path | str) -> dict[str, Any]:
             des = c["designator"]
             # 1. Unannotated designator check
             if "?" in des:
-                violations.append({
-                    "level": "Error",
-                    "type": "Unannotated Designator",
-                    "detail": (
-                        f"Component has unannotated designator '{des}' in {doc.name}"
-                    ),
-                })
+                violations.append(
+                    {
+                        "level": "Error",
+                        "type": "Unannotated Designator",
+                        "detail": (
+                            f"Component has unannotated designator '{des}' in {doc.name}"
+                        ),
+                    }
+                )
             # 2. Duplicate designator check
             elif des in seen_designators:
-                violations.append({
-                    "level": "Error",
-                    "type": "Duplicate Designator",
-                    "detail": (
-                        f"Duplicate designator '{des}' found in {doc.name} "
-                        f"(also in {seen_designators[des]})"
-                    ),
-                })
+                violations.append(
+                    {
+                        "level": "Error",
+                        "type": "Duplicate Designator",
+                        "detail": (
+                            f"Duplicate designator '{des}' found in {doc.name} "
+                            f"(also in {seen_designators[des]})"
+                        ),
+                    }
+                )
             else:
                 seen_designators[des] = doc.name
 
@@ -599,29 +768,35 @@ def get_harness_erc_violations(file_path: Path | str) -> dict[str, Any]:
             if not c.get("lib_reference") and not c.get("parameters", {}).get(
                 "PartNumber"
             ):
-                violations.append({
-                    "level": "Warning",
-                    "type": "Missing Component Reference",
-                    "detail": (
-                        f"Component '{des}' has no library reference or "
-                        f"PartNumber in {doc.name}"
-                    ),
-                })
+                violations.append(
+                    {
+                        "level": "Warning",
+                        "type": "Missing Component Reference",
+                        "detail": (
+                            f"Component '{des}' has no library reference or "
+                            f"PartNumber in {doc.name}"
+                        ),
+                    }
+                )
 
             # Check pins
             for pin in c.get("pins", []):
                 p_des = pin["designator"]
                 p_net = pin.get("net")
-                if not p_net:
-                    violations.append({
-                        "level": "Warning",
-                        "type": "Unconnected Pin",
-                        "detail": (
-                            f"Unconnected pin {des}.{p_des} "
-                            f"({pin.get('name', '')}) in {doc.name}"
-                        ),
-                    })
-                else:
+                is_nc = pin.get("is_no_connect", False)
+                has_wire = bool(pin.get("connected_wire"))
+                if not p_net and not is_nc and not has_wire:
+                    violations.append(
+                        {
+                            "level": "Warning",
+                            "type": "Unconnected Pin",
+                            "detail": (
+                                f"Unconnected pin {des}.{p_des} "
+                                f"({pin.get('name', '')}) in {doc.name}"
+                            ),
+                        }
+                    )
+                elif p_net:
                     if p_net not in all_net_connections:
                         all_net_connections[p_net] = []
                     all_net_connections[p_net].append(f"{des}.{p_des}")
@@ -629,11 +804,13 @@ def get_harness_erc_violations(file_path: Path | str) -> dict[str, Any]:
     # 4. Single pin nets check
     for net, pins in all_net_connections.items():
         if len(pins) == 1:
-            violations.append({
-                "level": "Warning",
-                "type": "Single Pin Net",
-                "detail": f"Net '{net}' has only 1 connection ({pins[0]})",
-            })
+            violations.append(
+                {
+                    "level": "Warning",
+                    "type": "Single Pin Net",
+                    "detail": f"Net '{net}' has only 1 connection ({pins[0]})",
+                }
+            )
 
     fatal_count = sum(1 for v in violations if v["level"] == "Fatal")
     error_count = sum(1 for v in violations if v["level"] == "Error")
