@@ -153,6 +153,12 @@ var
     PrjPath: String;
     ServerDoc: IServerDocument;
     DesignatorsList: TStringList;
+    P, DocIdx: Integer;
+    Project: IProject;
+    Doc: IDocument;
+    ModuleIdx, DocJ: Integer;
+    Module: IServerModule;
+    CurrentDoc: IServerDocument;
 begin
     // Extract the view type parameter
     ViewType := 'pcb';  // Default to PCB
@@ -174,9 +180,8 @@ begin
             end
             else if (Pos('"document_path"', RequestData[i]) > 0) then
             begin
-                ValueStart := Pos(':', RequestData[i]) + 1;
-                ParamValue := Copy(RequestData[i], ValueStart, Length(RequestData[i]) - ValueStart + 1);
-                DocPath := TrimJSON(ParamValue);
+                DocPath := JSONLineValue(RequestData[i]);
+                DocPath := StringReplace(DocPath, '/', '\', REPLACEALL);
             end
             // Look for optional designators array to zoom to before capture
             else if (Pos('"designators"', RequestData[i]) > 0) then
@@ -201,26 +206,57 @@ begin
 
         if (DocPath <> '') then
         begin
-            PrjPath := ChangeFileExt(DocPath, '.PrjHar');
-            if not FileExists(PrjPath) then
-                PrjPath := ChangeFileExt(DocPath, '.PrjPcb');
+            DocPath := StringReplace(DocPath, '/', '\', REPLACEALL);
+            DocPath := StringReplace(DocPath, '\\', '\', REPLACEALL);
 
-            if FileExists(PrjPath) then
+            ServerDoc := FindOpenDocument('connectors.SchLib');
+            if (ServerDoc <> nil) then
             begin
-                ResetParameters;
-                AddStringParameter('FileName', PrjPath);
-                RunProcess('WorkspaceManager:OpenObject');
-                Sleep(800);
+                try
+                    ResetParameters;
+                    AddStringParameter('Action', 'Close');
+                    AddStringParameter('FileName', ServerDoc.FileName);
+                    AddStringParameter('PromptToSave', 'False');
+                    RunProcess('WorkspaceManager:CloseObject');
+                    Sleep(300);
+                except
+                end;
             end;
 
-            ResetParameters;
-            AddStringParameter('FileName', DocPath);
-            RunProcess('WorkspaceManager:OpenObject');
-            Sleep(800);
-            ResetParameters;
-            AddStringParameter('Action', 'All');
-            RunProcess('Schematic:Zoom');
-            Sleep(500);
+            for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+            begin
+                Project := GetWorkspace.DM_Projects(P);
+                if (Project <> nil) then
+                begin
+                    for DocIdx := 0 to Project.DM_LogicalDocumentCount - 1 do
+                    begin
+                        Doc := Project.DM_LogicalDocuments(DocIdx);
+                        if (Doc <> nil) and (AnsiUpperCase(ExtractFileName(Doc.DM_FullPath)) = AnsiUpperCase(ExtractFileName(DocPath))) then
+                        begin
+                            try
+                                Doc.DM_OpenAndFocusDocument;
+                            except
+                            end;
+                            Break;
+                        end;
+                    end;
+                end;
+            end;
+
+            ServerDoc := FindOpenDocument(DocPath);
+            if (ServerDoc = nil) then
+            begin
+                if AnsiUpperCase(ExtractFileExt(DocPath)) = '.WIRDOC' then
+                    ServerDoc := Client.OpenDocument('HarnessWiringDiagram', DocPath)
+                else
+                    ServerDoc := Client.OpenDocument('SCH', DocPath);
+            end;
+            if (ServerDoc <> nil) then
+            begin
+                Client.ShowDocument(ServerDoc);
+                Sleep(500);
+            end;
+
         end;
 
         Result := TakeViewScreenshot(ViewType, DesignatorsList);
@@ -1113,6 +1149,26 @@ begin
     Result := GetProjectComponents(ROOT_DIR, IncludeParams);
 end;
 
+function ExecuteConvertNetlabelsToTextCommand(RequestData: TStringList): String;
+var
+    i: Integer;
+    DocPath: String;
+begin
+    DocPath := '';
+    if (RequestData <> nil) then
+    begin
+        for i := 0 to RequestData.Count - 1 do
+        begin
+            if (Pos('"document_path"', RequestData[i]) > 0) then
+            begin
+                DocPath := JSONLineValue(RequestData[i]);
+                DocPath := StringReplace(DocPath, '/', '\', REPLACEALL);
+            end;
+        end;
+    end;
+    Result := ExecuteConvertNetlabelsToText(ROOT_DIR, DocPath);
+end;
+
 // Function to execute a command with parameters
 function ExecuteCommand(CommandName: String): String;
 var
@@ -1221,6 +1277,8 @@ begin
             Result := ExecuteGetComponentPrimitives(RequestData);
         'add_harness_wiring':
             Result := ExecuteAddHarnessWiring(ROOT_DIR, ROOT_DIR + 'harness_wiring_spec.txt');
+        'convert_netlabels_to_text':
+            Result := ExecuteConvertNetlabelsToTextCommand(RequestData);
     else
         LogScriptError('Error: Unknown command: ' + CommandName);
     end;

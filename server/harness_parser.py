@@ -188,7 +188,7 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                     "unique_id": props.get("UniqueID", ""),
                     "net": None,
                 })
-        elif rtype == "4":  # Net Label
+        elif rtype in ["4", "25"]:  # Net Label (4: Harness/Text Label, 25: Standard Net Label)
             text = props.get("Text", "").strip()
             if text:
                 net_labels.append({

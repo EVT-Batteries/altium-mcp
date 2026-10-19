@@ -3,6 +3,9 @@
 TLDR: Use Claude to control or ask questions about your Altium project.
 This is a Model Context Protocol (MCP) server that provides an interface to interact with Altium Designer through Python. The server allows for querying and manipulation of PCB designs programmatically.
 
+> [!WARNING]
+> **Strict Single-Agent Exclusive Access**: Altium Designer is a single-instance GUI process, and the MCP bridge relies on shared communication files in `C:\Users\Public\altium_mcp\`. Never run two AI agents or parallel tasks concurrently against the Altium MCP. Concurrent access causes request clobbering, rapid tab-switching races, and DelphiScript debugger modal freezes. All Altium tasks must be executed sequentially.
+
 ## Example commands
 - Run all output jobs
 - Create a symbol for the part in the attached datasheet and use the currently open symbol as a reference example.

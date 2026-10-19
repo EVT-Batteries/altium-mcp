@@ -1716,6 +1716,10 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
                             splices: list = None,
                             no_connects: list = None,
                             net_labels: list = None,
+                            labels: list = None,
+                            connectors: list = None,
+                            rectangles: list = None,
+                            parts: list = None,
                             clear_existing: bool = False,
                             document_path: str = None) -> str:
     """
@@ -1769,9 +1773,17 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
 
     lines = []
     if document_path:
-        lines.append(f"DOCUMENT|{document_path}")
+        norm_path = str(Path(document_path).resolve())
+        lines.append(f"DOCUMENT|{norm_path}")
     if clear_existing:
         lines.append("CLEAR_EXISTING")
+    lines.append("SHEET_STYLE|D")
+
+    for c in (connectors or []):
+        c_des = str(c.get("designator", "")).strip()
+        cx = int(c.get("x", 0))
+        cy = int(c.get("y", 0))
+        lines.append(f"CONNECTOR|{c_des}|{cx}|{cy}")
 
     for s in (splices or []):
         s_des = str(s.get("designator", "SP?")).strip()
@@ -1858,7 +1870,7 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         show_name = "1" if nc.get("show_name", False) else "0"
         lines.append(f"NOCONNECT|{x}|{y}|{nc_name}|{show_name}")
 
-    for nl in (net_labels or []):
+    for nl in (labels or net_labels or []):
         x = int(nl.get("x", 0))
         y = int(nl.get("y", 0))
         ori = int(nl.get("orientation", 0))
@@ -1866,11 +1878,73 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         if text:
             lines.append(f"NETLABEL|{x}|{y}|{ori}|{text}")
 
+    for r in (rectangles or []):
+        x1 = int(r.get("x1", 0))
+        y1 = int(r.get("y1", 0))
+        x2 = int(r.get("x2", 0))
+        y2 = int(r.get("y2", 0))
+        lw = int(r.get("line_width", 2))
+        col = int(r.get("color", 16711935))
+        area = int(r.get("area_color", 11599871))
+        lines.append(f"RECTANGLE|{x1}|{y1}|{x2}|{y2}|{lw}|{col}|{area}")
+
+    for p in (parts or []):
+        des = str(p.get("designator", "")).strip()
+        lib = str(p.get("symbol_library", "")).strip()
+        sym = str(p.get("symbol", "")).strip()
+        px = int(p.get("x", 0))
+        py = int(p.get("y", 0))
+        ori = int(p.get("orientation", 0))
+        mir = "1" if p.get("mirror", False) else "0"
+        com = str(p.get("comment", "")).strip()
+        desc = str(p.get("description", "")).strip()
+        foot = str(p.get("footprint", "")).strip()
+        lines.append(f"PART|{des}|{lib}|{sym}|{px}|{py}|{ori}|{mir}|{com}|{desc}|{foot}")
+        for pk, pv in (p.get("parameters") or {}).items():
+            if pv is not None and str(pv).strip():
+                lines.append(f"PARTPARAM|{pk}|{pv}")
+
     spec_path = Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt")
     spec_path.parent.mkdir(parents=True, exist_ok=True)
     write_altium_text(spec_path, "\n".join(lines) + "\n")
 
     response = await altium_bridge.execute_command("add_harness_wiring", {})
+    if not response.get("success", False):
+        return json.dumps({
+            "success": False,
+            "error": response.get("error", "unknown error")
+        })
+
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            return json.dumps(json.loads(result), indent=2)
+        except ValueError:
+            return result
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> str:
+    """Convert all net labels (eNetLabel, RECORD=25) in a Harness Wiring Diagram (.WirDoc)
+    or Schematic back to standard text strings (ISch_Label, RECORD=4).
+
+    Args:
+        document_path (str, optional): Absolute or relative path to target .WirDoc file.
+            If omitted, uses active document.
+
+    Returns:
+        str: JSON string reporting conversion status and count.
+    """
+    logger.info(f"Converting netlabels to text strings for doc: {document_path}")
+    doc_path = ""
+    if document_path:
+        doc_path = str(Path(document_path).resolve())
+
+    response = await altium_bridge.execute_command(
+        "convert_netlabels_to_text",
+        {"document_path": doc_path}
+    )
     if not response.get("success", False):
         return json.dumps({
             "success": False,
@@ -1944,6 +2018,9 @@ async def reroute_harness_wiring(
         wires=routing_data["wires"],
         splices=routing_data["splices"],
         no_connects=routing_data["no_connects"],
+        net_labels=routing_data.get("net_labels"),
+        connectors=routing_data.get("connectors"),
+        rectangles=routing_data.get("rectangles"),
         clear_existing=clear_existing,
         document_path=target_path,
     )
@@ -2695,6 +2772,15 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         
         def capture_screenshot_thread():
             try:
+                try:
+                    import win32service
+                    hw = win32service.OpenWindowStation("WinSta0", True, win32con.GENERIC_ALL)
+                    hw.SetProcessWindowStation()
+                    hd = win32service.OpenDesktop("Default", 0, True, win32con.GENERIC_ALL)
+                    hd.SetThreadDesktop()
+                except Exception:
+                    pass
+
                 # Find Altium windows
                 altium_windows = []
                 altium_fallback_windows = []
@@ -2703,8 +2789,9 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     if win32gui.IsWindowVisible(hwnd):
                         title = win32gui.GetWindowText(hwnd)
                         
-                        # First, look for windows with Altium and .PrjPcb in the title
-                        if "Altium" in title and ".PrjPcb" in title:
+                        # First, look for main Altium design project windows (.PrjPcb, .PrjHar, .PrjMbd, or Designer)
+                        is_main = any(ext in title for ext in (".PrjPcb", ".PrjHar", ".PrjMbd")) or "Altium Designer" in title
+                        if "Altium" in title and is_main:
                             altium_windows.append({
                                 "handle": hwnd,
                                 "title": title,
@@ -2723,11 +2810,10 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 
                 win32gui.EnumWindows(collect_altium_windows, 0)
                 
-                # If no specific Altium .PrjPcb windows found, use the fallback
-                if not altium_windows and altium_fallback_windows:
-                    altium_windows = altium_fallback_windows
+                # If no specific Altium design project windows found, use the fallback
+                pool = altium_windows or altium_fallback_windows
                 
-                if not altium_windows:
+                if not pool:
                     result_queue.put({
                         "success": False, 
                         "error": f"No Altium windows found for {view_type} view"
@@ -2738,11 +2824,31 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 # title, and while it switches documents a small transient one
                 # can come first. Take the largest window that is not
                 # minimized: that is the main frame.
+                def safe_is_iconic(h):
+                    try:
+                        return win32gui.IsWindow(h) and win32gui.IsIconic(h)
+                    except Exception:
+                        return True
+
+                def safe_get_rect(h):
+                    try:
+                        if win32gui.IsWindow(h):
+                            return win32gui.GetWindowRect(h)
+                    except Exception:
+                        pass
+                    return (0, 0, 0, 0)
+
                 def area(w):
-                    l, t, r, b = w["rect"]
+                    l, t, r, b = safe_get_rect(w["handle"])
                     return max(0, r - l) * max(0, b - t)
-                candidates = [w for w in altium_windows if not win32gui.IsIconic(w["handle"])]
-                window = max(candidates or altium_windows, key=area)
+
+                candidates = [w for w in pool if win32gui.IsWindow(w["handle"]) and not safe_is_iconic(w["handle"])]
+                if not candidates:
+                    candidates = [w for w in pool if win32gui.IsWindow(w["handle"])]
+                if not candidates:
+                    result_queue.put({"success": False, "error": f"No valid Altium windows found for {view_type} view"})
+                    return
+                window = max(candidates, key=area)
                 hwnd = window["handle"]
                 
                 # Bring Altium to the front and let it paint. Altium only

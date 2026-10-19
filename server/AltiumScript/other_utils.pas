@@ -157,6 +157,7 @@ begin
     if (CommandName = 'search_library_symbol') or
        (CommandName = 'build_circuit') or
        (CommandName = 'add_harness_wiring') or
+       (CommandName = 'convert_netlabels_to_text') or
        (CommandName = 'take_view_screenshot') or
        (CommandName = 'get_symbol_primitives') or
        (CommandName = 'create_symbols_batch') or
@@ -258,10 +259,19 @@ begin
             Exit;
         end;
     end
-    else if (DocumentKind = 'SCH') and (SchServer <> Nil) then
+    else if (DocumentKind = 'SCH') then
     begin
-        CurrentDoc := SchServer.GetCurrentSchDocument;
-        if CurrentDoc <> Nil then
+        if (Client.CurrentView <> Nil) and (Client.CurrentView.OwnerDocument <> Nil) then
+        begin
+            if (Client.CurrentView.OwnerDocument.Kind = 'SCH') or 
+               (Client.CurrentView.OwnerDocument.Kind = 'HarnessWiringDiagram') or
+               (AnsiUpperCase(ExtractFileExt(Client.CurrentView.OwnerDocument.FileName)) = '.WIRDOC') then
+            begin
+                Result := True;
+                Exit;
+            end;
+        end;
+        if (SchServer <> Nil) and (SchServer.GetCurrentSchDocument <> Nil) then
         begin
             Result := True;
             Exit;
@@ -495,6 +505,9 @@ var
     ZoomedCount    : Integer;
     FocusedKind    : String;
     FocusedName    : String;
+    i, j           : Integer;
+    Module         : IServerModule;
+    AllDocs        : String;
 
     // For screenshot thread
     ThreadStarted  : Boolean;
@@ -525,16 +538,42 @@ begin
     if (DocType = 'PCB') and (DesignatorsList <> nil) and (DesignatorsList.Count > 0) then
         ZoomedCount := ZoomToComponents(DesignatorsList);
 
+    if (DocType = 'SCH') and (Client <> nil) and (Client.CurrentView <> nil) and (Client.CurrentView.OwnerDocument <> nil) then
+    begin
+        if (Pos('.WIR', AnsiUpperCase(Client.CurrentView.OwnerDocument.FileName)) = 0) and
+           (AnsiUpperCase(Client.CurrentView.OwnerDocument.Kind) <> 'HARNESSWIRINGDIAGRAM') then
+        begin
+            try
+                ResetParameters;
+                AddStringParameter('Action', 'Document');
+                RunProcess('Sch:Zoom');
+            except
+            end;
+        end;
+    end;
+
     // Report what is ACTUALLY focused now that EnsureDocumentFocused has run.
     // The server compares this against the requested view: if no document of
     // the requested kind is open, the focus stays where it was and the
     // capture would otherwise silently show the wrong editor.
     FocusedKind := '';
     FocusedName := '';
-    if (Client.CurrentView <> nil) and (Client.CurrentView.OwnerDocument <> nil) then
+    try
+        if (Client <> nil) and (Client.CurrentView <> nil) and (Client.CurrentView.OwnerDocument <> nil) then
+        begin
+            FocusedKind := Client.CurrentView.OwnerDocument.Kind;
+            FocusedName := ExtractFileName(Client.CurrentView.OwnerDocument.FileName);
+        end;
+    except
+    end;
+
+    AllDocs := '';
+    for i := 0 to Client.Count - 1 do
     begin
-        FocusedKind := Client.CurrentView.OwnerDocument.Kind;
-        FocusedName := ExtractFileName(Client.CurrentView.OwnerDocument.FileName);
+        Module := Client.ServerModule[i];
+        if (Module <> nil) then
+            for j := 0 to Module.DocumentCount - 1 do
+                AllDocs := AllDocs + ExtractFileName(Module.Documents[j].FileName) + '; ';
     end;
 
     // Create result JSON
@@ -545,6 +584,7 @@ begin
         AddJSONProperty(ResultProps, 'view_type', ViewType);
         AddJSONProperty(ResultProps, 'focused_kind', FocusedKind);
         AddJSONProperty(ResultProps, 'focused_document', FocusedName);
+        AddJSONProperty(ResultProps, 'open_client_docs', AllDocs);
         AddJSONProperty(ResultProps, 'class_filter', ClassName);
         AddJSONBoolean(ResultProps, 'window_found', WindowFound);
         AddJSONInteger(ResultProps, 'zoomed_component_count', ZoomedCount);
@@ -942,7 +982,8 @@ begin
         Module := Client.ServerModule[i];
         if (Module <> nil) then
             for j := 0 to Module.DocumentCount - 1 do
-                if (NormalizedPath(Module.Documents[j].FileName) = Want) then
+                if (NormalizedPath(Module.Documents[j].FileName) = Want) or
+                   (ExtractFileName(NormalizedPath(Module.Documents[j].FileName)) = Want) then
                 begin
                     Result := Module.Documents[j];
                     Exit;
