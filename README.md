@@ -80,7 +80,7 @@ Rename-Item altium-mcp.zip altium-mcp.dxt
     "type": "python",
     "entry_point": "start_server.py",
     "mcp_config": {
-      "command": "python",
+      "command": "py",
       "args": ["${__dirname}/start_server.py"]
     }
   }
