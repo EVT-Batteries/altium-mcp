@@ -1,33 +1,27 @@
-from mcp.server.mcpserver import MCPServer, Context
-from mcp.server.mcpserver.utilities.types import Image as MCPImage
-import json
-import os
-import time
 import asyncio
-import logging
-import subprocess
-import tkinter as tk
-from tkinter import filedialog
-from pathlib import Path
-from typing import Dict, Any, Optional
-import sys
-import win32gui
-import win32ui
-import win32con
-import win32api
-import win32process
-from PIL import Image
-import io
 import base64
 import glob
+import io
+import json
+import logging
+import os
 import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
 
+import win32api
+import win32con
+import win32gui
+import win32process
+import win32ui
 from altium_files import read_altium_text, write_altium_text
 from harness_parser import (
     find_workspace_harness,
-    get_harness_components,
     get_harness_component_data,
     get_harness_component_pins,
+    get_harness_components,
     get_harness_designators,
     get_harness_erc_violations,
     get_harness_net_connections,
@@ -39,21 +33,27 @@ from harness_parser import (
     parse_prjhar,
     parse_wirdoc,
 )
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.utilities.types import Image as MCPImage
 from outjob_parser import parse_outjob
 
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,  # Change to DEBUG for more detailed logs
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),  # Output to console
-        logging.FileHandler(str(Path(__file__).with_name('altium_mcp.log')))  # Also log to file
-    ]
+        logging.FileHandler(
+            str(Path(__file__).with_name("altium_mcp.log"))
+        ),  # Also log to file
+    ],
 )
 logger = logging.getLogger("AltiumMCPServer")
 
 # Set MCP_DIR to the directory of the current Python file
 MCP_DIR = Path(__file__).parent
+
+
 # config.json lives in a per-user folder OUTSIDE the install directory and
 # outside AppData. Claude Desktop replaces the extension folder on every
 # update, which used to reset a hand-picked Altium path; and being an MSIX
@@ -63,6 +63,7 @@ MCP_DIR = Path(__file__).parent
 def _data_dir() -> Path:
     override = os.environ.get("ALTIUM_MCP_HOME")
     return Path(override) if override else Path.home() / ".altium-mcp"
+
 
 LEGACY_CONFIG_FILE = MCP_DIR / "config.json"
 CONFIG_FILE = _data_dir() / "config.json"
@@ -81,12 +82,13 @@ RESPONSE_FILE = EXCHANGE_DIR / "response.json"
 # Initialize FastMCP server
 mcp = MCPServer("AltiumMCP")
 
+
 class AltiumConfig:
     def __init__(self):
         self.altium_exe_path = ""
         self.script_path = str(DEFAULT_SCRIPT_PATH)
         self.load_config()
-    
+
     def load_config(self):
         """Load configuration, migrating a pre-relocation config.json once."""
         source = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
@@ -115,15 +117,15 @@ class AltiumConfig:
 
     def _create_default_config(self):
         """Create a default configuration file with improved Altium executable discovery"""
-        
+
         # Try to find Altium directories dynamically
         altium_base_path = r"C:\Program Files\Altium"
         altium_exe_path = None
-        
+
         if os.path.exists(altium_base_path):
             # Find all directories that match the pattern AD*
             ad_dirs = glob.glob(os.path.join(altium_base_path, "AD*"))
-            
+
             if ad_dirs:
                 # Sort directories by version number (extract the number after "AD")
                 def get_version_number(dir_path):
@@ -131,23 +133,23 @@ class AltiumConfig:
                     if match:
                         return int(match.group(1))
                     return 0
-                
+
                 # Sort directories by version number (highest first)
                 ad_dirs.sort(key=get_version_number, reverse=True)
-                
+
                 # Try each directory until we find one with X2.EXE
                 for ad_dir in ad_dirs:
                     potential_exe = os.path.join(ad_dir, "X2.EXE")
                     if os.path.exists(potential_exe):
                         altium_exe_path = potential_exe
                         break
-        
+
         # Set the found path (or empty string if nothing found)
         self.altium_exe_path = altium_exe_path if altium_exe_path else ""
-        
+
         # Save the configuration
         self.save_config()
-    
+
     def _as_dict(self):
         config = {"altium_exe_path": self.altium_exe_path}
         # The default script project belongs to whichever install is running
@@ -178,18 +180,18 @@ class AltiumConfig:
         # Initialize variables
         root = None
         paths_verified = True
-        
+
         # Check Altium executable
         if not self.altium_exe_path or not os.path.exists(self.altium_exe_path):
             paths_verified = False
-            
+
             # Before prompting, try an automatic discovery
             altium_base_path = r"C:\Program Files\Altium"
             if os.path.exists(altium_base_path):
                 logger.info(f"Attempting automatic discovery in {altium_base_path}")
                 # Find all directories that match the pattern AD*
                 ad_dirs = glob.glob(os.path.join(altium_base_path, "AD*"))
-                
+
                 if ad_dirs:
                     # Sort directories by version number (extract the number after "AD")
                     def get_version_number(dir_path):
@@ -197,79 +199,91 @@ class AltiumConfig:
                         if match:
                             return int(match.group(1))
                         return 0
-                    
+
                     # Sort directories by version number (highest first)
                     ad_dirs.sort(key=get_version_number, reverse=True)
-                    
+
                     # Try each directory until we find one with X2.EXE
                     for ad_dir in ad_dirs:
                         potential_exe = os.path.join(ad_dir, "X2.EXE")
                         if os.path.exists(potential_exe):
                             self.altium_exe_path = potential_exe
-                            logger.info(f"Automatically found Altium at: {self.altium_exe_path}")
-                            print(f"Automatically found Altium at: {self.altium_exe_path}")
+                            logger.info(
+                                f"Automatically found Altium at: {self.altium_exe_path}"
+                            )
                             paths_verified = True
                             break
-            
+
             # If automatic discovery failed, prompt for input
             if not self.altium_exe_path or not os.path.exists(self.altium_exe_path):
                 if root is None:
                     import tkinter as tk
                     from tkinter import filedialog
+
                     root = tk.Tk()
                     root.withdraw()  # Hide the main window
-                
-                logger.info("Altium executable not found. Prompting user for selection...")
-                print(f"Altium executable not found. Searched in:")
-                print(f"  - Automatically scanned C:\\Program Files\\Altium\\AD*\\X2.EXE")
-                print(f"  - Last known path: {self.altium_exe_path}")
-                print("Please select the Altium X2.EXE file...")
-                
+
+                logger.info(
+                    "Altium executable not found. Prompting user for selection..."
+                )
+                logger.info(
+                    f"Altium executable not found. Searched in: "
+                    f"C:\\Program Files\\Altium\\AD*\\X2.EXE; "
+                    f"Last known path: {self.altium_exe_path}"
+                )
+
                 self.altium_exe_path = filedialog.askopenfilename(
                     title="Select Altium Executable",
                     filetypes=[("Executable files", "*.exe")],  # Only allow .exe files
-                    initialdir="C:/Program Files/Altium"
+                    initialdir="C:/Program Files/Altium",
                 )
-                
+
                 if not self.altium_exe_path:
-                    logger.error("No Altium executable selected. Some functionality may not work.")
-                    print("Warning: No Altium executable selected. Automatic script execution will be disabled.")
+                    logger.error(
+                        "No Altium executable selected. Some functionality may not work."
+                    )
                     paths_verified = False
-        
+
         # Check script path
         if not os.path.exists(self.script_path):
             paths_verified = False
-            
+
             if root is None:
                 import tkinter as tk
                 from tkinter import filedialog
+
                 root = tk.Tk()
                 root.withdraw()  # Hide the main window
-            
-            logger.info(f"Script file not found at {self.script_path}. Prompting user for selection...")
-            print(f"Script file not found at {self.script_path}. Please select the Altium project file...")
-            
+
+            logger.info(
+                f"Script file not found at {self.script_path}. Prompting user for selection..."
+            )
+
             selected_path = filedialog.askopenfilename(
                 title="Select Altium Project File",
-                filetypes=[("Altium Project files", "*.PrjScr")],  # Changed to PrjScr for script project
-                initialdir=str(MCP_DIR)
+                filetypes=[
+                    ("Altium Project files", "*.PrjScr")
+                ],  # Changed to PrjScr for script project
+                initialdir=str(MCP_DIR),
             )
-            
+
             if selected_path:
                 self.script_path = selected_path
             else:
-                logger.error("No script file selected. Some functionality may not work.")
-                print("Warning: No script file selected. Please make sure to create one.")
+                logger.error(
+                    "No script file selected. Some functionality may not work."
+                )
                 paths_verified = False
-        
+
         # Clean up tkinter root if created
         if root is not None:
             root.destroy()
-        
+
         # Save the updated configuration
         self.save_config()
-        
+
         return paths_verified
+
 
 class AltiumBridge:
     def __init__(self):
@@ -284,71 +298,86 @@ class AltiumBridge:
         # concurrent tool calls must be serialized or they clobber each other
         self._command_lock = asyncio.Lock()
 
-    async def execute_command(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def execute_command(
+        self, command: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
         """Execute a command in Altium via the bridge script"""
         async with self._command_lock:
             return await self._execute_command_locked(command, params)
 
-    async def _execute_command_locked(self, command: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _execute_command_locked(
+        self, command: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
             # Clean up any existing response file
             if RESPONSE_FILE.exists():
                 RESPONSE_FILE.unlink()
-            
+
             # Write the request file with command and parameters
             with open(REQUEST_FILE, "w") as f:
-                json.dump({
-                    "command": command,
-                    **params  # Include parameters directly in the main JSON object
-                }, f, indent=2)
-            
+                json.dump(
+                    {
+                        "command": command,
+                        **params,  # Include parameters directly in the main JSON object
+                    },
+                    f,
+                    indent=2,
+                )
+
             logger.info(f"Wrote request file for command: {command}")
-            
+
             # Run the Altium script
             success = await self.run_altium_script()
             if not success:
                 return {"success": False, "error": "Failed to run Altium script"}
-            
+
             # Wait for the response file
-            logger.info(f"Waiting for response file to appear...")
+            logger.info("Waiting for response file to appear...")
             timeout = 120  # seconds
             start_time = time.time()
             while not RESPONSE_FILE.exists() and time.time() - start_time < timeout:
                 await asyncio.sleep(0.5)
-            
+
             if not RESPONSE_FILE.exists():
                 logger.error("Timeout waiting for response from Altium")
-                return {"success": False, "error": "No response received from Altium (timeout)"}
-            
+                return {
+                    "success": False,
+                    "error": "No response received from Altium (timeout)",
+                }
+
             # Read the response file and print it for debugging
             logger.info("Response file found, reading response")
             response_text = read_altium_text(RESPONSE_FILE)
-            
+
             # Log the raw response for debugging
             logger.info(f"Raw response (first 200 chars): {response_text[:200]}")
-            
+
             # Parse the JSON response with detailed error handling
             try:
                 response = json.loads(response_text)
-                logger.info(f"Successfully parsed JSON response")
+                logger.info("Successfully parsed JSON response")
                 return response
             except json.JSONDecodeError as e:
                 logger.error(f"Error parsing JSON response: {e}")
-                logger.error(f"Error at position {e.pos}, line {e.lineno}, column {e.colno}")
-                logger.error(f"Character at error position: '{response_text[e.pos:e.pos+10]}...'")
-                
+                logger.error(
+                    f"Error at position {e.pos}, line {e.lineno}, column {e.colno}"
+                )
+                logger.error(
+                    f"Character at error position: '{response_text[e.pos : e.pos + 10]}...'"
+                )
+
                 # Try to manually fix common JSON issues
                 logger.info("Attempting to fix JSON response...")
                 fixed_text = response_text
-                
+
                 # Fix 1: If there's a quoted JSON array, try to fix it
                 if '"[' in fixed_text and ']"' in fixed_text:
-                    fixed_text = fixed_text.replace('"[', '[').replace(']"', ']')
+                    fixed_text = fixed_text.replace('"[', "[").replace(']"', "]")
                     logger.info("Fixed double-quoted JSON array")
-                
+
                 # Fix 2: Handle escaped quotes in JSON strings
                 fixed_text = fixed_text.replace('\\"', '"')
-                
+
                 # Try to parse the fixed JSON
                 try:
                     fixed_response = json.loads(fixed_text)
@@ -356,18 +385,20 @@ class AltiumBridge:
                     return fixed_response
                 except json.JSONDecodeError as e2:
                     logger.error(f"Still failed to parse JSON after fixes: {e2}")
-                
+
                 # If all else fails, return a structured error
                 return {
-                    "success": False, 
+                    "success": False,
                     "error": f"Invalid JSON response: {e}",
-                    "raw_response": response_text[:500]  # Include part of the raw response for diagnosis
+                    "raw_response": response_text[
+                        :500
+                    ],  # Include part of the raw response for diagnosis
                 }
-        
+
         except Exception as e:
             logger.error(f"Error executing command: {e}")
             return {"success": False, "error": str(e)}
-    
+
     @staticmethod
     def _resolve_msix_path(virtual_path: str) -> str:
         """Resolve an MSIX-virtualized path to the real filesystem path.
@@ -379,22 +410,26 @@ class AltiumBridge:
         can see the virtualized paths, but external apps (like Altium) cannot.
         This resolves the path so external processes can find the files.
         """
-        appdata = os.environ.get('APPDATA', '')
+        appdata = os.environ.get("APPDATA", "")
         if not appdata or not virtual_path.startswith(appdata):
             return virtual_path
 
-        localappdata = os.environ.get('LOCALAPPDATA', '')
-        packages_dir = os.path.join(localappdata, 'Packages')
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        packages_dir = os.path.join(localappdata, "Packages")
         if not os.path.isdir(packages_dir):
             return virtual_path
 
         try:
             for item in os.listdir(packages_dir):
-                if item.startswith('Claude_'):
+                if item.startswith("Claude_"):
                     relative = os.path.relpath(virtual_path, appdata)
-                    real_path = os.path.join(packages_dir, item, 'LocalCache', 'Roaming', relative)
+                    real_path = os.path.join(
+                        packages_dir, item, "LocalCache", "Roaming", relative
+                    )
                     if os.path.exists(real_path):
-                        logger.info(f"Resolved MSIX path: {virtual_path} -> {real_path}")
+                        logger.info(
+                            f"Resolved MSIX path: {virtual_path} -> {real_path}"
+                        )
                         return real_path
         except Exception as e:
             logger.warning(f"Error resolving MSIX path: {e}")
@@ -404,13 +439,13 @@ class AltiumBridge:
     async def run_altium_script(self) -> bool:
         """Run the Altium bridge script"""
         if not os.path.exists(self.config.altium_exe_path):
-            logger.error(f"Altium executable not found at: {self.config.altium_exe_path}")
-            print(f"Error: Altium executable not found. Please check the configuration.")
+            logger.error(
+                f"Altium executable not found at: {self.config.altium_exe_path}"
+            )
             return False
 
         if not os.path.exists(self.config.script_path):
             logger.error(f"Script file not found at: {self.config.script_path}")
-            print(f"Error: Script file not found. Please check the configuration.")
             return False
 
         try:
@@ -420,27 +455,28 @@ class AltiumBridge:
 
             # Command format: "X2.EXE" -RScriptingSystem:RunScript(ProjectName="path\file.PrjScr"|ProcName="ModuleName>Run")
             command = f'"{self.config.altium_exe_path}" -RScriptingSystem:RunScript(ProjectName="{script_path}"^|ProcName="Altium_API>Run")'
-            
+
             logger.info(f"Running command: {command}")
-            
+
             # Start the process
             process = subprocess.Popen(command, shell=True)
-            
+
             # Don't wait for completion - Altium will run the script and generate the response
             logger.info(f"Launched Altium with script, process ID: {process.pid}")
             return True
-        
+
         except Exception as e:
             logger.error(f"Error launching Altium: {e}")
             return False
 
+
 # Create a global bridge instance
 altium_bridge = AltiumBridge()
 
-_last_known_project_path: Optional[str] = None
+_last_known_project_path: str | None = None
 
 
-async def _get_active_harness_path() -> Optional[Path]:
+async def _get_active_harness_path() -> Path | None:
     """Resolve active harness project (.PrjHar) or wiring diagram (.WirDoc).
 
     Checks:
@@ -456,21 +492,24 @@ async def _get_active_harness_path() -> Optional[Path]:
     return find_workspace_harness()
 
 
-async def _pcb_only_tool_error(tool_name: str, original_error: str) -> Optional[str]:
+async def _pcb_only_tool_error(tool_name: str, original_error: str) -> str | None:
     """If a PCB layout tool fails on a harness project, return a helpful explanation."""
     h_path = await _get_active_harness_path()
     if h_path:
-        return json.dumps({
-            "error": (
-                f"Command '{tool_name}' requires an active PCB layout document (.PcbDoc), "
-                f"but the active project is an Altium Harness project ({h_path.name}). "
-                "For harness wiring, connectors, pinouts, and layout data, use "
-                "'get_harness_data', 'get_project_components', 'get_schematic_data', or 'get_all_nets'."
-            ),
-            "project_type": "harness",
-            "project_path": str(h_path.resolve()),
-            "original_error": original_error,
-        }, indent=2)
+        return json.dumps(
+            {
+                "error": (
+                    f"Command '{tool_name}' requires an active PCB layout document (.PcbDoc), "
+                    f"but the active project is an Altium Harness project ({h_path.name}). "
+                    "For harness wiring, connectors, pinouts, and layout data, use "
+                    "'get_harness_data', 'get_project_components', 'get_schematic_data', or 'get_all_nets'."
+                ),
+                "project_type": "harness",
+                "project_path": str(h_path.resolve()),
+                "original_error": original_error,
+            },
+            indent=2,
+        )
     return None
 
 
@@ -478,18 +517,15 @@ async def _pcb_only_tool_error(tool_name: str, original_error: str) -> Optional[
 async def get_all_component_property_names(ctx: Context) -> str:
     """
     Get all available component property names (JSON keys) from PCB/Schematic components or harness connectors.
-    
+
     Returns:
         str: JSON array with all unique property names
     """
     logger.info("Getting all component property names")
-    
+
     # Execute the command in Altium to get component data
-    response = await altium_bridge.execute_command(
-        "get_all_component_data", 
-        {}
-    )
-    
+    response = await altium_bridge.execute_command("get_all_component_data", {})
+
     # Check for success
     if not response.get("success", False) or not response.get("result"):
         h_path = await _get_active_harness_path()
@@ -501,10 +537,10 @@ async def get_all_component_property_names(ctx: Context) -> str:
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting component data: {error_msg}")
             return json.dumps({"error": f"Failed to get component data: {error_msg}"})
-    
+
     # Get the component data
     components_data = response.get("result", [])
-    
+
     if not components_data:
         h_path = await _get_active_harness_path()
         if h_path:
@@ -512,62 +548,62 @@ async def get_all_component_property_names(ctx: Context) -> str:
             return json.dumps(property_list, indent=2)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
-    
+
     try:
         # Parse the data if it's a string
         if isinstance(components_data, str):
             components_list = json.loads(components_data)
         else:
             components_list = components_data
-            
+
         # Extract all unique property names from all components
         property_names = set()
         for component in components_list:
             property_names.update(component.keys())
-        
+
         # Convert set to sorted list for consistent output
-        property_list = sorted(list(property_names))
-        
+        property_list = sorted(property_names)
+
         logger.info(f"Found {len(property_list)} unique property names")
         return json.dumps(property_list, indent=2)
     except Exception as e:
         logger.error(f"Error processing component data: {e}")
-        return json.dumps({"error": f"Failed to process component data: {str(e)}"})
+        return json.dumps({"error": f"Failed to process component data: {e!s}"})
+
 
 @mcp.tool()
 async def get_component_property_values(ctx: Context, property_name: str) -> str:
     """
     Get values of a specific property for all components (PCB/Schematic or harness connectors).
-    
+
     Args:
         property_name (str): The name of the property to get values for
-    
+
     Returns:
         str: JSON array with objects containing designator and property value
     """
     logger.info(f"Getting values for property: {property_name}")
-    
+
     # Execute the command in Altium to get component data
-    response = await altium_bridge.execute_command(
-        "get_all_component_data", 
-        {}
-    )
-    
+    response = await altium_bridge.execute_command("get_all_component_data", {})
+
     # Check for success
     if not response.get("success", False) or not response.get("result"):
         h_path = await _get_active_harness_path()
         if h_path:
             property_values = get_harness_property_values(h_path, property_name)
-            logger.info(f"Found {len(property_values)} harness components with property '{property_name}'")
+            logger.info(
+                f"Found {len(property_values)} harness components with property '{property_name}'"
+            )
             return json.dumps(property_values, indent=2)
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting component data: {error_msg}")
             return json.dumps({"error": f"Failed to get component data: {error_msg}"})
-    
+
     # Get the component data
     components_data = response.get("result", [])
-    
+
     if not components_data:
         h_path = await _get_active_harness_path()
         if h_path:
@@ -575,47 +611,49 @@ async def get_component_property_values(ctx: Context, property_name: str) -> str
             return json.dumps(property_values, indent=2)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
-    
+
     try:
         # Parse the data if it's a string
         if isinstance(components_data, str):
             components_list = json.loads(components_data)
         else:
             components_list = components_data
-            
+
         # Extract the property values along with designators
         property_values = []
         for component in components_list:
             designator = component.get("designator")
             if designator and property_name in component:
-                property_values.append({
-                    "designator": designator,
-                    "value": component.get(property_name)
-                })
-        
-        logger.info(f"Found {len(property_values)} components with property '{property_name}'")
+                property_values.append(
+                    {"designator": designator, "value": component.get(property_name)}
+                )
+
+        logger.info(
+            f"Found {len(property_values)} components with property '{property_name}'"
+        )
         return json.dumps(property_values, indent=2)
     except Exception as e:
         logger.error(f"Error processing component data: {e}")
-        return json.dumps({"error": f"Failed to process component data: {str(e)}"})
-    
+        return json.dumps({"error": f"Failed to process component data: {e!s}"})
+
+
 @mcp.tool()
 async def get_symbol_placement_rules(ctx: Context) -> str:
     """
     Get schematic symbol placement rules from a local configuration file
-    
+
     Returns:
         str: JSON object with rules for placing pins on schematic symbols
     """
     logger.info("Getting symbol placement rules")
-    
+
     # Define the rules file path in the MCP directory
     rules_file_path = MCP_DIR / "symbol_placement_rules.txt"
-    
+
     # Check if the rules file exists
     if not rules_file_path.exists():
         logger.info("Symbol placement rules file not found, suggesting creation")
-        
+
         # Default rules content
         default_rules = (
             "Only place pins on the left and right side of the symbol. "
@@ -624,75 +662,79 @@ async def get_symbol_placement_rules(ctx: Context) -> str:
             "and try to group other pins together by similar functionality (for example, SPI, I2C, RGMII, etc.). "
             "Always separate groups by 100mil gaps unless there is extra spacing, then space out groups equal distance from each other. "
         )
-        
+
         # Create a helpful message for the user
         message = {
             "success": False,
             "error": f"Rules file not found at: {rules_file_path}",
             "message": f"Let the user know that they can optionally update the file {rules_file_path} with custom symbol placement rules. "
-                      f"Suggested content: {default_rules}"
+            f"Suggested content: {default_rules}",
         }
-        
+
         return json.dumps(message, indent=2)
-    
+
     # Read the rules file if it exists
     try:
         with open(rules_file_path, "r") as f:
             rules_content = f.read()
-        
+
         logger.info("Successfully read symbol placement rules file")
-        
+
         # Return the rules with a message about how to modify them
         result = {
             "success": True,
             "message": f"Modify {rules_file_path} with custom symbol placement instructions",
-            "rules": rules_content
+            "rules": rules_content,
         }
-        
+
         return json.dumps(result, indent=2)
-        
+
     except Exception as e:
         logger.error(f"Error reading symbol placement rules file: {e}")
-        return json.dumps({
-            "success": False,
-            "error": f"Failed to read rules file: {str(e)}"
-        }, indent=2)
+        return json.dumps(
+            {"success": False, "error": f"Failed to read rules file: {e!s}"}, indent=2
+        )
+
 
 @mcp.tool()
 async def get_library_symbol_reference(ctx: Context) -> str:
     """
     Get the currently open symbol from a schematic library to use as reference for creating a new symbol.
     This tool should be used before creating a new symbol to understand the structure of existing symbols.
-    
+
     Returns:
         str: JSON object with the reference symbol data including pins, their types, positions, and orientations
     """
     logger.info("Getting library symbol reference data")
-    
+
     # Execute the command in Altium to get symbol reference data
-    response = await altium_bridge.execute_command(
-        "get_library_symbol_reference", 
-        {}
-    )
-    
+    response = await altium_bridge.execute_command("get_library_symbol_reference", {})
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error getting symbol reference: {error_msg}")
         return json.dumps({"error": f"Failed to get symbol reference: {error_msg}"})
-    
+
     # Get the symbol reference data
     symbol_data = response.get("result", {})
-    
+
     if not symbol_data:
         logger.info("No symbol reference data found")
-        return json.dumps({"error": "No symbol reference data found or no symbol is currently selected in the library"})
-    
-    logger.info(f"Retrieved symbol reference data")
+        return json.dumps(
+            {
+                "error": "No symbol reference data found or no symbol is currently selected in the library"
+            }
+        )
+
+    logger.info("Retrieved symbol reference data")
     return json.dumps(symbol_data, indent=2)
 
+
 @mcp.tool()
-async def search_library_symbol(ctx: Context, symbol_name: str, library_path: str = "") -> str:
+async def search_library_symbol(
+    ctx: Context, symbol_name: str, library_path: str = ""
+) -> str:
     """
     Search for a symbol by name in a schematic library (.SchLib) and navigate to it.
     Supports partial name matching (case-insensitive). Returns all matches and navigates
@@ -711,17 +753,16 @@ async def search_library_symbol(ctx: Context, symbol_name: str, library_path: st
     Returns:
         str: JSON object with search results including matches, navigated symbol, and full symbol list
     """
-    logger.info(f"Searching for symbol: {symbol_name} in library: {library_path or '(current)'}")
+    logger.info(
+        f"Searching for symbol: {symbol_name} in library: {library_path or '(current)'}"
+    )
 
     # Execute the command in Altium
     params = {"symbol_name": symbol_name}
     if library_path:
         params["library_path"] = library_path
 
-    response = await altium_bridge.execute_command(
-        "search_library_symbol",
-        params
-    )
+    response = await altium_bridge.execute_command("search_library_symbol", params)
 
     # Check for success
     if not response.get("success", False):
@@ -739,8 +780,16 @@ async def search_library_symbol(ctx: Context, symbol_name: str, library_path: st
     logger.info(f"Symbol search complete. Found: {result.get('found', False)}")
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
-async def create_schematic_symbol(ctx: Context, symbol_name: str, description: str, pins: list, part_count: int = 1, graphics: list = None) -> str:
+async def create_schematic_symbol(
+    ctx: Context,
+    symbol_name: str,
+    description: str,
+    pins: list,
+    part_count: int = 1,
+    graphics: list | None = None,
+) -> str:
     r"""
     Before executing, run get_symbol_placement_rules first.
 
@@ -804,90 +853,98 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
     Returns:
         str: JSON object with the result of the component creation
     """
-    logger.info(f"Creating schematic symbol: {symbol_name} with {len(pins)} pins, {part_count} part(s)")
+    logger.info(
+        f"Creating schematic symbol: {symbol_name} with {len(pins)} pins, {part_count} part(s)"
+    )
 
     params = {
         "symbol_name": symbol_name,
         "description": description,
         "part_count": part_count,
-        "pins": pins
+        "pins": pins,
     }
     if graphics:
         params["graphics"] = graphics
 
     # Execute the command in Altium to create the symbol
-    response = await altium_bridge.execute_command(
-        "create_schematic_symbol",
-        params
-    )
-    
+    response = await altium_bridge.execute_command("create_schematic_symbol", params)
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error creating symbol: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to create symbol: {error_msg}"})
-    
+        return json.dumps(
+            {"success": False, "error": f"Failed to create symbol: {error_msg}"}
+        )
+
     # Get the result data
     result = response.get("result", {})
-    
+
     logger.info(f"Symbol {symbol_name} created successfully with {len(pins)} pins")
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
     """
     Get schematic data for components in Altium (or connectors in harness wiring documents).
-    
+
     Args:
         cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "P1"])
-    
+
     Returns:
         str: JSON object with schematic/connector component data for requested designators
     """
     logger.info(f"Getting schematic data for components: {cmp_designators}")
-    
+
     # Execute the command in Altium to get schematic data
     response = await altium_bridge.execute_command(
         "get_schematic_data",
-        {}  # No parameters needed for this command in the Altium script
+        {},  # No parameters needed for this command in the Altium script
     )
-    
+
     # Check for success
     if not response.get("success", False) or not response.get("result"):
         h_path = await _get_active_harness_path()
         if h_path:
             h_components = get_harness_schematic_data(h_path, cmp_designators)
             if h_components:
-                logger.info(f"Retrieved {len(h_components)} harness schematic components as fallback")
-                return json.dumps({"components": h_components}, indent=2, ensure_ascii=False)
+                logger.info(
+                    f"Retrieved {len(h_components)} harness schematic components as fallback"
+                )
+                return json.dumps(
+                    {"components": h_components}, indent=2, ensure_ascii=False
+                )
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting schematic data: {error_msg}")
             return json.dumps({"error": f"Failed to get schematic data: {error_msg}"})
-    
+
     # Get the schematic data
     schematic_data = response.get("result", [])
-    
+
     if not schematic_data:
         h_path = await _get_active_harness_path()
         if h_path:
             h_components = get_harness_schematic_data(h_path, cmp_designators)
             if h_components:
-                return json.dumps({"components": h_components}, indent=2, ensure_ascii=False)
+                return json.dumps(
+                    {"components": h_components}, indent=2, ensure_ascii=False
+                )
         logger.info("No schematic data found")
         return json.dumps({"error": "No schematic data found"})
-    
+
     try:
         # Parse the data if it's a string
         if isinstance(schematic_data, str):
             schematic_list = json.loads(schematic_data)
         else:
             schematic_list = schematic_data
-        
+
         # Filter components by designator
         components = []
         missing_designators = []
-        
+
         for designator in cmp_designators:
             found = False
             for component in schematic_list:
@@ -895,48 +952,53 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
                     components.append(component)
                     found = True
                     break
-            
+
             if not found:
                 missing_designators.append(designator)
-        
+
         if not components and missing_designators:
             h_path = await _get_active_harness_path()
             if h_path:
                 h_components = get_harness_schematic_data(h_path, cmp_designators)
                 if h_components:
-                    return json.dumps({"components": h_components}, indent=2, ensure_ascii=False)
+                    return json.dumps(
+                        {"components": h_components}, indent=2, ensure_ascii=False
+                    )
 
         result = {
             "components": components,
         }
-        
+
         if missing_designators:
             result["missing_designators"] = missing_designators
-            logger.info(f"Some designators not found in schematic data: {missing_designators}")
-        
+            logger.info(
+                f"Some designators not found in schematic data: {missing_designators}"
+            )
+
         logger.info(f"Found schematic data for {len(components)} components")
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error processing schematic data: {e}")
-        return json.dumps({"error": f"Failed to process schematic data: {str(e)}"})
-    
+        return json.dumps({"error": f"Failed to process schematic data: {e!s}"})
+
+
 @mcp.tool()
 async def get_pcb_layers(ctx: Context) -> str:
     """
     Get detailed information about all layers in the current Altium PCB
-    
+
     Returns:
-        str: JSON object with detailed layer information including copper layers, 
+        str: JSON object with detailed layer information including copper layers,
              mechanical layers, and special layers with their properties
     """
     logger.info("Getting detailed PCB layer information")
-    
+
     # Execute the command in Altium to get all layers data
     response = await altium_bridge.execute_command(
         "get_pcb_layers",
-        {}  # No parameters needed
+        {},  # No parameters needed
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -945,40 +1007,39 @@ async def get_pcb_layers(ctx: Context) -> str:
             return h_err
         logger.error(f"Error getting PCB layers: {error_msg}")
         return json.dumps({"error": f"Failed to get PCB layers: {error_msg}"})
-    
+
     # Get the layers data
     layers_data = response.get("result", [])
-    
+
     if not layers_data:
         logger.info("No PCB layers found")
         return json.dumps({"message": "No PCB layers found in the current document"})
-    
-    logger.info(f"Retrieved PCB layers data")
+
+    logger.info("Retrieved PCB layers data")
     return json.dumps(layers_data, indent=2)
 
+
 @mcp.tool()
-async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: bool) -> str:
+async def set_pcb_layer_visibility(
+    ctx: Context, layer_names: list, visible: bool
+) -> str:
     """
     Set visibility for specified PCB layers
-    
+
     Args:
         layer_names (list): List of layer names to modify (e.g., ["Top Layer", "Bottom Layer", "Mechanical 1"])
         visible (bool): Whether to show (True) or hide (False) the specified layers
-        
+
     Returns:
         str: JSON object with the result of the operation
     """
     logger.info(f"Setting layers visibility: {layer_names} to {visible}")
-    
+
     # Execute the command in Altium to set layer visibility
     response = await altium_bridge.execute_command(
-        "set_pcb_layer_visibility",
-        {
-            "layer_names": layer_names,
-            "visible": visible
-        }
+        "set_pcb_layer_visibility", {"layer_names": layer_names, "visible": visible}
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -986,49 +1047,54 @@ async def set_pcb_layer_visibility(ctx: Context, layer_names: list, visible: boo
         if h_err:
             return h_err
         logger.error(f"Error setting layer visibility: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to set layer visibility: {error_msg}"})
-    
+        return json.dumps(
+            {"success": False, "error": f"Failed to set layer visibility: {error_msg}"}
+        )
+
     # Get the result data
     result = response.get("result", {})
-    
-    logger.info(f"Layer visibility set successfully")
+
+    logger.info("Layer visibility set successfully")
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 async def get_component_data(ctx: Context, cmp_designators: list) -> str:
     """
     Get all data for components in Altium PCB/Schematic or harness design.
-    
+
     Args:
         cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "P1"])
-    
+
     Returns:
         str: JSON object with all component data for requested designators
     """
     logger.info(f"Getting data for components: {cmp_designators}")
-    
+
     # Execute the command in Altium to get all component data
     response = await altium_bridge.execute_command(
         "get_all_component_data",
-        {}  # No parameters needed for this command in the Altium script
+        {},  # No parameters needed for this command in the Altium script
     )
-    
+
     # Check for success
     if not response.get("success", False) or not response.get("result"):
         h_path = await _get_active_harness_path()
         if h_path:
             h_data = get_harness_component_data(h_path, cmp_designators)
             if h_data.get("components"):
-                logger.info(f"Retrieved {len(h_data['components'])} harness components as fallback")
+                logger.info(
+                    f"Retrieved {len(h_data['components'])} harness components as fallback"
+                )
                 return json.dumps(h_data, indent=2, ensure_ascii=False)
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting component data: {error_msg}")
             return json.dumps({"error": f"Failed to get component data: {error_msg}"})
-    
+
     # Get the component data
     component_data = response.get("result", [])
-    
+
     if not component_data:
         h_path = await _get_active_harness_path()
         if h_path:
@@ -1037,18 +1103,18 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
                 return json.dumps(h_data, indent=2, ensure_ascii=False)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
-    
+
     try:
         # Parse the data if it's a string
         if isinstance(component_data, str):
             component_list = json.loads(component_data)
         else:
             component_list = component_data
-        
+
         # Filter components by designator
         components = []
         missing_designators = []
-        
+
         for designator in cmp_designators:
             found = False
             for component in component_list:
@@ -1056,10 +1122,10 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
                     components.append(component)
                     found = True
                     break
-            
+
             if not found:
                 missing_designators.append(designator)
-        
+
         if not components and missing_designators:
             h_path = await _get_active_harness_path()
             if h_path:
@@ -1070,84 +1136,94 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
         result = {
             "components": components,
         }
-        
+
         if missing_designators:
             result["missing_designators"] = missing_designators
             logger.info(f"Some designators not found: {missing_designators}")
-        
+
         logger.info(f"Found data for {len(components)} components")
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error processing component data: {e}")
-        return json.dumps({"error": f"Failed to process component data: {str(e)}"})
+        return json.dumps({"error": f"Failed to process component data: {e!s}"})
+
 
 @mcp.tool()
 async def get_selected_components_coordinates(ctx: Context) -> str:
     """
     Get coordinates and positioning information for selected components in Altium layout
-    
+
     Returns:
         str: JSON array with positioning data (designator, x, y, rotation, width, height)
     """
     logger.info("Getting coordinates for selected components")
-    
+
     # Execute the command in Altium to get selected components coordinates
     response = await altium_bridge.execute_command(
         "get_selected_components_coordinates",
-        {}  # No parameters needed
+        {},  # No parameters needed
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
-        h_err = await _pcb_only_tool_error("get_selected_components_coordinates", error_msg)
+        h_err = await _pcb_only_tool_error(
+            "get_selected_components_coordinates", error_msg
+        )
         if h_err:
             return h_err
         logger.error(f"Error getting selected components coordinates: {error_msg}")
-        return json.dumps({"error": f"Failed to get selected components coordinates: {error_msg}"})
-    
+        return json.dumps(
+            {"error": f"Failed to get selected components coordinates: {error_msg}"}
+        )
+
     # Get the components coordinates data
     components_coords = response.get("result", [])
-    
+
     if not components_coords:
         logger.info("No selected components found")
-        return json.dumps({"message": "No components are currently selected in the layout"})
-    
-    logger.info(f"Retrieved positioning data for selected components")
+        return json.dumps(
+            {"message": "No components are currently selected in the layout"}
+        )
+
+    logger.info("Retrieved positioning data for selected components")
     return json.dumps(components_coords, indent=2)
+
 
 @mcp.tool()
 async def get_all_designators(ctx: Context) -> str:
     """
     Get all component designators from the current Altium board or harness
-    
+
     Returns:
         str: JSON array of all component designators on the current board/harness
     """
     logger.info("Getting all component designators")
-    
+
     # Execute the command in Altium to get all component data
     response = await altium_bridge.execute_command(
         "get_all_component_data",
-        {}  # No parameters needed
+        {},  # No parameters needed
     )
-    
+
     # Check for success
     if not response.get("success", False) or not response.get("result"):
         h_path = await _get_active_harness_path()
         if h_path:
             h_designators = get_harness_designators(h_path)
             if h_designators:
-                logger.info(f"Retrieved {len(h_designators)} harness designators as fallback")
+                logger.info(
+                    f"Retrieved {len(h_designators)} harness designators as fallback"
+                )
                 return json.dumps(h_designators)
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting component data: {error_msg}")
             return json.dumps({"error": f"Failed to get component data: {error_msg}"})
-    
+
     # Get the component data
     component_data = response.get("result", [])
-    
+
     if not component_data:
         h_path = await _get_active_harness_path()
         if h_path:
@@ -1156,34 +1232,37 @@ async def get_all_designators(ctx: Context) -> str:
                 return json.dumps(h_designators)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
-    
+
     try:
         # Parse the data if it's a string
         if isinstance(component_data, str):
             component_list = json.loads(component_data)
         else:
             component_list = component_data
-        
+
         # Extract designators
-        designators = [comp.get("designator") for comp in component_list if "designator" in comp]
+        designators = [
+            comp.get("designator") for comp in component_list if "designator" in comp
+        ]
         if not designators:
             h_path = await _get_active_harness_path()
             if h_path:
                 h_designators = get_harness_designators(h_path)
                 if h_designators:
                     return json.dumps(h_designators)
-        
+
         logger.info(f"Found {len(designators)} designators")
         return json.dumps(designators)
     except Exception as e:
         logger.error(f"Error processing component data: {e}")
-        return json.dumps({"error": f"Failed to process component data: {str(e)}"})
+        return json.dumps({"error": f"Failed to process component data: {e!s}"})
+
 
 @mcp.tool()
 async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
     """
     Get pin data for components in Altium PCB/Schematic, or connectors in harness wiring diagrams.
-    
+
     Args:
         cmp_designators (list): List of designators of the components (e.g., ["R1", "C5", "P1"])
 
@@ -1191,29 +1270,31 @@ async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
         str: JSON array, one entry per component with pins list
     """
     logger.info(f"Getting pin data for components: {cmp_designators}")
-    
+
     # Execute the command in Altium to get pin data
     response = await altium_bridge.execute_command(
         "get_component_pins",
-        {"designators": cmp_designators}  # Pass the list of designators
+        {"designators": cmp_designators},  # Pass the list of designators
     )
-    
+
     # Check for success
     if not response.get("success", False) or not response.get("result"):
         h_path = await _get_active_harness_path()
         if h_path:
             h_pins = get_harness_component_pins(h_path, cmp_designators)
             if h_pins:
-                logger.info(f"Retrieved pin data for {len(h_pins)} harness components as fallback")
+                logger.info(
+                    f"Retrieved pin data for {len(h_pins)} harness components as fallback"
+                )
                 return json.dumps(h_pins, indent=2, ensure_ascii=False)
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting pin data: {error_msg}")
             return json.dumps({"error": f"Failed to get pin data: {error_msg}"})
-    
+
     # Get the components pins data
     pins_data = response.get("result", [])
-    
+
     if not pins_data:
         h_path = await _get_active_harness_path()
         if h_path:
@@ -1222,9 +1303,10 @@ async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
                 return json.dumps(h_pins, indent=2, ensure_ascii=False)
         logger.info(f"No pin data found for designators: {cmp_designators}")
         return json.dumps({"message": "No pin data found for the specified components"})
-    
-    logger.info(f"Retrieved pin data for components")
+
+    logger.info("Retrieved pin data for components")
     return json.dumps(pins_data, indent=2)
+
 
 SANDBOX_DIR = MCP_DIR / "SandboxScript"
 SANDBOX_PAS = SANDBOX_DIR / "Sandbox.pas"
@@ -1246,7 +1328,9 @@ def _window_process_name(hwnd) -> str:
     kernel32 = ctypes.windll.kernel32
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel32.OpenProcess(
+        0x1000, False, pid.value
+    )  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
         return ""
     try:
@@ -1293,7 +1377,12 @@ def _dismiss_altium_dialogs():
         buf = ctypes.create_unicode_buffer(n + 1)
         user32.GetWindowTextW(hwnd, buf, n + 1)
         title = buf.value
-        if cls.value == "TMessageForm" and title not in ("Error", "Warning", "Information", "Confirm"):
+        if cls.value == "TMessageForm" and title not in (
+            "Error",
+            "Warning",
+            "Information",
+            "Confirm",
+        ):
             return True
         if _window_process_name(hwnd).lower() != "x2.exe":
             return True
@@ -1307,7 +1396,9 @@ def _dismiss_altium_dialogs():
 
 
 @mcp.tool()
-async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 120) -> str:
+async def run_altium_script(
+    ctx: Context, script: str, timeout_seconds: int = 120
+) -> str:
     """
     Run a DelphiScript snippet inside an isolated Altium sandbox and report
     what happened, step by step.
@@ -1353,19 +1444,30 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     logger.info(f"run_altium_script: {len(script.splitlines())} lines")
 
     if not SANDBOX_PAS.exists() or not SANDBOX_PRJ.exists():
-        return json.dumps({"success": False,
-                           "error": f"sandbox project missing at {SANDBOX_DIR}"})
+        return json.dumps(
+            {"success": False, "error": f"sandbox project missing at {SANDBOX_DIR}"}
+        )
 
     try:
         src = SANDBOX_PAS.read_text(encoding="utf-8")
         pre, rest = src.split(SANDBOX_BEGIN, 1)
         marker_line, rest = rest.split("\n", 1)
         _, post = rest.split(SANDBOX_END, 1)
-        body = "\n".join("        " + ln if ln.strip() else ln
-                          for ln in script.strip("\n").splitlines())
+        body = "\n".join(
+            "        " + ln if ln.strip() else ln
+            for ln in script.strip("\n").splitlines()
+        )
         SANDBOX_PAS.write_text(
-            pre + SANDBOX_BEGIN + marker_line + "\n" + body + "\n        " + SANDBOX_END + post,
-            encoding="utf-8")
+            pre
+            + SANDBOX_BEGIN
+            + marker_line
+            + "\n"
+            + body
+            + "\n        "
+            + SANDBOX_END
+            + post,
+            encoding="utf-8",
+        )
     except Exception as e:
         return json.dumps({"success": False, "error": f"could not inject script: {e}"})
 
@@ -1379,8 +1481,10 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     # Altium runs outside Claude Desktop's MSIX package and cannot see the
     # virtualized AppData path this process sees (issue #19)
     sandbox_prj = AltiumBridge._resolve_msix_path(str(SANDBOX_PRJ))
-    cmd = (f'"{altium_bridge.config.altium_exe_path}" -RScriptingSystem:RunScript('
-           f'ProjectName="{sandbox_prj}"^|ProcName="Sandbox>Run")')
+    cmd = (
+        f'"{altium_bridge.config.altium_exe_path}" -RScriptingSystem:RunScript('
+        f'ProjectName="{sandbox_prj}"^|ProcName="Sandbox>Run")'
+    )
     subprocess.Popen(cmd, shell=True)
 
     start = time.time()
@@ -1401,42 +1505,65 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
 
     if SANDBOX_RESULT.exists():
         result_text = read_altium_text(SANDBOX_RESULT).strip()
-        return json.dumps({"success": True, "result": result_text, "steps": steps,
-                           "dialogs_dismissed": len(dialogs), "dismissed_dialog_titles": titles}, indent=2)
+        return json.dumps(
+            {
+                "success": True,
+                "result": result_text,
+                "steps": steps,
+                "dialogs_dismissed": len(dialogs),
+                "dismissed_dialog_titles": titles,
+            },
+            indent=2,
+        )
 
     if steps:
-        return json.dumps({
-            "success": False,
-            "error": "script started but did not finish",
-            "last_step_reached": steps[-1],
-            "diagnosis": "The statement AFTER the last step is what crashed or paused the script.",
-            "executor_wedged": True,
-            "recovery": "Altium's script executor is now blocked. Recover by running this "
-                        "shell command (sends the debugger Stop process to the running "
-                        "Altium): \"<altium_exe>\" -REditScript:Stop  -- then retry.",
-            "steps": steps,
-            "dialogs_dismissed": len(dialogs), "dismissed_dialog_titles": titles}, indent=2)
+        return json.dumps(
+            {
+                "success": False,
+                "error": "script started but did not finish",
+                "last_step_reached": steps[-1],
+                "diagnosis": "The statement AFTER the last step is what crashed or paused the script.",
+                "executor_wedged": True,
+                "recovery": "Altium's script executor is now blocked. Recover by running this "
+                "shell command (sends the debugger Stop process to the running "
+                'Altium): "<altium_exe>" -REditScript:Stop  -- then retry.',
+                "steps": steps,
+                "dialogs_dismissed": len(dialogs),
+                "dismissed_dialog_titles": titles,
+            },
+            indent=2,
+        )
 
     if any(c == "TForm_RunScriptParameters" for c, _ in dialogs):
-        return json.dumps({
-            "success": False,
-            "error": "Altium could not find the sandbox script project",
-            "diagnosis": f"Altium was asked to run {sandbox_prj} and showed 'Select Item To "
-                         "Run' instead, so it cannot open that path. The script executor is "
-                         "not wedged.",
-            "executor_wedged": False,
-            "dialogs_dismissed": len(dialogs), "dismissed_dialog_titles": titles}, indent=2)
+        return json.dumps(
+            {
+                "success": False,
+                "error": "Altium could not find the sandbox script project",
+                "diagnosis": f"Altium was asked to run {sandbox_prj} and showed 'Select Item To "
+                "Run' instead, so it cannot open that path. The script executor is "
+                "not wedged.",
+                "executor_wedged": False,
+                "dialogs_dismissed": len(dialogs),
+                "dismissed_dialog_titles": titles,
+            },
+            indent=2,
+        )
 
-    return json.dumps({
-        "success": False,
-        "error": "script never started",
-        "diagnosis": "Usually a COMPILE error in the script, or a previously paused "
-                     "script blocking execution.",
-        "executor_wedged": True,
-        "recovery": "A previously paused script may be blocking execution. Recover by "
-                    "running this shell command: \"<altium_exe>\" -REditScript:Stop  "
-                    "-- then retry. If it still fails, the script itself has a COMPILE error.",
-        "dialogs_dismissed": len(dialogs), "dismissed_dialog_titles": titles}, indent=2)
+    return json.dumps(
+        {
+            "success": False,
+            "error": "script never started",
+            "diagnosis": "Usually a COMPILE error in the script, or a previously paused "
+            "script blocking execution.",
+            "executor_wedged": True,
+            "recovery": "A previously paused script may be blocking execution. Recover by "
+            'running this shell command: "<altium_exe>" -REditScript:Stop  '
+            "-- then retry. If it still fails, the script itself has a COMPILE error.",
+            "dialogs_dismissed": len(dialogs),
+            "dismissed_dialog_titles": titles,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -1466,38 +1593,66 @@ async def ensure_altium_script_skill(ctx: Context, install: bool = False) -> str
     repo = "https://github.com/coffeenmusic/altium-scripts-skill"
 
     if (skill_dir / "SKILL.md").exists():
-        return json.dumps({"installed": True, "path": str(skill_dir),
-                           "note": "Use the altium-script skill for API guidance."},
-                          indent=2)
+        return json.dumps(
+            {
+                "installed": True,
+                "path": str(skill_dir),
+                "note": "Use the altium-script skill for API guidance.",
+            },
+            indent=2,
+        )
 
     if not install:
-        return json.dumps({
-            "installed": False,
-            "path": str(skill_dir),
-            "source": repo,
-            "next_step": "Call again with install=true to clone it, or install manually "
-                         "into the path above."}, indent=2)
+        return json.dumps(
+            {
+                "installed": False,
+                "path": str(skill_dir),
+                "source": repo,
+                "next_step": "Call again with install=true to clone it, or install manually "
+                "into the path above.",
+            },
+            indent=2,
+        )
 
     try:
         skill_dir.parent.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(["git", "clone", "--depth", "1", repo, str(skill_dir)],
-                              capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(
+            ["git", "clone", "--depth", "1", repo, str(skill_dir)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
         if proc.returncode != 0:
-            return json.dumps({
-                "installed": False, "path": str(skill_dir),
-                "error": (proc.stderr or proc.stdout)[:400],
-                "hint": f"Requires git on PATH; otherwise download {repo} and extract "
-                        "to the path above."}, indent=2)
-        return json.dumps({"installed": True, "path": str(skill_dir), "source": repo,
-                           "next_step": "Restart the client so the skill is loaded."},
-                          indent=2)
+            return json.dumps(
+                {
+                    "installed": False,
+                    "path": str(skill_dir),
+                    "error": (proc.stderr or proc.stdout)[:400],
+                    "hint": f"Requires git on PATH; otherwise download {repo} and extract "
+                    "to the path above.",
+                },
+                indent=2,
+            )
+        return json.dumps(
+            {
+                "installed": True,
+                "path": str(skill_dir),
+                "source": repo,
+                "next_step": "Restart the client so the skill is loaded.",
+            },
+            indent=2,
+        )
     except Exception as e:
-        return json.dumps({"installed": False, "path": str(skill_dir),
-                           "error": str(e)[:300]}, indent=2)
+        return json.dumps(
+            {"installed": False, "path": str(skill_dir), "error": str(e)[:300]},
+            indent=2,
+        )
 
 
 @mcp.tool()
-async def get_footprint_primitives(ctx: Context, library_path: str = "", footprint_name: str = "") -> str:
+async def get_footprint_primitives(
+    ctx: Context, library_path: str = "", footprint_name: str = ""
+) -> str:
     """
     Read the primitives of footprints in a PCB library (.PcbLib).
 
@@ -1527,19 +1682,27 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
              [{name, description, <type counts>}]}; dump: primitives list
              per footprint
     """
-    logger.info(f"Getting footprint primitives (library={library_path}, footprint={footprint_name})")
+    logger.info(
+        f"Getting footprint primitives (library={library_path}, footprint={footprint_name})"
+    )
 
     response = await altium_bridge.execute_command(
         "get_footprint_primitives",
-        {"library_path": library_path, "footprint_name": footprint_name}
+        {"library_path": library_path, "footprint_name": footprint_name},
     )
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
-        return json.dumps({"success": False, "error": f"Failed to get footprint primitives: {error_msg}"})
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to get footprint primitives: {error_msg}",
+            }
+        )
 
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
+
 
 @mcp.tool()
 async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
@@ -1573,21 +1736,29 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
     logger.info(f"Creating footprints batch from {spec_file}")
 
     response = await altium_bridge.execute_command(
-        "create_footprints_batch",
-        {"spec_file": spec_file}
+        "create_footprints_batch", {"spec_file": spec_file}
     )
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
-        return json.dumps({"success": False, "error": f"Failed batch footprint creation: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed batch footprint creation: {error_msg}"}
+        )
 
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
 
+
 @mcp.tool()
-async def build_schematic(ctx: Context, parts: list, wires: list = None,
-                          junctions: list = None, net_labels: list = None,
-                          power_ports: list = None, notes: list = None) -> str:
+async def build_schematic(
+    ctx: Context,
+    parts: list,
+    wires: list | None = None,
+    junctions: list | None = None,
+    net_labels: list | None = None,
+    power_ports: list | None = None,
+    notes: list | None = None,
+) -> str:
     """
     Build a wired schematic on a NEW sheet from a circuit description.
 
@@ -1637,12 +1808,24 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
     for p in parts:
         for key in ("designator", "symbol_library", "symbol", "x", "y"):
             if key not in p:
-                return json.dumps({"success": False,
-                                   "error": f"part missing required key '{key}': {p}"})
-        lines.append("PART|{}|{}|{}|{}|{}|{}|{}|{}".format(
-            p["designator"], p["symbol_library"], p["symbol"],
-            p.get("design_item_id", ""), int(p["x"]), int(p["y"]),
-            int(p.get("orientation", 0)), 1 if p.get("mirror") else 0))
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"part missing required key '{key}': {p}",
+                    }
+                )
+        lines.append(
+            "PART|{}|{}|{}|{}|{}|{}|{}|{}".format(
+                p["designator"],
+                p["symbol_library"],
+                p["symbol"],
+                p.get("design_item_id", ""),
+                int(p["x"]),
+                int(p["y"]),
+                int(p.get("orientation", 0)),
+                1 if p.get("mirror") else 0,
+            )
+        )
         if p.get("comment"):
             lines.append(f"COMMENT|{p['comment']}")
         if p.get("footprint"):
@@ -1657,27 +1840,44 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
     # which used to give an empty sheet reported as success (issue #19)
     for lib in sorted({str(p["symbol_library"]) for p in parts}):
         if not lib.lower().endswith(".schlib") or not os.path.isfile(lib):
-            return json.dumps({"success": False,
-                               "error": "symbol_library must be the full path of an existing "
-                                        ".SchLib file (integrated libraries such as .IntLib "
-                                        f"are not supported): {lib}"})
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "symbol_library must be the full path of an existing "
+                    ".SchLib file (integrated libraries such as .IntLib "
+                    f"are not supported): {lib}",
+                }
+            )
 
-    for route in (wires or []):
+    for route in wires or []:
         if len(route) < 4 or len(route) % 2:
-            return json.dumps({"success": False,
-                               "error": f"wire needs an even count of >=4 coords: {route}"})
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"wire needs an even count of >=4 coords: {route}",
+                }
+            )
         lines.append("WIRE|" + "|".join(str(int(v)) for v in route))
-    for j in (junctions or []):
+    for j in junctions or []:
         lines.append(f"JUNCTION|{int(j['x'])}|{int(j['y'])}")
-    for n in (net_labels or []):
-        lines.append("NETLABEL|{}|{}|{}|{}".format(
-            int(n["x"]), int(n["y"]), int(n.get("orientation", 0)), n["text"]))
-    for pw in (power_ports or []):
-        lines.append("POWER|{}|{}|{}|{}|{}|{}".format(
-            int(pw["x"]), int(pw["y"]), int(pw.get("orientation", 3)),
-            int(pw.get("style", 5)), pw["text"],
-            1 if pw.get("show_net_name") else 0))
-    for nt in (notes or []):
+    for n in net_labels or []:
+        lines.append(
+            "NETLABEL|{}|{}|{}|{}".format(
+                int(n["x"]), int(n["y"]), int(n.get("orientation", 0)), n["text"]
+            )
+        )
+    for pw in power_ports or []:
+        lines.append(
+            "POWER|{}|{}|{}|{}|{}|{}".format(
+                int(pw["x"]),
+                int(pw["y"]),
+                int(pw.get("orientation", 3)),
+                int(pw.get("style", 5)),
+                pw["text"],
+                1 if pw.get("show_net_name") else 0,
+            )
+        )
+    for nt in notes or []:
         lines.append(f"NOTE|{int(nt['x'])}|{int(nt['y'])}|{nt['text']}")
 
     spec_path = Path("C:/Users/Public/altium_mcp/circuit_spec.txt")
@@ -1687,8 +1887,9 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
 
     response = await altium_bridge.execute_command("build_circuit", {})
     if not response.get("success", False):
-        return json.dumps({"success": False,
-                           "error": response.get("error", "unknown error")})
+        return json.dumps(
+            {"success": False, "error": response.get("error", "unknown error")}
+        )
 
     result = response.get("result", {})
     if isinstance(result, str):
@@ -1706,22 +1907,27 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
             if len(f) == 5 and f[0] == "PIN":
                 pin_map.setdefault(f[1], {})[f[2]] = [int(f[3]), int(f[4])]
     result["pin_map"] = pin_map
-    result["pin_map_note"] = ("Absolute electrical connection points. Route "
-                              "wires from these, not from predicted offsets.")
+    result["pin_map_note"] = (
+        "Absolute electrical connection points. Route "
+        "wires from these, not from predicted offsets."
+    )
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
-async def add_harness_wiring(ctx: Context, wires: list = None,
-                            splices: list = None,
-                            no_connects: list = None,
-                            net_labels: list = None,
-                            labels: list = None,
-                            connectors: list = None,
-                            rectangles: list = None,
-                            parts: list = None,
-                            clear_existing: bool = False,
-                            document_path: str = None) -> str:
+async def add_harness_wiring(
+    ctx: Context,
+    wires: list | None = None,
+    splices: list | None = None,
+    no_connects: list | None = None,
+    net_labels: list | None = None,
+    labels: list | None = None,
+    connectors: list | None = None,
+    rectangles: list | None = None,
+    parts: list | None = None,
+    clear_existing: bool = False,
+    document_path: str | None = None,
+) -> str:
     """
     Add wires, splices, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
 
@@ -1779,27 +1985,29 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         lines.append("CLEAR_EXISTING")
     lines.append("SHEET_STYLE|D")
 
-    for c in (connectors or []):
+    for c in connectors or []:
         c_des = str(c.get("designator", "")).strip()
         cx = int(c.get("x", 0))
         cy = int(c.get("y", 0))
         lines.append(f"CONNECTOR|{c_des}|{cx}|{cy}")
 
-    for s in (splices or []):
+    for s in splices or []:
         s_des = str(s.get("designator", "SP?")).strip()
         sx = int(s.get("x", 0))
         sy = int(s.get("y", 0))
         lines.append(f"SPLICE|{s_des}|{sx}|{sy}")
 
-    for w in (wires or []):
+    for w in wires or []:
         des = str(w.get("designator", "")).strip()
         net = str(w.get("net", "")).strip()
         pts = w.get("points", [])
         if len(pts) < 4 or len(pts) % 2 != 0:
-            return json.dumps({
-                "success": False,
-                "error": f"wire needs an even count of >=4 coords: {w}"
-            })
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"wire needs an even count of >=4 coords: {w}",
+                }
+            )
         pts = [int(v) for v in pts]
         pts_str = "|".join(str(v) for v in pts)
 
@@ -1866,11 +2074,11 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
     for i, nc in enumerate(no_connects or []):
         x = int(nc.get("x", 0))
         y = int(nc.get("y", 0))
-        nc_name = nc.get("name") or nc.get("designator") or f"NC{i+1}"
+        nc_name = nc.get("name") or nc.get("designator") or f"NC{i + 1}"
         show_name = "1" if nc.get("show_name", False) else "0"
         lines.append(f"NOCONNECT|{x}|{y}|{nc_name}|{show_name}")
 
-    for nl in (labels or net_labels or []):
+    for nl in labels or net_labels or []:
         x = int(nl.get("x", 0))
         y = int(nl.get("y", 0))
         ori = int(nl.get("orientation", 0))
@@ -1878,7 +2086,7 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         if text:
             lines.append(f"NETLABEL|{x}|{y}|{ori}|{text}")
 
-    for r in (rectangles or []):
+    for r in rectangles or []:
         x1 = int(r.get("x1", 0))
         y1 = int(r.get("y1", 0))
         x2 = int(r.get("x2", 0))
@@ -1888,7 +2096,7 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         area = int(r.get("area_color", 11599871))
         lines.append(f"RECTANGLE|{x1}|{y1}|{x2}|{y2}|{lw}|{col}|{area}")
 
-    for p in (parts or []):
+    for p in parts or []:
         des = str(p.get("designator", "")).strip()
         lib = str(p.get("symbol_library", "")).strip()
         sym = str(p.get("symbol", "")).strip()
@@ -1899,7 +2107,9 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
         com = str(p.get("comment", "")).strip()
         desc = str(p.get("description", "")).strip()
         foot = str(p.get("footprint", "")).strip()
-        lines.append(f"PART|{des}|{lib}|{sym}|{px}|{py}|{ori}|{mir}|{com}|{desc}|{foot}")
+        lines.append(
+            f"PART|{des}|{lib}|{sym}|{px}|{py}|{ori}|{mir}|{com}|{desc}|{foot}"
+        )
         for pk, pv in (p.get("parameters") or {}).items():
             if pv is not None and str(pv).strip():
                 lines.append(f"PARTPARAM|{pk}|{pv}")
@@ -1910,10 +2120,9 @@ async def add_harness_wiring(ctx: Context, wires: list = None,
 
     response = await altium_bridge.execute_command("add_harness_wiring", {})
     if not response.get("success", False):
-        return json.dumps({
-            "success": False,
-            "error": response.get("error", "unknown error")
-        })
+        return json.dumps(
+            {"success": False, "error": response.get("error", "unknown error")}
+        )
 
     result = response.get("result", {})
     if isinstance(result, str):
@@ -1942,14 +2151,12 @@ async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> st
         doc_path = str(Path(document_path).resolve())
 
     response = await altium_bridge.execute_command(
-        "convert_netlabels_to_text",
-        {"document_path": doc_path}
+        "convert_netlabels_to_text", {"document_path": doc_path}
     )
     if not response.get("success", False):
-        return json.dumps({
-            "success": False,
-            "error": response.get("error", "unknown error")
-        })
+        return json.dumps(
+            {"success": False, "error": response.get("error", "unknown error")}
+        )
 
     result = response.get("result", {})
     if isinstance(result, str):
@@ -1963,9 +2170,9 @@ async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> st
 @mcp.tool()
 async def reroute_harness_wiring(
     ctx: Context,
-    document_path: str = None,
-    trunk_x_start: int = None,
-    splice_x: int = None,
+    document_path: str | None = None,
+    trunk_x_start: int | None = None,
+    splice_x: int | None = None,
     channel_spacing_mils: int = 100,
     clear_existing: bool = True,
 ) -> str:
@@ -1992,10 +2199,12 @@ async def reroute_harness_wiring(
     if not target_path:
         h_path = await _get_active_harness_path()
         if not h_path:
-            return json.dumps({
-                "success": False,
-                "error": "No active harness project or document_path provided",
-            })
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "No active harness project or document_path provided",
+                }
+            )
         target_path = str(h_path)
 
     try:
@@ -2007,10 +2216,12 @@ async def reroute_harness_wiring(
         )
     except Exception as e:
         logger.error(f"Error calculating harness reroute: {e}")
-        return json.dumps({
-            "success": False,
-            "error": f"Failed to calculate reroute: {str(e)}",
-        })
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to calculate reroute: {e!s}",
+            }
+        )
 
     # Execute wiring placement
     res_str = await add_harness_wiring(
@@ -2030,12 +2241,15 @@ async def reroute_harness_wiring(
     except Exception:
         res_json = {"raw": res_str}
 
-    return json.dumps({
-        "success": res_json.get("success", False),
-        "document_path": target_path,
-        "summary": routing_data["summary"],
-        "altium_response": res_json,
-    }, indent=2)
+    return json.dumps(
+        {
+            "success": res_json.get("success", False),
+            "document_path": target_path,
+            "summary": routing_data["summary"],
+            "altium_response": res_json,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -2067,20 +2281,24 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     logger.info(f"Creating symbols batch from {spec_file}")
 
     response = await altium_bridge.execute_command(
-        "create_symbols_batch",
-        {"spec_file": spec_file}
+        "create_symbols_batch", {"spec_file": spec_file}
     )
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error in batch symbol creation: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed batch creation: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed batch creation: {error_msg}"}
+        )
 
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
 
+
 @mcp.tool()
-async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_name: str = "") -> str:
+async def get_symbol_primitives(
+    ctx: Context, library_path: str = "", symbol_name: str = ""
+) -> str:
     """
     Read the graphic primitives of symbols in a schematic library (.SchLib).
 
@@ -2106,20 +2324,25 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
              dump mode: {library_name, symbol_name, description, part_count,
              primitives: [...]}
     """
-    logger.info(f"Getting symbol primitives (library={library_path}, symbol={symbol_name})")
+    logger.info(
+        f"Getting symbol primitives (library={library_path}, symbol={symbol_name})"
+    )
 
     response = await altium_bridge.execute_command(
         "get_symbol_primitives",
-        {"library_path": library_path, "symbol_name": symbol_name}
+        {"library_path": library_path, "symbol_name": symbol_name},
     )
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error getting symbol primitives: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to get symbol primitives: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed to get symbol primitives: {error_msg}"}
+        )
 
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
+
 
 @mcp.tool()
 async def get_all_nets(ctx: Context) -> str:
@@ -2150,29 +2373,26 @@ async def get_all_nets(ctx: Context) -> str:
     # Result is already a JSON‑serialisable Python list
     return json.dumps(response.get("result", []), indent=2)
 
+
 @mcp.tool()
 async def create_net_class(ctx: Context, class_name: str, net_names: list) -> str:
     """
     Create a new net class and add specified nets to it
-    
+
     Args:
         class_name (str): Name of the net class to create or modify
         net_names (list): List of net names to add to the class
-    
+
     Returns:
         str: JSON object with the result of the operation
     """
     logger.info(f"Creating net class '{class_name}' with {len(net_names)} nets")
-    
+
     # Execute the command in Altium to create the net class
     response = await altium_bridge.execute_command(
-        "create_net_class",
-        {
-            "class_name": class_name,
-            "net_names": net_names
-        }
+        "create_net_class", {"class_name": class_name, "net_names": net_names}
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -2180,71 +2400,87 @@ async def create_net_class(ctx: Context, class_name: str, net_names: list) -> st
         if h_err:
             return h_err
         logger.error(f"Error creating net class: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to create net class: {error_msg}"})
-    
+        return json.dumps(
+            {"success": False, "error": f"Failed to create net class: {error_msg}"}
+        )
+
     # Get the result data
     result = response.get("result", {})
-    
+
     logger.info(f"Net class '{class_name}' created/modified successfully")
     return json.dumps(result, indent=2)
-    
+
+
 @mcp.tool()
-async def set_component_position(ctx: Context, cmp_designator: str, x: float, y: float, rotation: float = -1) -> str:
+async def set_component_position(
+    ctx: Context, cmp_designator: str, x: float, y: float, rotation: float = -1
+) -> str:
     """
     Set a component's absolute position in the PCB layout
-    
+
     Args:
         cmp_designator (str): Designator of the component to position (e.g., "R1", "C5", "U3")
         x (float): Absolute X position in mils
         y (float): Absolute Y position in mils
         rotation (float): Rotation angle in degrees (0-360), use -1 to keep current rotation
-    
+
     Returns:
         str: JSON object with the result of the position operation
     """
-    logger.info(f"Setting component {cmp_designator} position to X:{x}, Y:{y}, Rotation:{rotation}")
-    
+    logger.info(
+        f"Setting component {cmp_designator} position to X:{x}, Y:{y}, Rotation:{rotation}"
+    )
+
     response = await altium_bridge.execute_command(
         "set_component_position",
-        {
-            "designator": cmp_designator,
-            "x": x,
-            "y": y,
-            "rotation": rotation
-        }
+        {"designator": cmp_designator, "x": x, "y": y, "rotation": rotation},
     )
-    
+
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         h_err = await _pcb_only_tool_error("set_component_position", error_msg)
         if h_err:
             return h_err
         logger.error(f"Error setting component position: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to set component position: {error_msg}"})
-    
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to set component position: {error_msg}",
+            }
+        )
+
     result = response.get("result", {})
-    logger.info(f"Component position set successfully")
+    logger.info("Component position set successfully")
     return json.dumps({"success": True, "result": result}, indent=2)
 
+
 @mcp.tool()
-async def move_components(ctx: Context, cmp_designators: list, x_offset: float, y_offset: float, rotation: float = 0) -> str:
+async def move_components(
+    ctx: Context,
+    cmp_designators: list,
+    x_offset: float,
+    y_offset: float,
+    rotation: float = 0,
+) -> str:
     """
     Move components by RELATIVE offset from their current position (not absolute positioning)
-    
+
     IMPORTANT: This moves components BY the offset amount, not TO a position.
     For absolute positioning, use set_component_position instead.
-    
+
     Args:
         cmp_designators (list): List of designators of the components to move (e.g., ["R1", "C5", "U3"])
         x_offset (float): X offset distance in mils (positive = right, negative = left)
         y_offset (float): Y offset distance in mils (positive = up, negative = down)
         rotation (float): New absolute rotation angle in degrees (0-360), if 0 the rotation is not changed
-    
+
     Returns:
         str: JSON object with the result of the move operation
     """
-    logger.info(f"Moving components: {cmp_designators} by X:{x_offset}, Y:{y_offset}, Rotation:{rotation}")
-    
+    logger.info(
+        f"Moving components: {cmp_designators} by X:{x_offset}, Y:{y_offset}, Rotation:{rotation}"
+    )
+
     # Execute the command in Altium to move components
     response = await altium_bridge.execute_command(
         "move_components",
@@ -2252,10 +2488,10 @@ async def move_components(ctx: Context, cmp_designators: list, x_offset: float, 
             "designators": cmp_designators,
             "x_offset": x_offset,
             "y_offset": y_offset,
-            "rotation": rotation
-        }
+            "rotation": rotation,
+        },
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -2263,13 +2499,16 @@ async def move_components(ctx: Context, cmp_designators: list, x_offset: float, 
         if h_err:
             return h_err
         logger.error(f"Error moving components: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to move components: {error_msg}"})
-    
+        return json.dumps(
+            {"success": False, "error": f"Failed to move components: {error_msg}"}
+        )
+
     # Get the result data
     result = response.get("result", {})
 
-    logger.info(f"Components moved successfully")
+    logger.info("Components moved successfully")
     return json.dumps({"success": True, "result": result}, indent=2)
+
 
 @mcp.tool()
 async def place_components(ctx: Context, placements: list) -> str:
@@ -2344,8 +2583,7 @@ async def place_components(ctx: Context, placements: list) -> str:
         return json.dumps({"success": False, "error": "No placements provided"})
 
     response = await altium_bridge.execute_command(
-        "place_components",
-        {"placements": entries}
+        "place_components", {"placements": entries}
     )
 
     if not response.get("success", False):
@@ -2354,11 +2592,14 @@ async def place_components(ctx: Context, placements: list) -> str:
         if h_err:
             return h_err
         logger.error(f"Error placing components: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to place components: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed to place components: {error_msg}"}
+        )
 
     result = response.get("result", {})
-    logger.info(f"Placed components successfully")
+    logger.info("Placed components successfully")
     return json.dumps({"success": True, "result": result}, indent=2)
+
 
 def _mst_length(points: list) -> float:
     """Minimum-spanning-tree length over (x, y) points (Prim's algorithm)."""
@@ -2366,6 +2607,7 @@ def _mst_length(points: list) -> float:
     if n < 2:
         return 0.0
     import math
+
     in_tree = [False] * n
     best = [float("inf")] * n
     best[0] = 0.0
@@ -2378,12 +2620,14 @@ def _mst_length(points: list) -> float:
         for v in range(n):
             if not in_tree[v]:
                 d = math.dist((ux, uy), points[v])
-                if d < best[v]:
-                    best[v] = d
+                best[v] = min(best[v], d)
     return total
 
+
 @mcp.tool()
-async def get_net_connections(ctx: Context, cmp_designators: list = None, max_pads_per_net: int = 40) -> str:
+async def get_net_connections(
+    ctx: Context, cmp_designators: list | None = None, max_pads_per_net: int = 40
+) -> str:
     """
     Get net connectivity and airline (unrouted connection) lengths for the
     nets touching the given components (supports PCB layout and harness wiring).
@@ -2422,32 +2666,39 @@ async def get_net_connections(ctx: Context, cmp_designators: list = None, max_pa
             if cmp_designators:
                 des_set = set(cmp_designators)
                 h_conns = [
-                    c for c in h_conns
+                    c
+                    for c in h_conns
                     if any(p["designator"] in des_set for p in c["pins"])
                 ]
             out_nets = []
             for c in h_conns:
-                out_nets.append({
-                    "net": c["net"],
-                    "pad_count": c["pin_count"],
-                    "airline_mst_mils": None,
-                    "pads": [
-                        {
-                            "designator": p["designator"],
-                            "pin": p["pin"],
-                            "name": p["pin_name"],
-                            "sheet": p.get("sheet", ""),
-                        }
-                        for p in c["pins"]
-                    ],
-                    "source": "harness_wiring",
-                })
-            logger.info(f"Retrieved {len(out_nets)} harness net connections as fallback")
+                out_nets.append(
+                    {
+                        "net": c["net"],
+                        "pad_count": c["pin_count"],
+                        "airline_mst_mils": None,
+                        "pads": [
+                            {
+                                "designator": p["designator"],
+                                "pin": p["pin"],
+                                "name": p["pin_name"],
+                                "sheet": p.get("sheet", ""),
+                            }
+                            for p in c["pins"]
+                        ],
+                        "source": "harness_wiring",
+                    }
+                )
+            logger.info(
+                f"Retrieved {len(out_nets)} harness net connections as fallback"
+            )
             return json.dumps({"nets": out_nets, "source": "harness_parser"}, indent=2)
 
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error getting net connections: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to get net connections: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed to get net connections: {error_msg}"}
+        )
 
     result = response.get("result", {})
     if isinstance(result, str):
@@ -2465,35 +2716,56 @@ async def get_net_connections(ctx: Context, cmp_designators: list = None, max_pa
         pads = nets.get(name, [])
         entry = {"net": name, "pad_count": len(pads)}
         if len(pads) <= max_pads_per_net:
-            entry["airline_mst_mils"] = round(_mst_length([(p["x"], p["y"]) for p in pads]), 1)
+            entry["airline_mst_mils"] = round(
+                _mst_length([(p["x"], p["y"]) for p in pads]), 1
+            )
             entry["pads"] = [
-                {"designator": p["designator"], "pin": p["pin"], "x": p["x"], "y": p["y"]}
+                {
+                    "designator": p["designator"],
+                    "pin": p["pin"],
+                    "x": p["x"],
+                    "y": p["y"],
+                }
                 for p in pads
             ]
         else:
             entry["airline_mst_mils"] = None
             entry["pads_truncated"] = True
             entry["pads"] = [
-                {"designator": p["designator"], "pin": p["pin"], "x": p["x"], "y": p["y"]}
+                {
+                    "designator": p["designator"],
+                    "pin": p["pin"],
+                    "x": p["x"],
+                    "y": p["y"],
+                }
                 for p in pads
                 if not target_set or p["designator"] in target_set
             ]
         out_nets.append(entry)
 
-    out_nets.sort(key=lambda e: (e["airline_mst_mils"] is None, -(e["airline_mst_mils"] or 0)))
+    out_nets.sort(
+        key=lambda e: (e["airline_mst_mils"] is None, -(e["airline_mst_mils"] or 0))
+    )
 
     logger.info(f"Net connections: {len(out_nets)} nets")
     return json.dumps({"net_count": len(out_nets), "nets": out_nets}, indent=2)
 
+
 def _rotate_offset(dx: float, dy: float, degrees: float) -> tuple:
     """Rotate a rotation-0 pad offset counterclockwise by the given angle."""
     import math
+
     rad = math.radians(degrees)
-    return (dx * math.cos(rad) - dy * math.sin(rad),
-            dx * math.sin(rad) + dy * math.cos(rad))
+    return (
+        dx * math.cos(rad) - dy * math.sin(rad),
+        dx * math.sin(rad) + dy * math.cos(rad),
+    )
+
 
 @mcp.tool()
-async def check_orientation(ctx: Context, cmp_designators: list = None, min_improvement_mils: float = 25) -> str:
+async def check_orientation(
+    ctx: Context, cmp_designators: list | None = None, min_improvement_mils: float = 25
+) -> str:
     """
     Advisory check: find 2-pad passives whose rotation could be improved.
 
@@ -2539,32 +2811,53 @@ async def check_orientation(ctx: Context, cmp_designators: list = None, min_impr
 
     # Resolve the target designators from the selection when not given
     if not cmp_designators:
-        sel_resp = await altium_bridge.execute_command("get_selected_components_coordinates", {})
+        sel_resp = await altium_bridge.execute_command(
+            "get_selected_components_coordinates", {}
+        )
         if not sel_resp.get("success", False):
-            h_err = await _pcb_only_tool_error("check_orientation", sel_resp.get("error", "Unknown error"))
+            h_err = await _pcb_only_tool_error(
+                "check_orientation", sel_resp.get("error", "Unknown error")
+            )
             if h_err:
                 return h_err
-            return json.dumps({"success": False, "error": sel_resp.get("error", "Unknown error")})
+            return json.dumps(
+                {"success": False, "error": sel_resp.get("error", "Unknown error")}
+            )
         sel = sel_resp.get("result", [])
         if isinstance(sel, str):
             sel = json.loads(sel)
         cmp_designators = [c["designator"] for c in sel if "designator" in c]
         if not cmp_designators:
-            return json.dumps({"success": False, "error": "No components selected and no designators given"})
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "No components selected and no designators given",
+                }
+            )
 
-    pins_resp = await altium_bridge.execute_command("get_component_pins", {"designators": cmp_designators})
+    pins_resp = await altium_bridge.execute_command(
+        "get_component_pins", {"designators": cmp_designators}
+    )
     if not pins_resp.get("success", False):
-        h_err = await _pcb_only_tool_error("check_orientation", pins_resp.get("error", "Unknown error"))
+        h_err = await _pcb_only_tool_error(
+            "check_orientation", pins_resp.get("error", "Unknown error")
+        )
         if h_err:
             return h_err
-        return json.dumps({"success": False, "error": pins_resp.get("error", "Unknown error")})
+        return json.dumps(
+            {"success": False, "error": pins_resp.get("error", "Unknown error")}
+        )
     comps = pins_resp.get("result", [])
     if isinstance(comps, str):
         comps = json.loads(comps)
 
-    nets_resp = await altium_bridge.execute_command("get_net_connections", {"designators": cmp_designators})
+    nets_resp = await altium_bridge.execute_command(
+        "get_net_connections", {"designators": cmp_designators}
+    )
     if not nets_resp.get("success", False):
-        return json.dumps({"success": False, "error": nets_resp.get("error", "Unknown error")})
+        return json.dumps(
+            {"success": False, "error": nets_resp.get("error", "Unknown error")}
+        )
     net_data = nets_resp.get("result", {})
     if isinstance(net_data, str):
         net_data = json.loads(net_data)
@@ -2589,8 +2882,15 @@ async def check_orientation(ctx: Context, cmp_designators: list = None, min_impr
             total, detail = 0.0, []
             for pin in pins:
                 net = pin.get("net", "")
-                cands = [(x, y) for (d, x, y) in net_pads.get(net, [])
-                         if d != comp["designator"]] if net else []
+                cands = (
+                    [
+                        (x, y)
+                        for (d, x, y) in net_pads.get(net, [])
+                        if d != comp["designator"]
+                    ]
+                    if net
+                    else []
+                )
                 if not cands:
                     continue
                 dx = -pin["dx"] if mirror else pin["dx"]
@@ -2620,27 +2920,37 @@ async def check_orientation(ctx: Context, cmp_designators: list = None, min_impr
 
         improvement = cur[0] - best[0]
         if best_rot != current and improvement >= min_improvement_mils:
-            suggestions.append({
-                "designator": comp["designator"],
-                "current_rotation": current,
-                "suggested_rotation": best_rot,
-                "improvement_mils": round(improvement, 1),
-                "bbox_changes": (best_rot - current) % 180 != 0,
-                "current_pads": cur[1],
-                "suggested_pads": best[1],
-            })
+            suggestions.append(
+                {
+                    "designator": comp["designator"],
+                    "current_rotation": current,
+                    "suggested_rotation": best_rot,
+                    "improvement_mils": round(improvement, 1),
+                    "bbox_changes": (best_rot - current) % 180 != 0,
+                    "current_pads": cur[1],
+                    "suggested_pads": best[1],
+                }
+            )
 
     suggestions.sort(key=lambda s: -s["improvement_mils"])
-    logger.info(f"Orientation check: {len(suggestions)} suggestions from {checked} components")
-    return json.dumps({
-        "checked_count": checked,
-        "min_improvement_mils": min_improvement_mils,
-        "suggestion_count": len(suggestions),
-        "suggestions": suggestions,
-    }, indent=2)
+    logger.info(
+        f"Orientation check: {len(suggestions)} suggestions from {checked} components"
+    )
+    return json.dumps(
+        {
+            "checked_count": checked,
+            "min_improvement_mils": min_improvement_mils,
+            "suggestion_count": len(suggestions),
+            "suggestions": suggestions,
+        },
+        indent=2,
+    )
+
 
 @mcp.tool()
-async def check_placement(ctx: Context, cmp_designators: list = None, clearance_mils: float = 6) -> str:
+async def check_placement(
+    ctx: Context, cmp_designators: list | None = None, clearance_mils: float = 6
+) -> str:
     """
     Verify component placement: find overlaps and clearance violations.
 
@@ -2667,7 +2977,9 @@ async def check_placement(ctx: Context, cmp_designators: list = None, clearance_
              intersect, and the other part's x/y position. An empty violations
              list means the placement is clean at the given clearance.
     """
-    logger.info(f"Checking placement (designators={cmp_designators}, clearance={clearance_mils})")
+    logger.info(
+        f"Checking placement (designators={cmp_designators}, clearance={clearance_mils})"
+    )
 
     params = {"clearance_mils": clearance_mils}
     if cmp_designators:
@@ -2681,14 +2993,24 @@ async def check_placement(ctx: Context, cmp_designators: list = None, clearance_
         if h_err:
             return h_err
         logger.error(f"Error checking placement: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to check placement: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed to check placement: {error_msg}"}
+        )
 
     result = response.get("result", {})
-    logger.info(f"Placement check complete: {result.get('violation_count', '?')} violations")
+    logger.info(
+        f"Placement check complete: {result.get('violation_count', '?')} violations"
+    )
     return json.dumps(result, indent=2)
 
+
 @mcp.tool()
-async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = None, document_path: str = None):
+async def get_screenshot(
+    ctx: Context,
+    view_type: str = "pcb",
+    zoom_to: list | None = None,
+    document_path: str | None = None,
+):
     """
     Take a screenshot of the Altium window, returned as viewable image content.
 
@@ -2705,7 +3027,9 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         Image content of the captured window plus a JSON metadata text block
         (window title, size, zoomed component count)
     """
-    logger.info(f"Taking screenshot of Altium {view_type} window (zoom_to={zoom_to}, doc={document_path})")
+    logger.info(
+        f"Taking screenshot of Altium {view_type} window (zoom_to={zoom_to}, doc={document_path})"
+    )
 
     try:
         # First, execute the Altium command to ensure the right document type
@@ -2715,11 +3039,8 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             params["designators"] = zoom_to
         if document_path:
             params["document_path"] = str(Path(document_path).resolve())
-        response = await altium_bridge.execute_command(
-            "take_view_screenshot",
-            params
-        )
-        
+        response = await altium_bridge.execute_command("take_view_screenshot", params)
+
         focused_kind = ""
         focused_document = ""
         # Check for success
@@ -2739,44 +3060,50 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
             focused_document = focus_info.get("focused_document", "")
             wanted_kind = {"pcb": "PCB", "sch": "SCH"}.get(view_type.lower())
-            is_sch_match = (
-                wanted_kind == "SCH"
-                and focused_kind in ("SCH", "HARNESSWIRINGDIAGRAM", "HARNESSLAYOUT")
+            is_sch_match = wanted_kind == "SCH" and focused_kind in (
+                "SCH",
+                "HARNESSWIRINGDIAGRAM",
+                "HARNESSLAYOUT",
             )
-            is_pcb_match = (
-                wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB")
-            )
+            is_pcb_match = wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB")
             if wanted_kind and focused_kind and not (is_sch_match or is_pcb_match):
                 logger.error(
                     f"Requested {view_type} view but {focused_kind} document is focused"
                 )
-                return json.dumps({
-                    "success": False,
-                    "error": (
-                        f"Requested a '{view_type}' view but Altium has a "
-                        f"{focused_kind} document focused ({focused_document}). Is a "
-                        f"{wanted_kind} document open in the active project?"
-                    ),
-                    "requested_view_type": view_type,
-                    "focused_kind": focused_kind,
-                    "focused_document": focused_document,
-                })
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Requested a '{view_type}' view but Altium has a "
+                            f"{focused_kind} document focused ({focused_document}). Is a "
+                            f"{wanted_kind} document open in the active project?"
+                        ),
+                        "requested_view_type": view_type,
+                        "focused_kind": focused_kind,
+                        "focused_document": focused_document,
+                    }
+                )
 
         # Run the screenshot capture in a separate thread
-        import threading
         import queue
-        import datetime
+        import threading
+
         from PIL import Image
-        
+
         result_queue = queue.Queue()
-        
+
         def capture_screenshot_thread():
             try:
                 try:
                     import win32service
-                    hw = win32service.OpenWindowStation("WinSta0", True, win32con.GENERIC_ALL)
+
+                    hw = win32service.OpenWindowStation(
+                        "WinSta0", True, win32con.GENERIC_ALL
+                    )
                     hw.SetProcessWindowStation()
-                    hd = win32service.OpenDesktop("Default", 0, True, win32con.GENERIC_ALL)
+                    hd = win32service.OpenDesktop(
+                        "Default", 0, True, win32con.GENERIC_ALL
+                    )
                     hd.SetThreadDesktop()
                 except Exception:
                     pass
@@ -2784,42 +3111,54 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 # Find Altium windows
                 altium_windows = []
                 altium_fallback_windows = []
-                
+
                 def collect_altium_windows(hwnd, _):
                     if win32gui.IsWindowVisible(hwnd):
                         title = win32gui.GetWindowText(hwnd)
-                        
+
                         # First, look for main Altium design project windows (.PrjPcb, .PrjHar, .PrjMbd, or Designer)
-                        is_main = any(ext in title for ext in (".PrjPcb", ".PrjHar", ".PrjMbd")) or "Altium Designer" in title
+                        is_main = (
+                            any(
+                                ext in title
+                                for ext in (".PrjPcb", ".PrjHar", ".PrjMbd")
+                            )
+                            or "Altium Designer" in title
+                        )
                         if "Altium" in title and is_main:
-                            altium_windows.append({
-                                "handle": hwnd,
-                                "title": title,
-                                "class_name": win32gui.GetClassName(hwnd),
-                                "rect": win32gui.GetWindowRect(hwnd)
-                            })
+                            altium_windows.append(
+                                {
+                                    "handle": hwnd,
+                                    "title": title,
+                                    "class_name": win32gui.GetClassName(hwnd),
+                                    "rect": win32gui.GetWindowRect(hwnd),
+                                }
+                            )
                         # Collect any window with Altium in the title as fallback
                         elif "Altium" in title:
-                            altium_fallback_windows.append({
-                                "handle": hwnd,
-                                "title": title,
-                                "class_name": win32gui.GetClassName(hwnd),
-                                "rect": win32gui.GetWindowRect(hwnd)
-                            })
+                            altium_fallback_windows.append(
+                                {
+                                    "handle": hwnd,
+                                    "title": title,
+                                    "class_name": win32gui.GetClassName(hwnd),
+                                    "rect": win32gui.GetWindowRect(hwnd),
+                                }
+                            )
                     return True
-                
+
                 win32gui.EnumWindows(collect_altium_windows, 0)
-                
+
                 # If no specific Altium design project windows found, use the fallback
                 pool = altium_windows or altium_fallback_windows
-                
+
                 if not pool:
-                    result_queue.put({
-                        "success": False, 
-                        "error": f"No Altium windows found for {view_type} view"
-                    })
+                    result_queue.put(
+                        {
+                            "success": False,
+                            "error": f"No Altium windows found for {view_type} view",
+                        }
+                    )
                     return
-                
+
                 # Altium owns several top-level windows with its name in the
                 # title, and while it switches documents a small transient one
                 # can come first. Take the largest window that is not
@@ -2842,15 +3181,25 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     l, t, r, b = safe_get_rect(w["handle"])
                     return max(0, r - l) * max(0, b - t)
 
-                candidates = [w for w in pool if win32gui.IsWindow(w["handle"]) and not safe_is_iconic(w["handle"])]
+                candidates = [
+                    w
+                    for w in pool
+                    if win32gui.IsWindow(w["handle"])
+                    and not safe_is_iconic(w["handle"])
+                ]
                 if not candidates:
                     candidates = [w for w in pool if win32gui.IsWindow(w["handle"])]
                 if not candidates:
-                    result_queue.put({"success": False, "error": f"No valid Altium windows found for {view_type} view"})
+                    result_queue.put(
+                        {
+                            "success": False,
+                            "error": f"No valid Altium windows found for {view_type} view",
+                        }
+                    )
                     return
                 window = max(candidates, key=area)
                 hwnd = window["handle"]
-                
+
                 # Bring Altium to the front and let it paint. Altium only
                 # renders a schematic view once it has actually been shown on
                 # screen, so a capture taken while it sits behind another
@@ -2865,10 +3214,14 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     # Altium owns several top-level windows; any of them
                     # being foreground means Altium is in front.
                     fg = win32gui.GetForegroundWindow()
-                    return bool(fg) and win32process.GetWindowThreadProcessId(fg)[1] == altium_pid
+                    return (
+                        bool(fg)
+                        and win32process.GetWindowThreadProcessId(fg)[1] == altium_pid
+                    )
 
                 try:
                     import ctypes
+
                     fg_hwnd = win32gui.GetForegroundWindow()
                     if fg_hwnd:
                         fg_tid = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
@@ -2901,7 +3254,9 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 except Exception as e:
                     logger.warning(f"Could not bring window to foreground: {e}")
                 if not activated:
-                    logger.warning("Altium is not the foreground window; the capture may show an unpainted view")
+                    logger.warning(
+                        "Altium is not the foreground window; the capture may show an unpainted view"
+                    )
                 # A freshly switched-to document needs a moment to render.
                 time.sleep(1.0)
 
@@ -2911,111 +3266,140 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 width = right - left
                 height = bottom - top
                 if width < 200 or height < 150:
-                    result_queue.put({"success": False, "error": f"Altium window is too small to capture ({width}x{height}); is it minimized?"})
+                    result_queue.put(
+                        {
+                            "success": False,
+                            "error": f"Altium window is too small to capture ({width}x{height}); is it minimized?",
+                        }
+                    )
                     return
-                
+
                 # Take screenshot using GDI functions instead of ImageGrab
                 try:
                     # Get device context
                     hwndDC = win32gui.GetWindowDC(hwnd)
                     mfcDC = win32ui.CreateDCFromHandle(hwndDC)
                     saveDC = mfcDC.CreateCompatibleDC()
-                    
+
                     # Create a bitmap object
                     saveBitMap = win32ui.CreateBitmap()
                     saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
                     saveDC.SelectObject(saveBitMap)
-                    
+
                     # Copy the screen into the bitmap using PrintWindow (works even in background)
                     pw_success = False
                     try:
                         import ctypes
-                        pw_res = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
+
+                        pw_res = ctypes.windll.user32.PrintWindow(
+                            hwnd, saveDC.GetSafeHdc(), 2
+                        )
                         pw_success = bool(pw_res)
                     except Exception:
                         pass
                     if not pw_success:
-                        saveDC.BitBlt((0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY)
-                    
+                        saveDC.BitBlt(
+                            (0, 0), (width, height), mfcDC, (0, 0), win32con.SRCCOPY
+                        )
+
                     # Convert the bitmap to an Image
                     bmpinfo = saveBitMap.GetInfo()
                     bmpstr = saveBitMap.GetBitmapBits(True)
                     img = Image.frombuffer(
-                        'RGB',
-                        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-                        bmpstr, 'raw', 'BGRX', 0, 1)
-                    
+                        "RGB",
+                        (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+                        bmpstr,
+                        "raw",
+                        "BGRX",
+                        0,
+                        1,
+                    )
+
                     # Save a local copy of the screenshot for debugging (non-fatal if it fails)
                     try:
                         debug_filename = str(MCP_DIR / f"screenshot_{view_type}.png")
                         img.save(debug_filename)
                         logger.info(f"Saved debug screenshot to {debug_filename}")
                     except Exception as save_error:
-                        logger.warning(f"Could not save debug screenshot to {debug_filename}: {save_error}")
+                        logger.warning(
+                            f"Could not save debug screenshot to {debug_filename}: {save_error}"
+                        )
                         debug_filename = None  # Clear it since save failed
-                    
+
                     # Clean up GDI resources
                     win32gui.DeleteObject(saveBitMap.GetHandle())
                     saveDC.DeleteDC()
                     mfcDC.DeleteDC()
                     win32gui.ReleaseDC(hwnd, hwndDC)
-                    
+
                     # Convert to base64
                     buffer = io.BytesIO()
-                    img.save(buffer, format='PNG')
+                    img.save(buffer, format="PNG")
                     buffer.seek(0)
-                    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
-                    
+                    img_base64 = base64.b64encode(buffer.read()).decode("utf-8")
+
                     # Put result in queue
-                    result_queue.put({
-                        "success": True,
-                        "width": width,
-                        "height": height,
-                        "window_title": window["title"],
-                        "window_class": window["class_name"],
-                        "view_type": view_type,
-                        "foreground_confirmed": activated,
-                        "image_format": "PNG",
-                        "encoding": "base64",
-                        "debug_file": debug_filename,
-                        "image_data": img_base64
-                    })
-                    
+                    result_queue.put(
+                        {
+                            "success": True,
+                            "width": width,
+                            "height": height,
+                            "window_title": window["title"],
+                            "window_class": window["class_name"],
+                            "view_type": view_type,
+                            "foreground_confirmed": activated,
+                            "image_format": "PNG",
+                            "encoding": "base64",
+                            "debug_file": debug_filename,
+                            "image_data": img_base64,
+                        }
+                    )
+
                 except Exception as e:
                     import traceback
+
                     trace = traceback.format_exc()
                     logger.error(f"GDI screenshot error: {e}\n{trace}")
-                    result_queue.put({
-                        "success": False, 
-                        "error": f"GDI screenshot failed: {str(e)}",
-                        "traceback": trace
-                    })
-                
+                    result_queue.put(
+                        {
+                            "success": False,
+                            "error": f"GDI screenshot failed: {e!s}",
+                            "traceback": trace,
+                        }
+                    )
+
             except Exception as e:
                 import traceback
-                result_queue.put({
-                    "success": False, 
-                    "error": f"Screenshot thread error: {str(e)}",
-                    "traceback": traceback.format_exc()
-                })
-        
+
+                result_queue.put(
+                    {
+                        "success": False,
+                        "error": f"Screenshot thread error: {e!s}",
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+
         # Start the thread
         thread = threading.Thread(target=capture_screenshot_thread)
         thread.daemon = True
         thread.start()
-        
+
         # Wait for the thread to complete
         thread.join(timeout=10)  # 10 second timeout
-        
+
         if thread.is_alive():
             logger.error("Screenshot thread timed out")
-            return json.dumps({"success": False, "error": "Screenshot operation timed out"})
-        
+            return json.dumps(
+                {"success": False, "error": "Screenshot operation timed out"}
+            )
+
         # Get the result from the queue
         if result_queue.empty():
             logger.error("Screenshot thread did not return a result")
-            return json.dumps({"success": False, "error": "Screenshot thread did not return a result"})
-        
+            return json.dumps(
+                {"success": False, "error": "Screenshot thread did not return a result"}
+            )
+
         result = result_queue.get()
 
         if not result.get("success", False):
@@ -3023,7 +3407,9 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             logger.error(f"Screenshot error: {error_msg}")
             return json.dumps({"success": False, "error": error_msg})
 
-        logger.info(f"Screenshot taken successfully, size: {result['width']}x{result['height']}")
+        logger.info(
+            f"Screenshot taken successfully, size: {result['width']}x{result['height']}"
+        )
 
         # Return the PNG as a proper MCP image content block instead of inline
         # base64 text: raw base64 in the text result exceeds client token
@@ -3043,25 +3429,25 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         ]
 
     except Exception as e:
-        logger.error(f"Error in screenshot function: {str(e)}")
-        return json.dumps({"success": False, "error": f"Failed to take screenshot: {str(e)}"})
-    
+        logger.error(f"Error in screenshot function: {e!s}")
+        return json.dumps(
+            {"success": False, "error": f"Failed to take screenshot: {e!s}"}
+        )
+
+
 @mcp.tool()
 async def layout_duplicator(ctx: Context) -> str:
     """
     First step of layout duplication. Selects source components and returns data to match with destination components.
-    
+
     Returns:
         str: JSON object with source and destination component data for matching
     """
     logger.info("Starting layout duplication - selection phase")
-    
+
     # Execute the command in Altium to get component data
-    response = await altium_bridge.execute_command(
-        "layout_duplicator", 
-        {}
-    )
-    
+    response = await altium_bridge.execute_command("layout_duplicator", {})
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -3069,51 +3455,65 @@ async def layout_duplicator(ctx: Context) -> str:
         if h_err:
             return h_err
         logger.error(f"Error in layout duplication selection: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to start layout duplication: {error_msg}"})
-    
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to start layout duplication: {error_msg}",
+            }
+        )
+
     # Get the component data
     components_data = response.get("result", {})
-    
+
     if not components_data:
         logger.info("No component data found")
-        return json.dumps({"success": False, "error": "No component data returned from Altium"})
-    
+        return json.dumps(
+            {"success": False, "error": "No component data returned from Altium"}
+        )
+
     # Parse the result to check if no source components were selected
     try:
         if isinstance(components_data, str):
             result_json = json.loads(components_data)
             if not result_json.get("success", True):
-                logger.info(f"Source component selection issue: {result_json.get('message', 'Unknown issue')}")
+                logger.info(
+                    f"Source component selection issue: {result_json.get('message', 'Unknown issue')}"
+                )
                 return json.dumps(result_json)
     except Exception as e:
         logger.error(f"Error parsing layout duplicator result: {e}")
-    
-    logger.info(f"Retrieved layout duplicator component data")
+
+    logger.info("Retrieved layout duplicator component data")
     return json.dumps(components_data, indent=2)
 
+
 @mcp.tool()
-async def layout_duplicator_apply(ctx: Context, source_designators: list, destination_designators: list) -> str:
+async def layout_duplicator_apply(
+    ctx: Context, source_designators: list, destination_designators: list
+) -> str:
     """
     Second step of layout duplication. Applies the layout of source components to destination components.
-    
+
     Args:
         source_designators (list): List of source component designators (e.g., ["R1", "C5", "U3"])
         destination_designators (list): List of destination component designators (e.g., ["R10", "C15", "U7"])
-    
+
     Returns:
         str: JSON object with the result of the layout duplication
     """
-    logger.info(f"Applying layout duplication from {source_designators} to {destination_designators}")
-    
+    logger.info(
+        f"Applying layout duplication from {source_designators} to {destination_designators}"
+    )
+
     # Execute the command in Altium to apply layout duplication
     response = await altium_bridge.execute_command(
         "layout_duplicator_apply",
         {
             "source_designators": source_designators,
-            "destination_designators": destination_designators
-        }
+            "destination_designators": destination_designators,
+        },
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -3121,30 +3521,36 @@ async def layout_duplicator_apply(ctx: Context, source_designators: list, destin
         if h_err:
             return h_err
         logger.error(f"Error applying layout duplication: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to apply layout duplication: {error_msg}"})
-    
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to apply layout duplication: {error_msg}",
+            }
+        )
+
     # Get the result data
     result = response.get("result", {})
-    
-    logger.info(f"Layout duplication applied successfully")
+
+    logger.info("Layout duplication applied successfully")
     return json.dumps(result, indent=2)
-    
+
+
 @mcp.tool()
 async def get_pcb_rules(ctx: Context) -> str:
     """
     Get all design rules from the current Altium PCB
-    
+
     Returns:
         str: JSON array of PCB design rules with their properties
     """
     logger.info("Getting PCB design rules")
-    
+
     # Execute the command in Altium to get rule data
     response = await altium_bridge.execute_command(
         "get_pcb_rules",
-        {}  # No parameters needed
+        {},  # No parameters needed
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -3153,34 +3559,35 @@ async def get_pcb_rules(ctx: Context) -> str:
             return h_err
         logger.error(f"Error getting PCB rules: {error_msg}")
         return json.dumps({"error": f"Failed to get PCB rules: {error_msg}"})
-    
+
     # Get the rules data
     rules_data = response.get("result", [])
-    
+
     if not rules_data:
         logger.info("No PCB rules found")
         return json.dumps({"message": "No PCB rules found in the current document"})
-    
-    logger.info(f"Retrieved PCB rules data")
+
+    logger.info("Retrieved PCB rules data")
     return json.dumps(rules_data, indent=2)
+
 
 @mcp.tool()
 async def get_pcb_layer_stackup(ctx: Context) -> str:
     """
     Get the detailed layer stackup information from the current Altium PCB including
     copper thickness, dielectric materials, constants, and heights
-    
+
     Returns:
         str: JSON object with detailed layer stackup information
     """
     logger.info("Getting PCB layer stackup information")
-    
+
     # Execute the command in Altium to get layer stackup data
     response = await altium_bridge.execute_command(
         "get_pcb_layer_stackup",
-        {}  # No parameters needed
+        {},  # No parameters needed
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -3189,51 +3596,57 @@ async def get_pcb_layer_stackup(ctx: Context) -> str:
             return h_err
         logger.error(f"Error getting PCB layer stackup: {error_msg}")
         return json.dumps({"error": f"Failed to get PCB layer stackup: {error_msg}"})
-    
+
     # Get the stackup data
     stackup_data = response.get("result", {})
-    
+
     if not stackup_data:
         logger.info("No PCB layer stackup found")
-        return json.dumps({"message": "No PCB layer stackup found in the current document"})
-    
-    logger.info(f"Retrieved PCB layer stackup data")
+        return json.dumps(
+            {"message": "No PCB layer stackup found in the current document"}
+        )
+
+    logger.info("Retrieved PCB layer stackup data")
     return json.dumps(stackup_data, indent=2)
+
 
 @mcp.tool()
 async def get_output_job_containers(ctx: Context) -> str:
     """
     Get all available output job containers from a specified OutJob file
-    
+
     Args:
         outjob_path (str): Path to the OutJob file (optional, will use first open OutJob if not provided)
-    
+
     Returns:
         str: JSON array with all output job containers and their properties
     """
     logger.info("Getting output job containers from the first open OutJob")
-    
+
     # Execute the command in Altium to get output job containers
     response = await altium_bridge.execute_command(
-        "get_output_job_containers", 
-        {}  # No parameters needed - will use first open OutJob
+        "get_output_job_containers",
+        {},  # No parameters needed - will use first open OutJob
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error getting output job containers: {error_msg}")
-        return json.dumps({"error": f"Failed to get output job containers: {error_msg}"})
-    
+        return json.dumps(
+            {"error": f"Failed to get output job containers: {error_msg}"}
+        )
+
     # Get the containers data
     containers_data = response.get("result", [])
-    
+
     if not containers_data:
         logger.info("No output job containers found")
         return json.dumps({"message": "No output job containers found"})
-    
-    logger.info(f"Retrieved output job containers data")
+
+    logger.info("Retrieved output job containers data")
     return containers_data  # Already in JSON format
+
 
 @mcp.tool()
 async def get_outjob_settings(ctx: Context, outjob_path: str) -> str:
@@ -3290,28 +3703,32 @@ async def get_harness_data(ctx: Context, file_path: str = "") -> str:
              and net_labels.
     """
     try:
-        p: Optional[Path] = None
+        p: Path | None = None
         if file_path and file_path.strip():
             p = Path(file_path.strip())
         else:
             p = await _get_active_harness_path()
 
         if not p or not p.exists():
-            return json.dumps({
-                "error": (
-                    f"File not found: '{file_path}'. No active harness project (.PrjHar) "
-                    "or wiring diagram (.WirDoc) detected in the current workspace."
-                )
-            })
+            return json.dumps(
+                {
+                    "error": (
+                        f"File not found: '{file_path}'. No active harness project (.PrjHar) "
+                        "or wiring diagram (.WirDoc) detected in the current workspace."
+                    )
+                }
+            )
 
         if p.suffix.lower() == ".prjhar":
             data = parse_prjhar(p)
         elif p.suffix.lower() in [".wirdoc", ".ldrdoc"]:
             data = parse_wirdoc(p)
         else:
-            return json.dumps({
-                "error": f"Unsupported file type '{p.suffix}'. Expected .WirDoc, .LdrDoc, or .PrjHar"
-            })
+            return json.dumps(
+                {
+                    "error": f"Unsupported file type '{p.suffix}'. Expected .WirDoc, .LdrDoc, or .PrjHar"
+                }
+            )
     except Exception as e:
         return json.dumps({"error": f"Could not parse harness document: {e}"})
     return json.dumps(data, indent=2, ensure_ascii=False)
@@ -3325,7 +3742,11 @@ async def _simple_command(command: str, params: dict, what: str) -> str:
         logger.error(f"Error getting {what}: {error_msg}")
         return json.dumps({"error": f"Failed to get {what}: {error_msg}"})
     result = response.get("result", {})
-    return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+    return (
+        result
+        if isinstance(result, str)
+        else json.dumps(result, indent=2, ensure_ascii=False)
+    )
 
 
 @mcp.tool()
@@ -3357,22 +3778,41 @@ async def get_project_info(ctx: Context) -> str:
                 pass
         elif isinstance(result, dict) and "project_path" in result:
             _last_known_project_path = result["project_path"]
-        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+        return (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, indent=2, ensure_ascii=False)
+        )
 
     # Fallback for offline harness projects
     try:
         h_path = await _get_active_harness_path()
         if h_path and h_path.suffix.lower() == ".prjhar":
             data = parse_prjhar(h_path)
-            return json.dumps({
-                "project_path": data["project_path"],
-                "parameters": [{"name": k, "value": v} for k, v in data["parameters"].items()],
-                "schematic_sheet_count": len([d for d in data["documents"] if d["kind"] == "HarnessWiringDiagram"]),
-                "modified_document_count": 0,
-                "documents": [{"path": d["path"], "kind": d["kind"], "state": "closed"} for d in data["documents"]],
-                "variants": [],
-                "source": "harness_parser_fallback",
-            }, indent=2, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "project_path": data["project_path"],
+                    "parameters": [
+                        {"name": k, "value": v} for k, v in data["parameters"].items()
+                    ],
+                    "schematic_sheet_count": len(
+                        [
+                            d
+                            for d in data["documents"]
+                            if d["kind"] == "HarnessWiringDiagram"
+                        ]
+                    ),
+                    "modified_document_count": 0,
+                    "documents": [
+                        {"path": d["path"], "kind": d["kind"], "state": "closed"}
+                        for d in data["documents"]
+                    ],
+                    "variants": [],
+                    "source": "harness_parser_fallback",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
     except Exception as e:
         logger.warning(f"Project info harness fallback failed: {e}")
 
@@ -3404,18 +3844,28 @@ async def get_project_components(ctx: Context, include_parameters: bool = False)
     )
     if response.get("success", False):
         result = response.get("result", {})
-        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+        return (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, indent=2, ensure_ascii=False)
+        )
 
     # Fallback for Harness projects (.PrjHar / .WirDoc)
     try:
         h_path = await _get_active_harness_path()
         if h_path:
-            components = get_harness_components(h_path, include_parameters=include_parameters)
-            return json.dumps({
-                "component_count": len(components),
-                "components": components,
-                "source": "harness_parser",
-            }, indent=2, ensure_ascii=False)
+            components = get_harness_components(
+                h_path, include_parameters=include_parameters
+            )
+            return json.dumps(
+                {
+                    "component_count": len(components),
+                    "components": components,
+                    "source": "harness_parser",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
     except Exception as e:
         logger.warning(f"Harness fallback failed: {e}")
 
@@ -3442,10 +3892,16 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
         str: JSON with total, fatal, errors, warnings and violations
              [{level, type, detail}]
     """
-    response = await altium_bridge.execute_command("get_erc_violations", {"compile": compile})
+    response = await altium_bridge.execute_command(
+        "get_erc_violations", {"compile": compile}
+    )
     if response.get("success", False):
         result = response.get("result", {})
-        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+        return (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, indent=2, ensure_ascii=False)
+        )
 
     # Fallback for harness projects where compilation returns no flattened document
     try:
@@ -3476,7 +3932,11 @@ async def get_board_summary(ctx: Context) -> str:
     response = await altium_bridge.execute_command("get_board_summary", {})
     if response.get("success", False):
         result = response.get("result", {})
-        return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+        return (
+            result
+            if isinstance(result, str)
+            else json.dumps(result, indent=2, ensure_ascii=False)
+        )
 
     # Fallback for harness projects
     try:
@@ -3485,16 +3945,20 @@ async def get_board_summary(ctx: Context) -> str:
             w_docs = get_harness_wiring_docs(h_path)
             components = get_harness_components(h_path)
             nets = get_harness_nets(h_path)
-            return json.dumps({
-                "project_type": "harness",
-                "message": "Active project is an Altium Harness project (no PCB board)",
-                "project_path": str(h_path.resolve()),
-                "harness_documents": [d.name for d in w_docs],
-                "connector_count": len(components),
-                "unique_nets_count": len(nets),
-                "connectors": [c["designator"] for c in components],
-                "source": "harness_summary",
-            }, indent=2, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "project_type": "harness",
+                    "message": "Active project is an Altium Harness project (no PCB board)",
+                    "project_path": str(h_path.resolve()),
+                    "harness_documents": [d.name for d in w_docs],
+                    "connector_count": len(components),
+                    "unique_nets_count": len(nets),
+                    "connectors": [c["designator"] for c in components],
+                    "source": "harness_summary",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
     except Exception as e:
         logger.warning(f"Board summary harness fallback failed: {e}")
 
@@ -3520,7 +3984,9 @@ async def get_component_primitives(ctx: Context, designators: list) -> str:
              rotation, primitives [{type, layer, ...}]}] and
              missing_designators
     """
-    response = await altium_bridge.execute_command("get_component_primitives", {"designators": designators})
+    response = await altium_bridge.execute_command(
+        "get_component_primitives", {"designators": designators}
+    )
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         h_err = await _pcb_only_tool_error("get_component_primitives", error_msg)
@@ -3529,49 +3995,60 @@ async def get_component_primitives(ctx: Context, designators: list) -> str:
         logger.error(f"Error getting component primitives: {error_msg}")
         return json.dumps({"error": f"Failed to get component primitives: {error_msg}"})
     result = response.get("result", {})
-    return result if isinstance(result, str) else json.dumps(result, indent=2, ensure_ascii=False)
+    return (
+        result
+        if isinstance(result, str)
+        else json.dumps(result, indent=2, ensure_ascii=False)
+    )
 
 
 @mcp.tool()
 async def run_output_jobs(ctx: Context, container_names: list) -> str:
     """
     Run specified output job containers
-    
+
     Args:
         container_names (list): List of container names to run
-    
+
     Returns:
         str: JSON object with results of running the output jobs
     """
-    logger.info(f"Running output jobs")
+    logger.info("Running output jobs")
     logger.info(f"Containers to run: {container_names}")
-    
+
     # Execute the command in Altium to run output jobs
     response = await altium_bridge.execute_command(
-        "run_output_jobs", 
-        {"container_names": container_names}
+        "run_output_jobs", {"container_names": container_names}
     )
-    
+
     # Check for success
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error running output jobs: {error_msg}")
         return json.dumps({"error": f"Failed to run output jobs: {error_msg}"})
-    
+
     # Get the result data
     result_data = response.get("result", {})
-    
-    logger.info(f"Output jobs execution completed")
-    
+
+    logger.info("Output jobs execution completed")
+
     # If result_data is a string, it's already in JSON format
     if isinstance(result_data, str):
         return result_data
-    
+
     # Otherwise, convert to JSON
     return json.dumps(result_data, indent=2)
 
+
 @mcp.tool()
-async def create_pcb_footprint(ctx: Context, footprint_name: str, description: str, pads: list, courtyard_x_mm: float = 0, courtyard_y_mm: float = 0) -> str:
+async def create_pcb_footprint(
+    ctx: Context,
+    footprint_name: str,
+    description: str,
+    pads: list,
+    courtyard_x_mm: float = 0,
+    courtyard_y_mm: float = 0,
+) -> str:
     """
     Create a new PCB footprint in the currently active PcbLib document.
     The PcbLib (e.g. Discrete.PcbLib) must be the focused document in Altium.
@@ -3604,17 +4081,20 @@ async def create_pcb_footprint(ctx: Context, footprint_name: str, description: s
             "pads": pads,
             "courtyard_x_mm": courtyard_x_mm,
             "courtyard_y_mm": courtyard_y_mm,
-        }
+        },
     )
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error creating footprint: {error_msg}")
-        return json.dumps({"success": False, "error": f"Failed to create footprint: {error_msg}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed to create footprint: {error_msg}"}
+        )
 
     result = response.get("result", {})
     logger.info(f"Footprint {footprint_name} created successfully")
     return json.dumps(result, indent=2)
+
 
 @mcp.tool()
 async def get_server_status(ctx: Context) -> str:
@@ -3626,27 +4106,28 @@ async def get_server_status(ctx: Context) -> str:
         "altium_found": os.path.exists(altium_bridge.config.altium_exe_path),
         "script_found": os.path.exists(altium_bridge.config.script_path),
     }
-    
+
     return json.dumps(status, indent=2)
+
 
 if __name__ == "__main__":
     logger.info("Starting Altium MCP Server...")
     logger.info(f"Using MCP directory: {MCP_DIR}")
-    
+
     # Initialize the directory
     MCP_DIR.mkdir(exist_ok=True)
-    
+
     # Create the AltiumScript directory if it doesn't exist
     script_dir = MCP_DIR / "AltiumScript"
     script_dir.mkdir(exist_ok=True)
-    
+
     # Verify configuration before starting
     if not altium_bridge.config.verify_paths():
-        print("Warning: Configuration not complete. Some functionality may not work.")
-    
-    # Print status
-    print(f"Altium executable: {altium_bridge.config.altium_exe_path}")
-    print(f"Script path: {altium_bridge.config.script_path}")
-    
+        logger.warning("Configuration not complete. Some functionality may not work.")
+
+    # Log status
+    logger.info(f"Altium executable: {altium_bridge.config.altium_exe_path}")
+    logger.info(f"Script path: {altium_bridge.config.script_path}")
+
     # Run the server
-    mcp.run(transport='stdio')
+    mcp.run(transport="stdio")

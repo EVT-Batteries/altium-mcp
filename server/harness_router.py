@@ -603,11 +603,11 @@ def calculate_harness_reroute(
 
         phase = idx % 2
         if phase == 0:
-            x_des = 18800
-            x_com = 19150
+            x_des = 16800
+            x_com = 17150
         else:
-            x_des = 19500
-            x_com = 19850
+            x_des = 18200
+            x_com = 18550
 
         y_label = sy + 15
         wires.append(
