@@ -2033,6 +2033,157 @@ begin
     else Result := 8388608;
 end;
 
+// Set parameter PName on Owner: update the first match, delete any further
+// parameters with the same name (repeated runs used to stack duplicates with
+// conflicting values), or create a hidden one. Returns True if it existed.
+function UpsertSchParameter(Owner: ISch_BasicContainer; PName: String; PVal: String): Boolean;
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+    Param     : ISch_Parameter;
+    Dups      : TList;
+    k         : Integer;
+begin
+    Result := False;
+    Param := nil;
+    Dups := TList.Create;
+    try
+        ChildIter := Owner.SchIterator_Create;
+        ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+        Prim := ChildIter.FirstSchObject;
+        while (Prim <> nil) do
+        begin
+            if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
+            begin
+                if (Param = nil) then
+                    Param := Prim
+                else
+                    Dups.Add(Prim);
+            end;
+            Prim := ChildIter.NextSchObject;
+        end;
+        Owner.SchIterator_Destroy(ChildIter);
+
+        for k := 0 to Dups.Count - 1 do
+        begin
+            Prim := Dups[k];
+            Owner.RemoveSchObject(Prim);
+            SchServer.RobotManager.SendMessage(Owner.I_ObjectAddress, c_BroadCast,
+                SCHM_PrimitiveRegistration, Prim.I_ObjectAddress);
+        end;
+
+        if (Param <> nil) then
+        begin
+            Param.Text := PVal;
+            Result := True;
+        end
+        else
+        begin
+            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+            if (Param <> nil) then
+            begin
+                Param.Name := PName;
+                Param.Text := PVal;
+                Param.ParamType := eParameterType_String;
+                Param.ReadOnlyState := eReadOnly_None;
+                Param.IsHidden := True;
+                Owner.AddSchObject(Param);
+                SchServer.RobotManager.SendMessage(Owner.I_ObjectAddress, c_BroadCast,
+                    SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+            end;
+        end;
+    finally
+        Dups.Free;
+    end;
+end;
+
+// Mirror the parameters that have a native harness wire property onto it.
+procedure ApplyHarnessWireProperty(Wire: ISch_GraphicalObject; PName: String; PVal: String);
+var
+    U: String;
+begin
+    U := AnsiUpperCase(PName);
+    if (U = 'COMMENT') and (Wire.Comment <> nil) then
+        Wire.Comment.Text := PVal
+    else if (U = 'COLOR') then
+        Wire.Color := HarnessColorToTColor(PVal)
+    else if (U = 'DESIGN ITEM ID') or (U = 'PARTNUMBER') or (U = 'DESIGNITEMID') then
+        Wire.DesignItemId := PVal
+    else if (U = 'SOURCE LIBRARY') or (U = 'SOURCELIBRARYNAME') then
+        Wire.SourceLibraryName := PVal;
+end;
+
+// Designator of a placed component, from its designator object or, failing
+// that, from a 'Designator' parameter.
+function PlacedDesignator(Obj: ISch_GraphicalObject): String;
+var
+    ChildIter : ISch_Iterator;
+    Param     : ISch_Parameter;
+begin
+    Result := '';
+    if (Obj.Designator <> nil) then
+        Result := Obj.Designator.Text;
+    if (Result <> '') then Exit;
+    ChildIter := Obj.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+    Param := ChildIter.FirstSchObject;
+    while (Param <> nil) do
+    begin
+        if (AnsiUpperCase(Param.Name) = 'DESIGNATOR') and (Param.Text <> '') then
+        begin
+            Result := Param.Text;
+            Break;
+        end;
+        Param := ChildIter.NextSchObject;
+    end;
+    Obj.SchIterator_Destroy(ChildIter);
+end;
+
+// First top-level harness connector (81) or component on Doc with the given
+// designator, or nil.
+function FindPlacedComponent(Doc: ISch_Document; Des: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (AnsiUpperCase(PlacedDesignator(Obj)) = AnsiUpperCase(Des)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// First harness wire (82) on Doc with the given designator, or nil.
+function FindHarnessWire(Doc: ISch_Document; Des: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(82));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (Obj.Designator <> nil) and (AnsiUpperCase(Obj.Designator.Text) = AnsiUpperCase(Des)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
 // Add wires, splices, no-connect directives, and net labels to the current wiring diagram or schematic
 function ExecuteAddHarnessWiring(ROOT_DIR: String; SpecPath: String): String;
 var
@@ -2068,7 +2219,6 @@ var
     ConnX, ConnY  : Integer;
     DelObj        : ISch_GraphicalObject;
     OldObj        : ISch_GraphicalObject;
-    DbgList       : TStringList;
     ObjList       : TList;
     LibDoc        : ISch_Document;
     FoundComp     : ISch_Component;
@@ -2093,151 +2243,104 @@ var
     RectCount     : Integer;
     PartCount     : Integer;
     InfoStr       : String;
+    Misses        : TStringList;
+    Saved         : Boolean;
+    WiresUpdated  : Integer;
+    CrimpCount    : Integer;
+    MovedCount    : Integer;
+    ParamCount    : Integer;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
     if not FileExists(SpecPath) then
     begin
-        Result := '{"success": false, "error": "spec file not found: ' + SpecPath + '"}';
+        Result := '{"success": false, "error": "spec file not found: ' + JSONEscapeString(SpecPath) + '"}';
         Exit;
     end;
 
     Spec := TStringList.Create;
+    Misses := TStringList.Create;
     try
         Spec.LoadFromFile(SpecPath);
         TargetDoc := nil;
+        ServerDoc := nil;
+        TargetDocPath := '';
         ClearExisting := False;
 
         for i := 0 to Spec.Count - 1 do
         begin
             if (GetFieldFromPipeString(Spec[i], 0) = 'DOCUMENT') then
-            begin
-                TargetDocPath := GetFieldFromPipeString(Spec[i], 1);
-                TargetDocPath := StringReplace(TargetDocPath, '/', '\', REPLACEALL);
-                ServerDoc := FindOpenDocument(TargetDocPath);
-                if (ServerDoc = nil) then
-                    ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
-                if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
-                TargetDoc := SchServer.GetCurrentSchDocument;
-                if (TargetDoc = nil) or (AnsiUpperCase(ExtractFileName(TargetDoc.DocumentName)) <> AnsiUpperCase(ExtractFileName(TargetDocPath))) then
-                begin
-                    Result := '{"success": false, "error": "could not focus requested document: ' + TargetDocPath + '"}';
-                    Exit;
-                end;
-            end
+                TargetDocPath := StringReplace(GetFieldFromPipeString(Spec[i], 1), '/', '\', REPLACEALL)
             else if (GetFieldFromPipeString(Spec[i], 0) = 'CLEAR_EXISTING') then
                 ClearExisting := True;
         end;
 
-        if (TargetDoc = nil) then
-            TargetDoc := SchServer.GetCurrentSchDocument;
-
-        if (TargetDoc = nil) then
+        // Writes always name their document: falling back to whatever is
+        // focused (or the first sheet of some project) has edited the wrong
+        // document before.
+        if (TargetDocPath = '') then
         begin
-            for P := -1 to GetWorkspace.DM_ProjectCount - 1 do
-            begin
-                if P < 0 then
-                    Project := GetWorkspace.DM_FocusedProject
-                else
-                begin
-                    Project := GetWorkspace.DM_Projects(P);
-                    if (Project = nil) or (Project = GetWorkspace.DM_FocusedProject) then Continue;
-                end;
-                if Project <> nil then
-                begin
-                    for DocIdx := 0 to Project.DM_LogicalDocumentCount - 1 do
-                    begin
-                        Doc := Project.DM_LogicalDocuments(DocIdx);
-                        if (Doc <> nil) and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or (Doc.DM_DocumentKind = 'SCH')) then
-                        begin
-                            ServerDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
-                            if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
-                            if (Doc.DM_DocumentKind = 'HarnessWiringDiagram') then
-                                TargetDoc := SchServer.GetCurrentSchDocument
-                            else
-                                TargetDoc := SchServer.GetSchDocumentByPath(Doc.DM_FullPath);
-                            if TargetDoc = nil then
-                                TargetDoc := SchServer.GetCurrentSchDocument;
-                            if TargetDoc <> nil then Break;
-                        end;
-                    end;
-                end;
-                if TargetDoc <> nil then Break;
-            end;
+            Result := '{"success": false, "error": "no DOCUMENT given; document_path is required"}';
+            Exit;
         end;
 
-        if (TargetDoc = nil) then
+        // FindOpenDocument first: Client.OpenDocument on an open document
+        // reloads it from disk and discards unsaved changes.
+        ServerDoc := FindOpenDocument(TargetDocPath);
+        if (ServerDoc = nil) then
         begin
-            Result := '{"success": false, "error": "no active schematic or harness document open"}';
+            if (AnsiUpperCase(ExtractFileExt(TargetDocPath)) = '.WIRDOC') then
+                ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath)
+            else
+                ServerDoc := Client.OpenDocument('SCH', TargetDocPath);
+        end;
+        if (ServerDoc <> nil) then
+        begin
+            Client.ShowDocument(ServerDoc);
+            TargetDoc := SchServer.GetSchDocumentByPath(TargetDocPath);
+        end;
+        if (TargetDoc = nil) or (NormalizedPath(TargetDoc.DocumentName) <> NormalizedPath(TargetDocPath)) then
+        begin
+            Result := '{"success": false, "error": "could not open requested document: ' + JSONEscapeString(TargetDocPath) + '"}';
             Exit;
         end;
 
         SchServer.ProcessControl.PreProcess(TargetDoc, '');
 
+        // Only the harness connectivity primitives this tool recreates: wires
+        // (82), splices (83) and harness no-connects (94). User text,
+        // rectangles and other graphics are never touched.
         if ClearExisting then
         begin
-            try
-                DbgList := TStringList.Create;
-                ObjList := TList.Create;
-                try
-                    Iter := TargetDoc.SchIterator_Create;
-                    Iter.AddFilter_ObjectSet(MkSet(4, 25, 24, 94, 82, 83, 14, 22));
-                    Obj := Iter.FirstSchObject;
-                    while (Obj <> nil) do
-                    begin
-                        ObjList.Add(Obj);
-                        Obj := Iter.NextSchObject;
-                    end;
-                    TargetDoc.SchIterator_Destroy(Iter);
-
-                    for j := 0 to ObjList.Count - 1 do
-                    begin
-                        DelObj := ObjList[j];
-                        if (DelObj <> nil) then
-                        begin
-                            DbgList.Add('Removing Obj id=' + IntToStr(DelObj.ObjectId));
-                            DelObj.GraphicallyInvalidate;
-                            TargetDoc.RemoveSchObject(DelObj);
-                            SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
-                                SCHM_PrimitiveRegistration, DelObj.I_ObjectAddress);
-                        end;
-                    end;
-                finally
-                    ObjList.Free;
-                end;
-                DbgList.SaveToFile('C:\Users\Public\altium_mcp\debug_objects.txt');
-                DbgList.Free;
-            except
-            end;
-
-            // Restore connector designators if unannotated
+            ObjList := TList.Create;
             try
                 Iter := TargetDoc.SchIterator_Create;
-                Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
+                Iter.AddFilter_ObjectSet(MkSet(82, 83, 94));
                 Obj := Iter.FirstSchObject;
                 while (Obj <> nil) do
                 begin
-                    if (Obj.Designator <> nil) then
-                    begin
-                        if (Obj.Designator.Text = 'P?') or (Obj.Designator.Text = 'X?') or (Obj.Designator.Text = '') then
-                        begin
-                            if (Pos('1376360-1', Obj.ComponentDescription) > 0) or (Pos('26P', Obj.ComponentDescription) > 0) then
-                                Obj.Designator.Text := 'P1'
-                            else if (Pos('MX34028SF1', Obj.ComponentDescription) > 0) or (Pos('28POS', Obj.ComponentDescription) > 0) then
-                                Obj.Designator.Text := 'P2'
-                            else if (Pos('39-01-2025', Obj.ComponentDescription) > 0) or (Pos('2 Circuits', Obj.ComponentDescription) > 0) then
-                                Obj.Designator.Text := 'P3'
-                            else if (Pos('TERM_LUG_RING', Obj.ComponentDescription) > 0) or (Pos('Ring Terminal', Obj.ComponentDescription) > 0) then
-                                Obj.Designator.Text := 'X1';
-                        end;
-                    end;
+                    ObjList.Add(Obj);
                     Obj := Iter.NextSchObject;
                 end;
                 TargetDoc.SchIterator_Destroy(Iter);
-            except
+
+                for j := 0 to ObjList.Count - 1 do
+                begin
+                    DelObj := ObjList[j];
+                    DelObj.GraphicallyInvalidate;
+                    TargetDoc.RemoveSchObject(DelObj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, DelObj.I_ObjectAddress);
+                end;
+            finally
+                ObjList.Free;
             end;
         end;
 
+        WiresUpdated := 0;
+        CrimpCount := 0;
+        MovedCount := 0;
+        ParamCount := 0;
         WireCount := 0;
         SpliceCount := 0;
         NcCount := 0;
@@ -2255,13 +2358,11 @@ begin
             Kind := GetFieldFromPipeString(Rec, 0);
             if (Kind = 'SHEET_STYLE') then
             begin
-                try
-                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
-                    TargetDoc.SheetStyle := 8;
-                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
-                    TargetDoc.GraphicallyInvalidate;
-                except
-                end;
+                // SHEET_STYLE|<TSheetStyle ordinal>; only sent when asked for
+                SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                TargetDoc.SheetStyle := StrToInt(GetFieldFromPipeString(Rec, 1));
+                SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                TargetDoc.GraphicallyInvalidate;
             end
             else if (Kind = 'CONNECTOR') then
             begin
@@ -2269,84 +2370,16 @@ begin
                 ConnDes := GetFieldFromPipeString(Rec, 1);
                 ConnX := MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2)));
                 ConnY := MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3)));
-                try
-                    DbgList := TStringList.Create;
-                    if FileExists('C:\Users\Public\altium_mcp\debug_connector.txt') then
-                        DbgList.LoadFromFile('C:\Users\Public\altium_mcp\debug_connector.txt');
-                    DbgList.Add('Processing CONNECTOR: ' + ConnDes + ' target=(' + IntToStr(ConnX) + ',' + IntToStr(ConnY) + ')');
-                except
-                end;
-
-                Iter := TargetDoc.SchIterator_Create;
-                Obj := Iter.FirstSchObject;
-                while (Obj <> nil) do
+                Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                if (Obj = nil) then
+                    Misses.Add('connector:' + ConnDes)
+                else
                 begin
-                    if (Obj.ObjectId = 81) or (Obj.ObjectId = eSchComponent) then
-                    begin
-                        FoundDes := '';
-                        try
-                            if (Obj.Designator <> nil) and (Obj.Designator.Text <> '') then
-                                FoundDes := Obj.Designator.Text;
-                        except
-                        end;
-                        if (FoundDes = '') then
-                        begin
-                            try
-                                ChildIter := Obj.SchIterator_Create;
-                                ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
-                                Param := ChildIter.FirstSchObject;
-                                while (Param <> nil) do
-                                begin
-                                    if (AnsiUpperCase(Param.Name) = 'DESIGNATOR') and (Param.Text <> '') then
-                                    begin
-                                        FoundDes := Param.Text;
-                                        Break;
-                                    end;
-                                    Param := ChildIter.NextSchObject;
-                                end;
-                                Obj.SchIterator_Destroy(ChildIter);
-                            except
-                            end;
-                        end;
-                        if (FoundDes = '') and (ConnDes = 'P1') and ((Pos('11X2', AnsiUpperCase(Obj.LibReference)) > 0) or (Pos('649022', Obj.ComponentDescription) > 0) or (Pos('22POS', Obj.ComponentDescription) > 0)) then
-                            FoundDes := 'P1';
-                        if (FoundDes = '') and (ConnDes = 'J1') and ((Pos('2X2', AnsiUpperCase(Obj.LibReference)) > 0) or (Pos('DTM04-4P', Obj.ComponentDescription) > 0) or (Pos('4P', Obj.ComponentDescription) > 0)) then
-                            FoundDes := 'J1';
-                        if (FoundDes = '') and (ConnDes = 'P2') and (Pos('MX84B012', Obj.ComponentDescription) > 0) then
-                            FoundDes := 'P2';
-
-                        try
-                            if DbgList <> nil then
-                                DbgList.Add('  Candidate Obj id=' + IntToStr(Obj.ObjectId) + ' lib=' + Obj.LibReference + ' loc=(' + IntToStr(Obj.Location.X) + ',' + IntToStr(Obj.Location.Y) + ') FoundDes=' + FoundDes);
-                        except
-                        end;
-
-                        if (AnsiUpperCase(FoundDes) = AnsiUpperCase(ConnDes)) then
-                        begin
-                            try
-                                if DbgList <> nil then
-                                    DbgList.Add('    MATCH! Moving Obj ' + FoundDes + ' by dx=' + IntToStr(ConnX - Obj.Location.X) + ' dy=' + IntToStr(ConnY - Obj.Location.Y));
-                            except
-                            end;
-                            SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
-                            Obj.MoveByXY(ConnX - Obj.Location.X, ConnY - Obj.Location.Y);
-                            SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
-                            Obj.GraphicallyInvalidate;
-                            Break;
-                        end;
-                    end;
-                    Obj := Iter.NextSchObject;
-                end;
-                TargetDoc.SchIterator_Destroy(Iter);
-
-                try
-                    if DbgList <> nil then
-                    begin
-                        DbgList.SaveToFile('C:\Users\Public\altium_mcp\debug_connector.txt');
-                        DbgList.Free;
-                        DbgList := nil;
-                    end;
-                except
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    Obj.MoveByXY(ConnX - Obj.Location.X, ConnY - Obj.Location.Y);
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    Obj.GraphicallyInvalidate;
+                    MovedCount := MovedCount + 1;
                 end;
             end
             else if (Kind = 'WIRE') then
@@ -2443,42 +2476,10 @@ begin
                 // WIREPARAM|<ParamName>|<ParamValue>
                 PName := GetFieldFromPipeString(Rec, 1);
                 PVal  := GetFieldFromPipeString(Rec, 2);
-                try
-                    Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
-                    if (Param <> nil) then
-                    begin
-                        Param.Name := PName;
-                        Param.Text := PVal;
-                        Param.ParamType := eParameterType_String;
-                        Param.ReadOnlyState := eReadOnly_None;
-                        Param.IsHidden := True;
-                        LastWire.AddSchObject(Param);
-                        SchServer.RobotManager.SendMessage(LastWire.I_ObjectAddress, c_BroadCast,
-                            SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
-                    end;
-                except
-                end;
-                if (AnsiUpperCase(PName) = 'COLOR') then
-                begin
-                    try
-                        LastWire.Color := HarnessColorToTColor(PVal);
-                    except
-                    end;
-                end;
-                if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') or (AnsiUpperCase(PName) = 'DESIGNITEMID') then
-                begin
-                    try
-                        LastWire.DesignItemId := PVal;
-                    except
-                    end;
-                end;
-                if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') or (AnsiUpperCase(PName) = 'SOURCELIBRARYNAME') then
-                begin
-                    try
-                        LastWire.SourceLibraryName := PVal;
-                    except
-                    end;
-                end;
+                if (AnsiUpperCase(PName) <> 'COMMENT') then
+                    UpsertSchParameter(LastWire, PName, PVal);
+                ApplyHarnessWireProperty(LastWire, PName, PVal);
+                ParamCount := ParamCount + 1;
             end
             else if (Kind = 'SPLICE') then
             begin
@@ -2640,6 +2641,9 @@ begin
                 end;
                 TargetDoc.SchIterator_Destroy(Iter);
 
+                if (not FoundOnSheet) and ((PartLib = '') or (PartSym = '')) then
+                    Misses.Add('part:' + PartDes);
+
                 if (not FoundOnSheet) and (PartLib <> '') and (PartSym <> '') then
                 begin
                     OpenLibraryDocument('SchLib', PartLib);
@@ -2659,8 +2663,12 @@ begin
                         LibDoc.SchIterator_Destroy(Iter);
                     end;
 
-                    if (ServerDoc <> nil) then Client.ShowDocument(ServerDoc);
-                    TargetDoc := SchServer.GetCurrentSchDocument;
+                    // Opening the library moved focus; go back to the target
+                    // by path, never to "whatever is current now".
+                    Client.ShowDocument(ServerDoc);
+                    TargetDoc := SchServer.GetSchDocumentByPath(TargetDocPath);
+                    if (FoundComp = nil) then
+                        Misses.Add('symbol:' + PartLib + '/' + PartSym);
 
                     if (FoundComp <> nil) and (TargetDoc <> nil) then
                     begin
@@ -2706,21 +2714,8 @@ begin
                 // PARTPARAM|Name|Value
                 PName := GetFieldFromPipeString(Rec, 1);
                 PVal  := GetFieldFromPipeString(Rec, 2);
-                try
-                    Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
-                    if (Param <> nil) then
-                    begin
-                        Param.Name := PName;
-                        Param.Text := PVal;
-                        Param.ParamType := eParameterType_String;
-                        Param.ReadOnlyState := eReadOnly_None;
-                        Param.IsHidden := True;
-                        LastComp.AddSchObject(Param);
-                        SchServer.RobotManager.SendMessage(LastComp.I_ObjectAddress, c_BroadCast,
-                            SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
-                    end;
-                except
-                end;
+                UpsertSchParameter(LastComp, PName, PVal);
+                ParamCount := ParamCount + 1;
             end
             else if (Kind = 'UPDATE_WIREPARAM') then
             begin
@@ -2731,103 +2726,26 @@ begin
 
                 Obj := nil;
                 if (CachedWireObj <> nil) and (AnsiUpperCase(CachedWireDes) = AnsiUpperCase(WireDes)) then
-                begin
-                    Obj := CachedWireObj;
-                end
+                    Obj := CachedWireObj
                 else
                 begin
-                    Iter := TargetDoc.SchIterator_Create;
-                    Iter.AddFilter_ObjectSet(MkSet(82));
-                    Obj := Iter.FirstSchObject;
-                    while (Obj <> nil) do
+                    Obj := FindHarnessWire(TargetDoc, WireDes);
+                    if (Obj <> nil) then
                     begin
-                        FoundDes := '';
-                        try
-                            if (Obj.Designator <> nil) then FoundDes := Obj.Designator.Text;
-                        except
-                        end;
-                        if (AnsiUpperCase(FoundDes) = AnsiUpperCase(WireDes)) then
-                        begin
-                            CachedWireDes := WireDes;
-                            CachedWireObj := Obj;
-                            Break;
-                        end;
-                        Obj := Iter.NextSchObject;
-                    end;
-                    TargetDoc.SchIterator_Destroy(Iter);
+                        CachedWireDes := WireDes;
+                        CachedWireObj := Obj;
+                        WiresUpdated := WiresUpdated + 1;
+                    end
+                    else if (Misses.IndexOf('wire:' + WireDes) < 0) then
+                        Misses.Add('wire:' + WireDes);
                 end;
 
                 if (Obj <> nil) then
                 begin
-                    if (AnsiUpperCase(PName) = 'COMMENT') and (Obj.Comment <> nil) then
-                    begin
-                        try
-                            Obj.Comment.Text := PVal;
-                        except
-                        end;
-                    end;
-                    if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') or (AnsiUpperCase(PName) = 'DESIGNITEMID') then
-                    begin
-                        try
-                            Obj.DesignItemId := PVal;
-                        except
-                        end;
-                    end;
-                    if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') or (AnsiUpperCase(PName) = 'SOURCELIBRARYNAME') then
-                    begin
-                        try
-                            Obj.SourceLibraryName := PVal;
-                        except
-                        end;
-                    end;
-
-                    Param := nil;
-                    try
-                        ChildIter := Obj.SchIterator_Create;
-                        ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
-                        Prim := ChildIter.FirstSchObject;
-                        while (Prim <> nil) do
-                        begin
-                            if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
-                            begin
-                                Param := Prim;
-                                Break;
-                            end;
-                            Prim := ChildIter.NextSchObject;
-                        end;
-                        Obj.SchIterator_Destroy(ChildIter);
-                    except
-                    end;
-
-                    if (Param <> nil) then
-                    begin
-                        Param.Text := PVal;
-                    end
-                    else
-                    begin
-                        try
-                            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
-                            if (Param <> nil) then
-                            begin
-                                Param.Name := PName;
-                                Param.Text := PVal;
-                                Param.ParamType := eParameterType_String;
-                                Param.ReadOnlyState := eReadOnly_None;
-                                Param.IsHidden := True;
-                                Obj.AddSchObject(Param);
-                                SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast,
-                                    SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
-                            end;
-                        except
-                        end;
-                    end;
-                    if (AnsiUpperCase(PName) = 'COLOR') then
-                    begin
-                        try
-                            Obj.Color := HarnessColorToTColor(PVal);
-                        except
-                        end;
-                    end;
+                    if (AnsiUpperCase(PName) <> 'COMMENT') then
+                        UpsertSchParameter(Obj, PName, PVal);
+                    ApplyHarnessWireProperty(Obj, PName, PVal);
+                    ParamCount := ParamCount + 1;
                 end;
             end
             else if (Kind = 'CAVITYCRIMP') then
@@ -2838,151 +2756,104 @@ begin
                 PVal    := GetFieldFromPipeString(Rec, 3);
                 SrcLib  := GetFieldFromPipeString(Rec, 4);
                 DbTbl   := GetFieldFromPipeString(Rec, 5);
-                Iter := TargetDoc.SchIterator_Create;
-                Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
-                Obj := Iter.FirstSchObject;
-                while (Obj <> nil) do
+                Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                if (Obj = nil) then
+                    Misses.Add('connector:' + ConnDes)
+                else
                 begin
-                    FoundDes := '';
-                    try
-                        if (Obj.Designator <> nil) and (Obj.Designator.Text <> '') then
-                            FoundDes := Obj.Designator.Text;
-                    except
-                    end;
-                    if (FoundDes = '') then
+                    FoundOnSheet := False;
+                    ChildIter := Obj.SchIterator_Create;
+                    ChildIter.AddFilter_ObjectSet(MkSet(88, ePin));
+                    Prim := ChildIter.FirstSchObject;
+                    while (Prim <> nil) do
                     begin
-                        try
-                            ChildIter := Obj.SchIterator_Create;
-                            ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
-                            Param := ChildIter.FirstSchObject;
-                            while (Param <> nil) do
-                            begin
-                                if (AnsiUpperCase(Param.Name) = 'DESIGNATOR') and (Param.Text <> '') then
-                                begin
-                                    FoundDes := Param.Text;
-                                    Break;
-                                end;
-                                Param := ChildIter.NextSchObject;
-                            end;
-                            Obj.SchIterator_Destroy(ChildIter);
-                        except
-                        end;
-                    end;
-                    if (AnsiUpperCase(FoundDes) = AnsiUpperCase(ConnDes)) then
-                    begin
-                        ChildIter := Obj.SchIterator_Create;
-                        ChildIter.AddFilter_ObjectSet(MkSet(88, ePin));
-                        Prim := ChildIter.FirstSchObject;
-                        while (Prim <> nil) do
+                        // Designator only: a pin NAME can equal another pin's number
+                        if (Prim.Designator = PName) then
                         begin
-                            if (Prim.Designator = PName) or (Prim.Name = PName) then
-                            begin
-                                try
-                                    Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
-                                    if (Param <> nil) then
-                                    begin
-                                        Param.Name := 'Crimp';
-                                        Param.Text := PVal;
-                                        Param.ParamType := eParameterType_String;
-                                        Param.ReadOnlyState := eReadOnly_None;
-                                        Param.IsHidden := True;
-                                        Prim.AddSchObject(Param);
-                                        SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast,
-                                            SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
-                                    end;
-                                except
-                                end;
+                            FoundOnSheet := True;
+                            CrimpCount := CrimpCount + 1;
+                            UpsertSchParameter(Prim, 'Crimp', PVal);
 
+                            // The cavity's crimp slot (type 0) holds one
+                            // harness component carrying the terminal part.
+                            // AddItem/RemoveAllOfType/SetFirst come from the
+                            // undocumented cavity API, hence the guards.
+                            CavityComp := SchServer.SchObjectFactory(81, eCreate_Default);
+                            if (CavityComp <> nil) then
+                            begin
+                                CavityComp.DesignItemId := PVal;
+                                UpsertSchParameter(CavityComp, 'Comment', PVal);
+                                if (CavityComp.Comment <> nil) then
+                                    CavityComp.Comment.Text := PVal;
+                                if (SrcLib <> '') then
+                                    CavityComp.SourceLibraryName := SrcLib;
+                                if (DbTbl <> '') then
+                                    CavityComp.DatabaseTableName := DbTbl;
                                 try
-                                    CavityComp := SchServer.SchObjectFactory(81, eCreate_Default);
-                                    if (CavityComp <> nil) then
-                                    begin
-                                        try
-                                            CavityComp.DesignItemId := PVal;
-                                        except
-                                        end;
-                                        try
-                                            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
-                                            if (Param <> nil) then
-                                            begin
-                                                Param.Name := 'Comment';
-                                                Param.Text := PVal;
-                                                Param.ParamType := eParameterType_String;
-                                                Param.ReadOnlyState := eReadOnly_None;
-                                                Param.IsHidden := True;
-                                                CavityComp.AddSchObject(Param);
-                                                SchServer.RobotManager.SendMessage(CavityComp.I_ObjectAddress, c_BroadCast,
-                                                    SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
-                                            end;
-                                            if (CavityComp.Comment <> nil) then
-                                                CavityComp.Comment.Text := PVal;
-                                        except
-                                        end;
-                                        if (SrcLib <> '') then
-                                        begin
-                                            try
-                                                CavityComp.SourceLibraryName := SrcLib;
-                                            except
-                                            end;
-                                        end;
-                                        if (DbTbl <> '') then
-                                        begin
-                                            try
-                                                CavityComp.DatabaseTableName := DbTbl;
-                                            except
-                                            end;
-                                        end;
-                                        try
-                                            Prim.RemoveAllOfType(0);
-                                        except
-                                        end;
-                                        try
-                                            Prim.AddItem(0, CavityComp);
-                                        except
-                                            try
-                                                Prim.SetFirst(0, CavityComp);
-                                            except
-                                            end;
-                                        end;
-                                    end;
+                                    Prim.RemoveAllOfType(0);
                                 except
                                 end;
-                                Break;
+                                try
+                                    Prim.AddItem(0, CavityComp);
+                                except
+                                    try
+                                        Prim.SetFirst(0, CavityComp);
+                                    except
+                                    end;
+                                end;
                             end;
-                            Prim := ChildIter.NextSchObject;
+                            Break;
                         end;
-                        Obj.SchIterator_Destroy(ChildIter);
-                        Break;
+                        Prim := ChildIter.NextSchObject;
                     end;
-                    Obj := Iter.NextSchObject;
+                    Obj.SchIterator_Destroy(ChildIter);
+                    if not FoundOnSheet then
+                        Misses.Add('pin:' + ConnDes + '.' + PName);
                 end;
-                TargetDoc.SchIterator_Destroy(Iter);
             end;
         end;
 
         SchServer.ProcessControl.PostProcess(TargetDoc, '');
         TargetDoc.GraphicallyInvalidate;
 
-        if (ServerDoc = nil) and (TargetDoc <> nil) then
-            ServerDoc := FindOpenDocument(TargetDoc.DocumentName);
+        // Report the save truthfully: the document is clean afterwards only
+        // if DoFileSave actually wrote it.
+        ServerDoc.Modified := True;
+        try
+            ServerDoc.DoFileSave('');
+        except
+        end;
+        Saved := not ServerDoc.Modified;
 
-        if (ServerDoc <> nil) then
+        InfoStr := '';
+        for j := 0 to Misses.Count - 1 do
         begin
-            ServerDoc.Modified := True;
-            try
-                ServerDoc.DoFileSave('');
-            except
-            end;
+            if (j > 0) then InfoStr := InfoStr + ', ';
+            InfoStr := InfoStr + '"' + JSONEscapeString(Misses[j]) + '"';
         end;
 
-        Result := '{"success": true, "sheet": "' + ExtractFileName(TargetDoc.DocumentName) +
+        if (Misses.Count = 0) and Saved then
+            Result := '{"success": true'
+        else
+            Result := '{"success": false';
+        if Saved then
+            Result := Result + ', "saved": true'
+        else
+            Result := Result + ', "saved": false, "error": "document was not saved"';
+        Result := Result + ', "sheet": "' + JSONEscapeString(TargetDoc.DocumentName) +
                   '", "wires": ' + IntToStr(WireCount) +
+                  ', "wires_updated": ' + IntToStr(WiresUpdated) +
+                  ', "parameters_set": ' + IntToStr(ParamCount) +
+                  ', "crimps": ' + IntToStr(CrimpCount) +
+                  ', "connectors_moved": ' + IntToStr(MovedCount) +
                   ', "splices": ' + IntToStr(SpliceCount) +
                   ', "no_connects": ' + IntToStr(NcCount) +
-                  ', "net_labels": ' + IntToStr(NetCount) +
+                  ', "labels": ' + IntToStr(NetCount) +
                   ', "parts": ' + IntToStr(PartCount) +
-                  ', "rectangles": ' + IntToStr(RectCount) + '}';
+                  ', "rectangles": ' + IntToStr(RectCount) +
+                  ', "not_found": [' + InfoStr + ']}';
     finally
+        Misses.Free;
         Spec.Free;
     end;
 end;
@@ -3004,21 +2875,25 @@ var
 begin
     ConvCount := 0;
     try
-        if (TargetDocPath <> '') then
+        if (TargetDocPath = '') then
         begin
-            TargetDocPath := StringReplace(TargetDocPath, '/', '\', REPLACEALL);
-            ServerDoc := FindOpenDocument(TargetDocPath);
-            if (ServerDoc = nil) then
-                ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
-            if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
-            TargetDoc := SchServer.GetCurrentSchDocument;
-        end
-        else
-            TargetDoc := SchServer.GetCurrentSchDocument;
+            Result := '{"success": false, "error": "document_path is required"}';
+            Exit;
+        end;
+        TargetDocPath := StringReplace(TargetDocPath, '/', '\', REPLACEALL);
+        TargetDoc := nil;
+        ServerDoc := FindOpenDocument(TargetDocPath);
+        if (ServerDoc = nil) then
+            ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
+        if ServerDoc <> nil then
+        begin
+            Client.ShowDocument(ServerDoc);
+            TargetDoc := SchServer.GetSchDocumentByPath(TargetDocPath);
+        end;
 
-        if (TargetDoc = nil) then
+        if (TargetDoc = nil) or (NormalizedPath(TargetDoc.DocumentName) <> NormalizedPath(TargetDocPath)) then
         begin
-            Result := '{"success": false, "error": "No schematic or harness document active or found"}';
+            Result := '{"success": false, "error": "could not open requested document: ' + JSONEscapeString(TargetDocPath) + '"}';
             Exit;
         end;
 

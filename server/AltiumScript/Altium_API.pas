@@ -209,40 +209,8 @@ begin
             DocPath := StringReplace(DocPath, '/', '\', REPLACEALL);
             DocPath := StringReplace(DocPath, '\\', '\', REPLACEALL);
 
-            ServerDoc := FindOpenDocument('connectors.SchLib');
-            if (ServerDoc <> nil) then
-            begin
-                try
-                    ResetParameters;
-                    AddStringParameter('Action', 'Close');
-                    AddStringParameter('FileName', ServerDoc.FileName);
-                    AddStringParameter('PromptToSave', 'False');
-                    RunProcess('WorkspaceManager:CloseObject');
-                    Sleep(300);
-                except
-                end;
-            end;
-
-            for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
-            begin
-                Project := GetWorkspace.DM_Projects(P);
-                if (Project <> nil) then
-                begin
-                    for DocIdx := 0 to Project.DM_LogicalDocumentCount - 1 do
-                    begin
-                        Doc := Project.DM_LogicalDocuments(DocIdx);
-                        if (Doc <> nil) and (AnsiUpperCase(ExtractFileName(Doc.DM_FullPath)) = AnsiUpperCase(ExtractFileName(DocPath))) then
-                        begin
-                            try
-                                Doc.DM_OpenAndFocusDocument;
-                            except
-                            end;
-                            Break;
-                        end;
-                    end;
-                end;
-            end;
-
+            // FindOpenDocument first: Client.OpenDocument on an open document
+            // reloads it from disk and discards unsaved changes.
             ServerDoc := FindOpenDocument(DocPath);
             if (ServerDoc = nil) then
             begin

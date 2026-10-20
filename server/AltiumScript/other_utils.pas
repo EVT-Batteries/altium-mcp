@@ -400,8 +400,10 @@ begin
                     CurrentDoc := Module.Documents[J];
                     if CurrentDoc <> nil then
                     begin
-                        if (DocumentKind = 'SCH') and ((Pos('.SCH', AnsiUpperCase(CurrentDoc.FileName)) > 0) or 
-                                                       (Pos('.WIR', AnsiUpperCase(CurrentDoc.FileName)) > 0)) then
+                        // Exact extensions: '.SCH' as a substring also
+                        // matched .SchLib, '.PCB' matched .PcbLib.
+                        if (DocumentKind = 'SCH') and ((AnsiUpperCase(ExtractFileExt(CurrentDoc.FileName)) = '.SCHDOC') or
+                                                       (AnsiUpperCase(ExtractFileExt(CurrentDoc.FileName)) = '.WIRDOC')) then
                         begin
                             DocFound := True;
                             Client.ShowDocument(CurrentDoc);
@@ -409,7 +411,7 @@ begin
                             Result := True;
                             Exit;
                         end;
-                        if (DocumentKind = 'PCB') and (Pos('.PCB', AnsiUpperCase(CurrentDoc.FileName)) > 0) then
+                        if (DocumentKind = 'PCB') and (AnsiUpperCase(ExtractFileExt(CurrentDoc.FileName)) = '.PCBDOC') then
                         begin
                             DocFound := True;
                             Client.ShowDocument(CurrentDoc);

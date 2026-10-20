@@ -45,6 +45,10 @@ def vprint(message, level=VERBOSITY_NORMAL):
     if verbosity_level >= level:
         print(message)
 
+@unittest.skipUnless(
+    os.environ.get("ALTIUM_INTEGRATION"),
+    "drives a live Altium session and waits for input; set ALTIUM_INTEGRATION=1",
+)
 class AltiumScriptTest(unittest.TestCase):
     """Test cases for validating the Altium script functionality."""
     

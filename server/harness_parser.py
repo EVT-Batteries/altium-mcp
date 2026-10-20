@@ -72,6 +72,16 @@ def extract_ole_records(
     return records
 
 
+def _coord(props: dict[str, str], key: str) -> int | float:
+    """Coordinate in DXP units (10 mils): integer field plus its 1/100000 _Frac.
+
+    Altium omits either field when it is zero, so both are optional.
+    """
+    whole = int(props.get(key) or 0)
+    frac = int(props.get(f"{key}_Frac") or 0)
+    return whole + frac / 100000 if frac else whole
+
+
 def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
     """Parse an Altium Harness Wiring Diagram (.WirDoc) or Layout Drawing (.LdrDoc).
 
@@ -94,12 +104,19 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
     splices_dict: dict[int, dict[str, Any]] = {}
     no_connects_list: list[dict[str, Any]] = []
     net_labels: list[dict[str, Any]] = []
+    pins_by_index: dict[int, dict[str, Any]] = {}
+    # Components nested in pin cavities (RECORD 106 owned by a RECORD 131
+    # cavity container owned by the pin), resolved after the first pass
+    cavity_parts: list[tuple[int, dict[str, str]]] = []
 
     # First pass: collect connectors, wires, splices, parameters, pins, and net labels
     for idx, props in enumerate(records):
         rtype = props.get("RECORD")
 
-        if rtype == "106":  # Harness Connector
+        if rtype == "106" and "OwnerIndex" in props:
+            # Crimp/seal/plug in a cavity, not a placed connector
+            cavity_parts.append((int(props["OwnerIndex"]), props))
+        elif rtype == "106":  # Harness Connector
             connectors[idx] = {
                 "index": idx,
                 "designator": "?",
@@ -107,8 +124,8 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 "description": props.get("ComponentDescription", ""),
                 "comment": props.get("ComponentDescription", ""),
                 "location": {
-                    "x": int(props.get("Location.X", 0)),
-                    "y": int(props.get("Location.Y", 0)),
+                    "x": _coord(props, "Location.X"),
+                    "y": _coord(props, "Location.Y"),
                 },
                 "unique_id": props.get("UniqueID", ""),
                 "pins": [],
@@ -118,15 +135,14 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
             count = int(props.get("LocationCount", 0))
             pts = []
             for vi in range(1, count + 1):
-                x_val = props.get(f"X{vi}") or props.get(f"X{vi}_Frac")
-                y_val = props.get(f"Y{vi}") or props.get(f"Y{vi}_Frac")
-                if x_val is not None and y_val is not None:
-                    pts.extend([int(x_val), int(y_val)])
+                pts.extend([_coord(props, f"X{vi}"), _coord(props, f"Y{vi}")])
             wires_dict[idx] = {
                 "index": idx,
                 "designator": "?",
                 "net": "?",
                 "points": pts,
+                "design_item_id": props.get("DesignItemId", ""),
+                "source_library": props.get("SourceLibraryName", ""),
                 "unique_id": props.get("UniqueID", ""),
                 "end_vertex1_conn_uid": props.get(
                     "EndVertex1ConnectedObjectUniqueID", ""
@@ -137,8 +153,8 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 "parameters": {},
             }
         elif rtype == "108":  # Harness Splice
-            sx = props.get("Location.X") or props.get("Location.X_Frac", 0)
-            sy = props.get("Location.Y") or props.get("Location.Y_Frac", 0)
+            sx = _coord(props, "Location.X")
+            sy = _coord(props, "Location.Y")
             conn_count = int(props.get("ConnectedWiresUniqueIdsCount", 0))
             conn_wire_uids = [
                 props[f"ConnectedWireUniqueId{ci}"]
@@ -149,20 +165,18 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                 "index": idx,
                 "designator": "?",
                 "location": {
-                    "x": int(sx),
-                    "y": int(sy),
+                    "x": sx,
+                    "y": sy,
                 },
                 "unique_id": props.get("UniqueID", ""),
                 "connected_wires_count": conn_count,
                 "connected_wire_uids": conn_wire_uids,
             }
         elif rtype == "119":  # Harness No-Connect
-            ncx = props.get("Location.X") or props.get("Location.X_Frac", 0)
-            ncy = props.get("Location.Y") or props.get("Location.Y_Frac", 0)
             no_connects_list.append(
                 {
-                    "x": int(ncx),
-                    "y": int(ncy),
+                    "x": _coord(props, "Location.X"),
+                    "y": _coord(props, "Location.Y"),
                     "name": props.get("Text", ""),
                     "unique_id": props.get("UniqueID", ""),
                 }
@@ -191,9 +205,9 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
         elif rtype == "113":  # Harness Connector Pin
             owner = int(props.get("OwnerIndex", -1))
             if owner in connectors:
-                x_base = int(props.get("Location.X", 0))
-                y_base = int(props.get("Location.Y", 0))
-                length = int(props.get("PinLength", 0))
+                x_base = _coord(props, "Location.X")
+                y_base = _coord(props, "Location.Y")
+                length = _coord(props, "PinLength")
                 cong = int(props.get("PinConglomerate", 0))
                 orient = cong & 0x03
                 if orient == 0:
@@ -212,8 +226,7 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                     if f"ConnectedWireUniqueId{ci}" in props
                 ]
 
-                connectors[owner]["pins"].append(
-                    {
+                pins_by_index[idx] = {
                         "designator": props.get("Designator", ""),
                         "name": props.get("Name", ""),
                         "electrical": int(props.get("Electrical", 0)),
@@ -233,23 +246,44 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
                         "net": None,
                         "is_no_connect": False,
                         "no_connect_id": None,
+                        "cavity_parts": [],
                     }
-                )
+                connectors[owner]["pins"].append(pins_by_index[idx])
         elif rtype in [
             "4",
             "25",
         ]:  # Net Label (4: Harness/Text Label, 25: Standard Net Label)
             text = props.get("Text", "").strip()
-            if text:
+            # Text owned by a connector (e.g. its title) belongs to it, not the sheet
+            if text and "OwnerIndex" not in props:
                 net_labels.append(
                     {
                         "text": text,
-                        "x": int(props.get("Location.X", 0)),
-                        "y": int(props.get("Location.Y", 0)),
+                        "x": _coord(props, "Location.X"),
+                        "y": _coord(props, "Location.Y"),
                         "color": props.get("Color", ""),
                         "unique_id": props.get("UniqueID", ""),
                     }
                 )
+
+    # Cavity contents: 106 -> 131 cavity container -> 113 pin. Altium writes
+    # each cavity component twice with the same UniqueID; keep one.
+    for container_idx, props in cavity_parts:
+        container = records[container_idx] if container_idx < len(records) else {}
+        pin = pins_by_index.get(int(container.get("OwnerIndex", -1)))
+        if pin is None:
+            continue
+        uid = props.get("UniqueID", "")
+        if any(p["unique_id"] == uid for p in pin["cavity_parts"]):
+            continue
+        pin["cavity_parts"].append(
+            {
+                "part_number": props.get("DesignItemId", ""),
+                "source_library": props.get("SourceLibraryName", ""),
+                "source_table": props.get("DatabaseTableName", ""),
+                "unique_id": uid,
+            }
+        )
 
     # Resolve comment if "=PartNumber" or empty
     for c in connectors.values():

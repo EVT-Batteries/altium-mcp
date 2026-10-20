@@ -138,8 +138,8 @@ def calculate_harness_reroute(
         for w in parsed["wires"]:
             pts = w["points"]
             if len(pts) >= 4:
-                sx, sy = pts[0] * 10, pts[1] * 10
-                dx, dy = pts[-2] * 10, pts[-1] * 10
+                sx, sy = round(pts[0] * 10), round(pts[1] * 10)
+                dx, dy = round(pts[-2] * 10), round(pts[-1] * 10)
                 if sx > dx:
                     sx, sy, dx, dy = dx, dy, sx, sy
                 generic_conns.append(
@@ -153,69 +153,45 @@ def calculate_harness_reroute(
                         "parameters": w.get("parameters", {}),
                     }
                 )
-        base_x = trunk_x_start if trunk_x_start is not None else 16500
+        if trunk_x_start is not None:
+            base_x = trunk_x_start
+        else:
+            # Middle of the endpoints' X span, on the 100 mil grid
+            xs = [c["sx"] for c in generic_conns] + [c["dx"] for c in generic_conns]
+            base_x = round((min(xs) + max(xs)) / 2 / 100) * 100
         routed = route_topological_bundle(
             generic_conns,
             base_x=base_x,
             direction_sign=1,
             channel_pitch=channel_spacing_mils,
         )
+        # The parser reports DXP units (10 mils); add_harness_wiring takes mils
         out_splices = []
         for s in parsed.get("splices", []):
-            loc = s.get("location", {})
-            sx = int(s.get("x", loc.get("x", 0)))
-            sy = int(s.get("y", loc.get("y", 0)))
-            if sx < 5000:
-                sx *= 10
-            if sy < 5000:
-                sy *= 10
             out_splices.append({
                 "designator": s.get("designator", ""),
-                "x": sx,
-                "y": sy,
+                "x": round(s["location"]["x"] * 10),
+                "y": round(s["location"]["y"] * 10),
             })
 
         out_no_connects = []
         for nc in parsed.get("no_connects", []):
-            loc = nc.get("location", {})
-            nx = int(nc.get("x", loc.get("x", 0)))
-            ny = int(nc.get("y", loc.get("y", 0)))
-            if nx < 5000:
-                nx *= 10
-            if ny < 5000:
-                ny *= 10
             out_no_connects.append({
                 "name": nc.get("name", nc.get("designator", "")),
                 "designator": nc.get("designator", nc.get("name", "")),
-                "x": nx,
-                "y": ny,
+                "x": round(nc["x"] * 10),
+                "y": round(nc["y"] * 10),
                 "show_name": nc.get("show_name", False),
             })
 
-        out_net_labels = []
-        for nl in parsed.get("net_labels", []):
-            loc = nl.get("location", {})
-            lx = int(nl.get("x", loc.get("x", 0)))
-            ly = int(nl.get("y", loc.get("y", 0)))
-            if lx < 5000:
-                lx *= 10
-            if ly < 5000:
-                ly *= 10
-            out_net_labels.append({
-                "text": nl.get("text", ""),
-                "x": lx,
-                "y": ly,
-                "orientation": nl.get("orientation", 0),
-            })
-
-        detected_splice_x = out_splices[0]["x"] if out_splices else (splice_x or 13500)
+        detected_splice_x = out_splices[0]["x"] if out_splices else splice_x
+        # Sheet text is not part of the routing and is left in place
         return {
             "connectors": [],
             "rectangles": [],
             "wires": routed,
             "splices": out_splices,
             "no_connects": out_no_connects,
-            "net_labels": out_net_labels,
             "summary": {
                 "wire_count": len(routed),
                 "splice_count": len(out_splices),

@@ -1914,9 +1914,37 @@ async def build_schematic(
     return json.dumps(result, indent=2)
 
 
+HARNESS_SPEC_FILE = EXCHANGE_DIR / "harness_wiring_spec.txt"
+
+# TSheetStyle ordinals accepted by ISch_Document.SheetStyle
+SHEET_STYLES = {
+    "A4": 0, "A3": 1, "A2": 2, "A1": 3, "A0": 4,
+    "A": 5, "B": 6, "C": 7, "D": 8, "E": 9,
+    "LETTER": 10, "LEGAL": 11, "TABLOID": 12,
+}
+
+
+def _bad_spec_value(value: Any) -> str | None:
+    """First string in value that would corrupt the pipe/line spec format."""
+    if isinstance(value, str):
+        return value if any(ch in value for ch in "|\r\n") else None
+    if isinstance(value, dict):
+        items = [*value.keys(), *value.values()]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return None
+    for item in items:
+        bad = _bad_spec_value(item)
+        if bad is not None:
+            return bad
+    return None
+
+
 @mcp.tool()
 async def add_harness_wiring(
     ctx: Context,
+    document_path: str | None = None,
     wires: list | None = None,
     splices: list | None = None,
     no_connects: list | None = None,
@@ -1928,10 +1956,20 @@ async def add_harness_wiring(
     wire_updates: list | None = None,
     cavity_crimps: list | None = None,
     clear_existing: bool = False,
-    document_path: str | None = None,
+    sheet_style: str | None = None,
 ) -> str:
     """
-    Add wires, splices, no-connect directives, and net labels to the currently active Harness Wiring Diagram (.WirDoc) or Schematic.
+    Add or update wires, splices, no-connects, text, crimps and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
+
+    document_path is required: the target is always named explicitly, matched by full path,
+    and saved to disk afterwards.
+
+    Parameters are upserted: setting a parameter that already exists updates it and removes
+    any duplicates with the same name, so repeated runs never stack conflicting values.
+
+    The result reports what was done ("wires_updated", "parameters_set", "crimps", ...) and lists
+    every wire, connector, pin or symbol that could not be found under "not_found"; "success" is
+    false when anything was not found or the document could not be saved.
 
     Coordinates Convention:
         All coordinates (points, splices, no-connects, label positions) MUST be specified in true mils
@@ -1961,31 +1999,62 @@ async def add_harness_wiring(
             [
                 {"x": 16700, "y": 8100, "name": "NC1", "show_name": False}
             ]
-        net_labels (list): List of net label dicts, e.g.:
+        labels (list): Text strings (ISch_Label, never net labels), e.g.:
             [
                 {"x": 16700, "y": 8400, "orientation": 0, "text": "BMSS_C01_POS"}
             ]
+        net_labels (list): Deprecated alias of labels.
+        wire_updates (list): Parameters to upsert on existing wires, e.g.:
+            [{"designator": "W1", "parameters": {"Gauge": "22 AWG"}}]
+        cavity_crimps (list): Terminals to put in connector cavities, e.g.:
+            [{"connector": "P1", "pin": "1", "terminal": "64900613722DEC",
+              "source_library": "my.DbLib", "source_table": "terminals-db.csv"}]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
-            and no-connect directives from the sheet before adding new ones. Defaults to False.
-        document_path (str, optional): Target document path. If omitted, uses active document.
+            and harness no-connects (only those) before adding new ones. Defaults to False.
+        sheet_style (str, optional): Change the sheet size, e.g. "D" or "A3". Left unchanged
+            when omitted.
+        document_path (str): Target .WirDoc / .SchDoc path. Required.
 
     Returns:
-        str: JSON string reporting placement counts and document name.
+        str: JSON string reporting counts, saved state and not_found items.
     """
     logger.info(
         f"Adding harness wiring: {len(wires or [])} wires, "
         f"{len(splices or [])} splices, "
         f"{len(no_connects or [])} no-connects, "
-        f"{len(net_labels or [])} net labels"
+        f"{len(labels or net_labels or [])} labels"
     )
 
-    lines = []
-    if document_path:
-        norm_path = str(Path(document_path).resolve())
-        lines.append(f"DOCUMENT|{norm_path}")
+    if not document_path:
+        return json.dumps(
+            {"success": False, "error": "document_path is required"}
+        )
+    bad = _bad_spec_value(
+        [wires, splices, no_connects, net_labels, labels, connectors,
+         rectangles, parts, wire_updates, cavity_crimps, document_path]
+    )
+    if bad is not None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"values may not contain '|' or line breaks: {bad!r}",
+            }
+        )
+
+    lines = [f"DOCUMENT|{Path(document_path).resolve()}"]
     if clear_existing:
         lines.append("CLEAR_EXISTING")
-    lines.append("SHEET_STYLE|D")
+    if sheet_style:
+        style = SHEET_STYLES.get(str(sheet_style).strip().upper())
+        if style is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"unknown sheet_style {sheet_style!r}; "
+                    f"use one of {sorted(SHEET_STYLES)}",
+                }
+            )
+        lines.append(f"SHEET_STYLE|{style}")
 
     for c in connectors or []:
         c_des = str(c.get("designator", "")).strip()
@@ -2142,9 +2211,8 @@ async def add_harness_wiring(
             else:
                 lines.append(f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}")
 
-    spec_path = Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt")
-    spec_path.parent.mkdir(parents=True, exist_ok=True)
-    write_altium_text(spec_path, "\n".join(lines) + "\n")
+    HARNESS_SPEC_FILE.parent.mkdir(parents=True, exist_ok=True)
+    write_altium_text(HARNESS_SPEC_FILE, "\n".join(lines) + "\n")
 
     response = await altium_bridge.execute_command("add_harness_wiring", {})
     if not response.get("success", False):
@@ -2167,16 +2235,15 @@ async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> st
     or Schematic back to standard text strings (ISch_Label, RECORD=4).
 
     Args:
-        document_path (str, optional): Absolute or relative path to target .WirDoc file.
-            If omitted, uses active document.
+        document_path (str): Absolute or relative path to target .WirDoc file. Required.
 
     Returns:
         str: JSON string reporting conversion status and count.
     """
     logger.info(f"Converting netlabels to text strings for doc: {document_path}")
-    doc_path = ""
-    if document_path:
-        doc_path = str(Path(document_path).resolve())
+    if not document_path:
+        return json.dumps({"success": False, "error": "document_path is required"})
+    doc_path = str(Path(document_path).resolve())
 
     response = await altium_bridge.execute_command(
         "convert_netlabels_to_text", {"document_path": doc_path}
@@ -2212,9 +2279,14 @@ async def reroute_harness_wiring(
     places splices with certified runways, positions midpoint labels without collisions,
     and commits directly to Altium Designer.
 
+    Only harness wires, splices and harness no-connects are replaced; text, rectangles
+    and other graphics on the sheet are left untouched. Wires are currently deleted and
+    recreated, so their UniqueIDs change (links from .LdrDoc layout drawings are lost).
+
     Args:
-        document_path: Full path to target .WirDoc file. If omitted, uses active harness.
+        document_path: Full path to target .WirDoc file. Required.
         trunk_x_start: Optional X coordinate in mils for vertical trunk start.
+            Defaults to the middle of the wire endpoints' X span.
         splice_x: Optional X coordinate in mils for harness splices.
         channel_spacing_mils: Distance between vertical trunk channels (default 300 mils / 3 grid units).
         clear_existing: Whether to clear existing wires before rerouting (default True).
@@ -2224,17 +2296,11 @@ async def reroute_harness_wiring(
     """
     import harness_router
 
+    if not document_path or Path(document_path).suffix.lower() != ".wirdoc":
+        return json.dumps(
+            {"success": False, "error": "document_path to a .WirDoc is required"}
+        )
     target_path = document_path
-    if not target_path:
-        h_path = await _get_active_harness_path()
-        if not h_path:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": "No active harness project or document_path provided",
-                }
-            )
-        target_path = str(h_path)
 
     try:
         routing_data = harness_router.calculate_harness_reroute(
@@ -2258,7 +2324,6 @@ async def reroute_harness_wiring(
         wires=routing_data["wires"],
         splices=routing_data["splices"],
         no_connects=routing_data["no_connects"],
-        net_labels=routing_data.get("net_labels"),
         connectors=routing_data.get("connectors"),
         rectangles=routing_data.get("rectangles"),
         clear_existing=clear_existing,
@@ -2301,33 +2366,43 @@ async def sync_harness_wires(
     5. Commits changes to disk via DoFileSave.
 
     Args:
-        document_path (str, optional): Target .WirDoc file path. Defaults to active document in Altium.
-        wires_db_path (str, optional): Path to wires-db.csv. If omitted, searches standard local paths or environment ALTIUM_WIRES_DB_PATH.
+        document_path (str): Target .WirDoc file path. Required.
+        wires_db_path (str, optional): Path to the wire database CSV. If omitted, uses the
+            ALTIUM_WIRES_DB_PATH environment variable, else searches upwards from the document's
+            folder for wires-db.csv (directly, in components/, or in */components/).
         source_library_name (str, optional): Name of the parent database library (e.g. 'components.DbLib').
         wire_designator_map (dict, optional): Optional mapping of wire designator to PartNumber, e.g. {"W1": "5875 BK005"}.
-            If omitted, wires are resolved using their existing PartNumber / Design Item Id or Gauge + Color.
+            Otherwise each wire is resolved from its PartNumber / Design Item Id, or from the one
+            database row matching both its gauge and color. Wires that cannot be resolved
+            unambiguously are listed under "unresolved" and left unchanged.
 
     Returns:
-        str: JSON string detailing updated wires and applied parameters.
+        str: JSON string detailing updated wires, unresolved wires and Altium's report.
     """
-    db_file = None
+    if not document_path or not Path(document_path).exists():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"document_path to an existing .WirDoc is required: {document_path!r}",
+            }
+        )
+    target_path = str(Path(document_path).resolve())
+
+    db_file: Path | None = None
     if wires_db_path:
         db_file = Path(wires_db_path).resolve()
+    elif os.environ.get("ALTIUM_WIRES_DB_PATH"):
+        db_file = Path(os.environ["ALTIUM_WIRES_DB_PATH"]).resolve()
     else:
-        env_p = os.environ.get("ALTIUM_WIRES_DB_PATH")
-        if env_p and Path(env_p).exists():
-            db_file = Path(env_p).resolve()
-        else:
-            candidates = [
-                Path("components/wires-db.csv"),
-                Path("altium-librairies/components/wires-db.csv"),
-                Path("../altium-librairies/components/wires-db.csv"),
-                Path("c:/evt_gits/altium-librairies/components/wires-db.csv"),
+        for folder in Path(target_path).parents:
+            found = [
+                *folder.glob("wires-db.csv"),
+                *folder.glob("components/wires-db.csv"),
+                *folder.glob("*/components/wires-db.csv"),
             ]
-            for c in candidates:
-                if c.exists():
-                    db_file = c.resolve()
-                    break
+            if found:
+                db_file = found[0].resolve()
+                break
 
     if not db_file or not db_file.exists():
         return json.dumps({"success": False, "error": "Wire database CSV not found. Please provide wires_db_path."})
@@ -2341,27 +2416,9 @@ async def sync_harness_wires(
             if pn:
                 wire_db[pn] = {k: (v or "").strip() for k, v in row.items()}
 
-    # Resolve target document path
-    target_path = None
-    if document_path:
-        target_path = str(Path(document_path).resolve())
-    else:
-        status_res = await altium_bridge.execute_command("get_server_status", {})
-        focused = status_res.get("result", {}).get("focused_document", "")
-        if focused and focused.lower().endswith(".wirdoc"):
-            for doc_path in Path(".").rglob(focused):
-                target_path = str(doc_path.resolve())
-                break
-        if not target_path:
-            h_path = await _get_active_harness_path()
-            if h_path and str(h_path).lower().endswith(".wirdoc"):
-                target_path = str(Path(h_path).resolve())
-
-    if not target_path or not Path(target_path).exists():
-        return json.dumps({
-            "success": False,
-            "error": f"Target .WirDoc document not found: {target_path or 'No document specified and no active .WirDoc detected'}"
-        })
+    def awg(text: str | None) -> str | None:
+        match = re.search(r"(\d+(?:/\d+)?)\s*AWG", text or "", re.IGNORECASE)
+        return match.group(1) if match else None
 
     doc_data = parse_wirdoc(target_path)
     wires = doc_data.get("wires", [])
@@ -2369,6 +2426,7 @@ async def sync_harness_wires(
         return json.dumps({"success": False, "error": f"No wires found in {target_path}"})
 
     wire_updates = []
+    unresolved: list[dict[str, str]] = []
     des_map = wire_designator_map or {}
 
     for w in wires:
@@ -2376,18 +2434,38 @@ async def sync_harness_wires(
         if not des or des == "?":
             continue
 
-        part_num = des_map.get(des)
+        wp = w.get("parameters", {})
+        part_num = (
+            des_map.get(des)
+            or wp.get("PartNumber")
+            or wp.get("Design Item Id")
+            or w.get("design_item_id")
+        )
         if not part_num:
-            part_num = w.get("parameters", {}).get("PartNumber") or w.get("parameters", {}).get("Design Item Id")
-        if not part_num:
-            w_color = w.get("parameters", {}).get("Color", "")
-            for pn, row in wire_db.items():
-                if row.get("Color", "").lower() == w_color.lower():
-                    part_num = pn
-                    break
+            gauge = awg(wp.get("Gauge") or wp.get("Wire Gauge"))
+            color = wp.get("Color", "").lower()
+            matches = [
+                pn
+                for pn, row in wire_db.items()
+                if row.get("Color", "").lower() == color
+                and awg(row.get("Wire Gauge") or row.get("Gauge")) == gauge
+            ]
+            if len(matches) == 1:
+                part_num = matches[0]
+            else:
+                unresolved.append(
+                    {
+                        "designator": des,
+                        "reason": f"{len(matches)} database rows match gauge "
+                        f"{gauge!r} and color {color!r}",
+                    }
+                )
+                continue
 
-        if not part_num or part_num not in wire_db:
-            logger.warning(f"Wire {des} PartNumber '{part_num}' not found in {db_file}")
+        if part_num not in wire_db:
+            unresolved.append(
+                {"designator": des, "reason": f"PartNumber {part_num!r} not in database"}
+            )
             continue
 
         row = wire_db[part_num]
@@ -2436,22 +2514,25 @@ async def sync_harness_wires(
             "parameters": params,
         })
 
-    res_str = await add_harness_wiring(
-        ctx,
-        wire_updates=wire_updates,
-        document_path=target_path,
-    )
-
-    try:
-        res_json = json.loads(res_str)
-    except Exception:
-        res_json = {"raw": res_str}
+    if wire_updates:
+        res_str = await add_harness_wiring(
+            ctx,
+            wire_updates=wire_updates,
+            document_path=target_path,
+        )
+        try:
+            res_json = json.loads(res_str)
+        except Exception:
+            res_json = {"success": False, "raw": res_str}
+    else:
+        res_json = {"success": True, "note": "nothing to update"}
 
     return json.dumps(
         {
-            "success": res_json.get("success", False),
+            "success": bool(res_json.get("success")) and not unresolved,
             "document_path": target_path,
-            "wires_synced_count": len(wire_updates),
+            "wires_synced_count": res_json.get("wires_updated", len(wire_updates)),
+            "unresolved": unresolved,
             "wires_db_path": str(db_file),
             "altium_response": res_json,
         },
