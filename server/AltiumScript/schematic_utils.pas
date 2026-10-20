@@ -2083,6 +2083,8 @@ var
     PartX, PartY  : Integer;
     PartOri       : Integer;
     PartCom       : String;
+    CachedWireDes : String;
+    CachedWireObj : ISch_GraphicalObject;
     PartDesc      : String;
     PartFoot      : String;
     PartMir       : String;
@@ -2243,6 +2245,8 @@ begin
         PartCount := 0;
         LastWire := nil;
         LastComp := nil;
+        CachedWireDes := '';
+        CachedWireObj := nil;
 
         for i := 0 to Spec.Count - 1 do
         begin
@@ -2709,90 +2713,93 @@ begin
                 WireDes := GetFieldFromPipeString(Rec, 1);
                 PName   := GetFieldFromPipeString(Rec, 2);
                 PVal    := GetFieldFromPipeString(Rec, 3);
-                Iter := TargetDoc.SchIterator_Create;
-                Iter.AddFilter_ObjectSet(MkSet(82));
-                Obj := Iter.FirstSchObject;
-                while (Obj <> nil) do
-                begin
-                    FoundDes := '';
-                    try
-                        if (Obj.Designator <> nil) then FoundDes := Obj.Designator.Text;
-                    except
-                    end;
-                    if (AnsiUpperCase(FoundDes) = AnsiUpperCase(WireDes)) then
-                    begin
-                        if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') then
-                        begin
-                            try
-                                Obj.DesignItemId := PVal;
-                            except
-                            end;
-                            try
-                                Obj.LibReference := PVal;
-                            except
-                            end;
-                            try
-                                Obj.SourceLibraryName := 'evt-components.DbLib';
-                            except
-                            end;
-                            try
-                                Obj.DatabaseTableName := 'wires-db.csv';
-                            except
-                            end;
-                        end;
 
-                        Param := nil;
+                Obj := nil;
+                if (CachedWireObj <> nil) and (AnsiUpperCase(CachedWireDes) = AnsiUpperCase(WireDes)) then
+                begin
+                    Obj := CachedWireObj;
+                end
+                else
+                begin
+                    Iter := TargetDoc.SchIterator_Create;
+                    Iter.AddFilter_ObjectSet(MkSet(82));
+                    Obj := Iter.FirstSchObject;
+                    while (Obj <> nil) do
+                    begin
+                        FoundDes := '';
                         try
-                            ChildIter := Obj.SchIterator_Create;
-                            ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
-                            Prim := ChildIter.FirstSchObject;
-                            while (Prim <> nil) do
-                            begin
-                                if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
-                                begin
-                                    Param := Prim;
-                                    Break;
-                                end;
-                                Prim := ChildIter.NextSchObject;
-                            end;
-                            Obj.SchIterator_Destroy(ChildIter);
+                            if (Obj.Designator <> nil) then FoundDes := Obj.Designator.Text;
                         except
                         end;
-
-                        if (Param <> nil) then
+                        if (AnsiUpperCase(FoundDes) = AnsiUpperCase(WireDes)) then
                         begin
-                            Param.Text := PVal;
-                        end
-                        else
-                        begin
-                            try
-                                Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
-                                if (Param <> nil) then
-                                begin
-                                    Param.Name := PName;
-                                    Param.Text := PVal;
-                                    Param.ParamType := eParameterType_String;
-                                    Param.ReadOnlyState := eReadOnly_None;
-                                    Param.IsHidden := True;
-                                    Obj.AddSchObject(Param);
-                                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast,
-                                        SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
-                                end;
-                            except
-                            end;
+                            CachedWireDes := WireDes;
+                            CachedWireObj := Obj;
+                            Break;
                         end;
-                        if (AnsiUpperCase(PName) = 'COLOR') then
-                        begin
-                            try
-                                Obj.Color := HarnessColorToTColor(PVal);
-                            except
-                            end;
-                        end;
-                        Break;
+                        Obj := Iter.NextSchObject;
                     end;
-                    Obj := Iter.NextSchObject;
+                    TargetDoc.SchIterator_Destroy(Iter);
                 end;
-                TargetDoc.SchIterator_Destroy(Iter);
+
+                if (Obj <> nil) then
+                begin
+                    if (AnsiUpperCase(PName) = 'COMMENT') and (Obj.Comment <> nil) then
+                    begin
+                        try
+                            Obj.Comment.Text := PVal;
+                        except
+                        end;
+                    end;
+
+                    Param := nil;
+                    try
+                        ChildIter := Obj.SchIterator_Create;
+                        ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+                        Prim := ChildIter.FirstSchObject;
+                        while (Prim <> nil) do
+                        begin
+                            if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
+                            begin
+                                Param := Prim;
+                                Break;
+                            end;
+                            Prim := ChildIter.NextSchObject;
+                        end;
+                        Obj.SchIterator_Destroy(ChildIter);
+                    except
+                    end;
+
+                    if (Param <> nil) then
+                    begin
+                        Param.Text := PVal;
+                    end
+                    else
+                    begin
+                        try
+                            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                            if (Param <> nil) then
+                            begin
+                                Param.Name := PName;
+                                Param.Text := PVal;
+                                Param.ParamType := eParameterType_String;
+                                Param.ReadOnlyState := eReadOnly_None;
+                                Param.IsHidden := True;
+                                Obj.AddSchObject(Param);
+                                SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast,
+                                    SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                            end;
+                        except
+                        end;
+                    end;
+                    if (AnsiUpperCase(PName) = 'COLOR') then
+                    begin
+                        try
+                            Obj.Color := HarnessColorToTColor(PVal);
+                        except
+                        end;
+                    end;
+                end;
             end
             else if (Kind = 'CAVITYCRIMP') then
             begin

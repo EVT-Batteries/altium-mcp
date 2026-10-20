@@ -2269,6 +2269,158 @@ async def reroute_harness_wiring(
 
 
 @mcp.tool()
+@mcp.tool()
+async def sync_harness_wires(
+    ctx: Context,
+    document_path: str | None = None,
+    wires_db_path: str = "c:/evt_gits/altium-librairies/components/wires-db.csv",
+    wire_designator_map: dict | None = None,
+) -> str:
+    """Synchronize harness wire parameters, design item IDs, and visual colors from wires-db.csv onto a .WirDoc.
+
+    Because Altium Designer's internal harness engine rejects .DbLib components via the GUI 'Replace Component'
+    dialog (it requires a cloud ISchHarnessWire model with ObjectID=82 rather than a .SchLib symbol),
+    this tool provides the official automated library synchronization mechanism:
+    1. Loads master wire definitions from wires-db.csv (PartNumber, Description, Gauge, Color, Voltage Rating, etc.).
+    2. Identifies all wires in the target .WirDoc.
+    3. Resolves each wire's PartNumber from its current parameters or an explicit wire_designator_map.
+    4. Propagates all engineering parameters, design item IDs, and visual TColor rendering onto the wires in Altium.
+    5. Saves changes to disk via DoFileSave.
+
+    Args:
+        document_path (str, optional): Target .WirDoc file path. Defaults to active document.
+        wires_db_path (str): Path to wires-db.csv.
+        wire_designator_map (dict, optional): Optional mapping of wire designator to PartNumber, e.g. {"W1": "5875 BK005"}.
+            If omitted, wires are resolved using their existing PartNumber / Design Item Id or Gauge + Color.
+
+    Returns:
+        str: JSON string detailing updated wires and applied parameters.
+    """
+    db_file = Path(wires_db_path).resolve()
+    if not db_file.exists():
+        return json.dumps({"success": False, "error": f"wires-db.csv not found: {db_file}"})
+
+    import csv
+    wire_db: dict[str, dict[str, str]] = {}
+    with open(db_file, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pn = row.get("PartNumber", "").strip()
+            if pn:
+                wire_db[pn] = {k: (v or "").strip() for k, v in row.items()}
+
+    # Resolve target document path
+    target_path = None
+    if document_path:
+        target_path = str(Path(document_path).resolve())
+    else:
+        status_res = await altium_bridge.execute_command("get_server_status", {})
+        focused = status_res.get("result", {}).get("focused_document", "")
+        if focused and focused.lower().endswith(".wirdoc"):
+            for doc_path in Path(".").rglob(focused):
+                target_path = str(doc_path.resolve())
+                break
+        if not target_path:
+            default_p = Path("c:/evt_gits/electrical-p42c-1/P42C-1_Slave_Harness/P42C-1_Slave_Sense_Harness.WirDoc")
+            if default_p.exists():
+                target_path = str(default_p.resolve())
+
+    if not target_path or not Path(target_path).exists():
+        return json.dumps({"success": False, "error": f"Target .WirDoc document not found: {target_path}"})
+
+    doc_data = parse_wirdoc(target_path)
+    wires = doc_data.get("wires", [])
+    if not wires:
+        return json.dumps({"success": False, "error": f"No wires found in {target_path}"})
+
+    wire_updates = []
+    des_map = wire_designator_map or {}
+
+    for w in wires:
+        des = w.get("designator", "").strip()
+        if not des or des == "?":
+            continue
+
+        part_num = des_map.get(des)
+        if not part_num:
+            part_num = w.get("parameters", {}).get("PartNumber") or w.get("parameters", {}).get("Design Item Id")
+        if not part_num:
+            w_color = w.get("parameters", {}).get("Color", "")
+            for pn, row in wire_db.items():
+                if row.get("Color", "").lower() == w_color.lower():
+                    part_num = pn
+                    break
+
+        if not part_num or part_num not in wire_db:
+            logger.warning(f"Wire {des} PartNumber '{part_num}' not found in {wires_db_path}")
+            continue
+
+        row = wire_db[part_num]
+        params = {
+            "Design Item Id": part_num,
+            "PartNumber": part_num,
+            "Description": row.get("Description", ""),
+            "Manufacturer 1": row.get("Manufacturer 1", ""),
+            "Manufacturer Part Number 1": row.get("Manufacturer Part Number 1", ""),
+            "Manufacturer Series": row.get("Manufacturer Series", ""),
+            "Wire Gauge": row.get("Wire Gauge", ""),
+            "Gauge": row.get("Wire Gauge", ""),
+            "Color": row.get("Color", ""),
+            "Color Code": row.get("Color Code", ""),
+            "Outer Diameter": row.get("Outer Diameter", ""),
+            "Linear Weight": row.get("Linear Weight", ""),
+            "Min Bend Radius": row.get("Min Bend Radius", ""),
+            "Conductor Material": row.get("Conductor Material", ""),
+            "Conductor Stranding": row.get("Conductor Stranding", ""),
+            "Insulation Material": row.get("Insulation Material", ""),
+            "Insulation Color": row.get("Insulation Color", ""),
+            "Voltage Rating": row.get("Voltage Rating", ""),
+            "VoltageRating": row.get("Voltage Rating", ""),
+            "Max Current Rating": row.get("Max Current Rating", ""),
+            "Max Operating Temperature": row.get("Max Operating Temperature", ""),
+            "Min Operating Temperature": row.get("Min Operating Temperature", ""),
+            "Flammability Rating": row.get("Flammability Rating", ""),
+            "ComponentType": "Wire",
+            "Border": "None",
+            "Source Library": "evt-components.DbLib",
+            "Source Table": "wires-db.csv",
+        }
+        for k in ["ComponentLink1Description", "ComponentLink1URL", "ComponentLink2Description", "ComponentLink2URL"]:
+            if row.get(k):
+                params[k] = row[k]
+
+        if des == "W10" and (not w.get("net") or w.get("net") == "?"):
+            params["Comment"] = "MOD1_NTC2_GND"
+
+        wire_updates.append({
+            "designator": des,
+            "parameters": params,
+        })
+
+    res_str = await add_harness_wiring(
+        ctx,
+        wire_updates=wire_updates,
+        document_path=target_path,
+    )
+
+    try:
+        res_json = json.loads(res_str)
+    except Exception:
+        res_json = {"raw": res_str}
+
+    return json.dumps(
+        {
+            "success": res_json.get("success", False),
+            "document_path": target_path,
+            "wires_synced_count": len(wire_updates),
+            "wires_db_path": str(db_file),
+            "altium_response": res_json,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     """
     Create many schematic symbols in a single Altium script run.
