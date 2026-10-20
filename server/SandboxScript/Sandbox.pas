@@ -44,18 +44,13 @@ begin
 
     try
         // === BEGIN EXPERIMENT (rewritten by the run_altium_script tool) ===
-        ResultText := '{"success": true}';
-
-
-
-
-
-
-
-
-
-
-        ResultText := '{"success": true}';
+        S1 := 'C:\evt_gits\electrical-p42c-1\P42C-1_Slave_Harness\P42C-1_Slave_Sense_Harness.WirDoc';
+        SandboxLog('GetSchDocumentByPath');
+        Obj1 := SchServer.GetSchDocumentByPath(S1);
+        if Obj1 = nil then ResultText := 'ByPath=nil' else ResultText := 'ByPath DocumentName=' + Obj1.DocumentName + ' ObjectId=' + IntToStr(Obj1.ObjectId);
+        SandboxLog('current');
+        Obj2 := SchServer.GetCurrentSchDocument;
+        if Obj2 <> nil then ResultText := ResultText + ' | Current=' + Obj2.DocumentName;
         // === END EXPERIMENT ===
     except
         SandboxLog('EXCEPTION escaped the script body');
