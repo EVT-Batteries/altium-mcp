@@ -2464,6 +2464,24 @@ begin
                     except
                     end;
                 end;
+                if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') then
+                begin
+                    try
+                        LastWire.DesignItemId := PVal;
+                    except
+                    end;
+                    try
+                        LastWire.SourceLibraryName := 'evt-components.DbLib';
+                    except
+                    end;
+                end;
+                if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') then
+                begin
+                    try
+                        LastWire.SourceLibraryName := PVal;
+                    except
+                    end;
+                end;
             end
             else if (Kind = 'SPLICE') then
             begin
@@ -2748,6 +2766,24 @@ begin
                     begin
                         try
                             Obj.Comment.Text := PVal;
+                        except
+                        end;
+                    end;
+                    if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') then
+                    begin
+                        try
+                            Obj.DesignItemId := PVal;
+                        except
+                        end;
+                        try
+                            Obj.SourceLibraryName := 'evt-components.DbLib';
+                        except
+                        end;
+                    end;
+                    if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') then
+                    begin
+                        try
+                            Obj.SourceLibraryName := PVal;
                         except
                         end;
                     end;
