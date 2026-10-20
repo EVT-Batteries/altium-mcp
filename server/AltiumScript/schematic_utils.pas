@@ -2885,6 +2885,18 @@ begin
                                         except
                                         end;
                                         try
+                                            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                                            if (Param <> nil) then
+                                            begin
+                                                Param.Name := 'Comment';
+                                                Param.Text := PVal;
+                                                Param.ParamType := eParameterType_String;
+                                                Param.ReadOnlyState := eReadOnly_None;
+                                                Param.IsHidden := True;
+                                                CavityComp.AddSchObject(Param);
+                                                SchServer.RobotManager.SendMessage(CavityComp.I_ObjectAddress, c_BroadCast,
+                                                    SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                                            end;
                                             if (CavityComp.Comment <> nil) then
                                                 CavityComp.Comment.Text := PVal;
                                         except
