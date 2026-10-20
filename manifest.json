@@ -11,7 +11,9 @@
     "entry_point": "start_server.py",
     "mcp_config": {
       "command": "python",
-      "args": ["${__dirname}/start_server.py"]
+      "args": [
+        "${__dirname}/start_server.py"
+      ]
     }
   },
   "tools": [
@@ -193,7 +195,23 @@
     },
     {
       "name": "add_harness_wiring",
-      "description": "Add wires, no-connect directives, and net labels to the active Harness Wiring Diagram (.WirDoc)"
+      "description": "Add or update wires, splices, no-connects, text, cavity terminals and parameters on a Harness Wiring Diagram (.WirDoc); moves existing wires in place"
+    },
+    {
+      "name": "reroute_harness_wiring",
+      "description": "Re-route every wire of a .WirDoc orthogonally in place (corridors, nested staircases, label staggering), keeping wire IDs and links"
+    },
+    {
+      "name": "sync_harness_library",
+      "description": "Link harness wires and cavity terminals to a local CSV-backed .DbLib and copy all their parameters onto the .WirDoc"
+    },
+    {
+      "name": "sync_harness_wires",
+      "description": "Wire-only library sync from a wire database CSV, with the legacy Gauge/VoltageRating/Border parameters"
+    },
+    {
+      "name": "convert_netlabels_to_text",
+      "description": "Convert net labels on a .WirDoc or schematic to plain text strings"
     }
   ],
   "compatibility": {

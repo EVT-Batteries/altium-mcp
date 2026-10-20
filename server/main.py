@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import contextlib
 import glob
 import io
 import json
 import logging
+import msvcrt
 import os
 import re
 import subprocess
@@ -17,8 +19,8 @@ import win32gui
 import win32process
 import win32ui
 from altium_files import read_altium_text, write_altium_text
+from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from harness_parser import (
-    find_workspace_harness,
     get_harness_component_data,
     get_harness_component_pins,
     get_harness_components,
@@ -37,15 +39,16 @@ from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.utilities.types import Image as MCPImage
 from outjob_parser import parse_outjob
 
-# Configure logging
+# Log to stderr and to the per-user data folder (not the source tree).
+# ALTIUM_MCP_LOG_LEVEL=DEBUG for detailed logs.
+_LOG_DIR = Path(os.environ.get("ALTIUM_MCP_HOME") or Path.home() / ".altium-mcp")
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    level=logging.DEBUG,  # Change to DEBUG for more detailed logs
+    level=os.environ.get("ALTIUM_MCP_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.StreamHandler(),  # Output to console
-        logging.FileHandler(
-            str(Path(__file__).with_name("altium_mcp.log"))
-        ),  # Also log to file
+        logging.StreamHandler(),
+        logging.FileHandler(str(_LOG_DIR / "altium_mcp.log"), encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("AltiumMCPServer")
@@ -78,6 +81,9 @@ EXCHANGE_DIR = Path("C:/Users/Public/altium_mcp")
 EXCHANGE_DIR.mkdir(exist_ok=True)
 REQUEST_FILE = EXCHANGE_DIR / "request.json"
 RESPONSE_FILE = EXCHANGE_DIR / "response.json"
+BRIDGE_LOCK_FILE = EXCHANGE_DIR / "bridge.lock"
+# Longer than one script's 120 s response timeout
+BRIDGE_LOCK_TIMEOUT = 300
 
 # Initialize FastMCP server
 mcp = MCPServer("AltiumMCP")
@@ -298,12 +304,42 @@ class AltiumBridge:
         # concurrent tool calls must be serialized or they clobber each other
         self._command_lock = asyncio.Lock()
 
+    @contextlib.asynccontextmanager
+    async def exclusive(self):
+        """Hold the Altium bridge: an asyncio lock for this server and an OS
+        lock on BRIDGE_LOCK_FILE for every other server process using the same
+        exchange folder (e.g. one started by Gemini and one by Claude). The OS
+        releases the lock if a process dies."""
+        async with self._command_lock:
+            with open(BRIDGE_LOCK_FILE, "a+b") as handle:  # noqa: ASYNC230
+                deadline = time.time() + BRIDGE_LOCK_TIMEOUT
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                "Altium bridge busy: another MCP server process held "
+                                f"{BRIDGE_LOCK_FILE} for {BRIDGE_LOCK_TIMEOUT} s"
+                            ) from None
+                        await asyncio.sleep(0.25)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
     async def execute_command(
         self, command: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         """Execute a command in Altium via the bridge script"""
-        async with self._command_lock:
-            return await self._execute_command_locked(command, params)
+        try:
+            async with self.exclusive():
+                return await self._execute_command_locked(command, params)
+        except TimeoutError as e:
+            return {"success": False, "error": str(e)}
 
     async def _execute_command_locked(
         self, command: str, params: dict[str, Any]
@@ -473,23 +509,38 @@ class AltiumBridge:
 # Create a global bridge instance
 altium_bridge = AltiumBridge()
 
-_last_known_project_path: str | None = None
-
-
 async def _get_active_harness_path() -> Path | None:
-    """Resolve active harness project (.PrjHar) or wiring diagram (.WirDoc).
+    """The harness project (.PrjHar) or wiring document Altium has focused.
 
-    Checks:
-    1. Last known project path from Altium if it was a .PrjHar
-    2. Instant workspace / directory search for .PrjHar or .WirDoc
+    Asked from Altium, never guessed from disk: a folder search returns
+    whichever harness project sorts first, not the one being edited. None
+    when Altium cannot answer or the focused document is not a harness.
     """
-    global _last_known_project_path
-    if _last_known_project_path:
-        p = Path(_last_known_project_path)
-        if p.suffix.lower() == ".prjhar" and p.exists():
-            return p
+    response = await altium_bridge.execute_command("get_active_document", {})
+    if not response.get("success", False):
+        return None
+    info = response.get("result", {})
+    if isinstance(info, str):
+        try:
+            info = json.loads(info)
+        except ValueError:
+            return None
+    project = Path(info.get("project_path") or "")
+    if project.suffix.lower() == ".prjhar" and project.exists():
+        return project
+    document = Path(info.get("document_path") or "")
+    if document.suffix.lower() in (".wirdoc", ".ldrdoc") and document.exists():
+        return document
+    return None
 
-    return find_workspace_harness()
+
+def _disk_source(path: Path) -> dict[str, str]:
+    """Marks a result that was parsed from saved files instead of Altium."""
+    return {
+        "source": "harness_file",
+        "source_path": str(Path(path).resolve()),
+        "note": "Parsed from the saved file; unsaved edits in Altium are not included.",
+    }
 
 
 async def _pcb_only_tool_error(tool_name: str, original_error: str) -> str | None:
@@ -913,7 +964,7 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
                     f"Retrieved {len(h_components)} harness schematic components as fallback"
                 )
                 return json.dumps(
-                    {"components": h_components}, indent=2, ensure_ascii=False
+                    {"components": h_components, **_disk_source(h_path)}, indent=2, ensure_ascii=False
                 )
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
@@ -929,7 +980,7 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
             h_components = get_harness_schematic_data(h_path, cmp_designators)
             if h_components:
                 return json.dumps(
-                    {"components": h_components}, indent=2, ensure_ascii=False
+                    {"components": h_components, **_disk_source(h_path)}, indent=2, ensure_ascii=False
                 )
         logger.info("No schematic data found")
         return json.dumps({"error": "No schematic data found"})
@@ -962,7 +1013,7 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
                 h_components = get_harness_schematic_data(h_path, cmp_designators)
                 if h_components:
                     return json.dumps(
-                        {"components": h_components}, indent=2, ensure_ascii=False
+                        {"components": h_components, **_disk_source(h_path)}, indent=2, ensure_ascii=False
                     )
 
         result = {
@@ -1086,7 +1137,7 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
                 logger.info(
                     f"Retrieved {len(h_data['components'])} harness components as fallback"
                 )
-                return json.dumps(h_data, indent=2, ensure_ascii=False)
+                return json.dumps({**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting component data: {error_msg}")
@@ -1100,7 +1151,7 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
         if h_path:
             h_data = get_harness_component_data(h_path, cmp_designators)
             if h_data.get("components"):
-                return json.dumps(h_data, indent=2, ensure_ascii=False)
+                return json.dumps({**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
 
@@ -1131,7 +1182,7 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
             if h_path:
                 h_data = get_harness_component_data(h_path, cmp_designators)
                 if h_data.get("components"):
-                    return json.dumps(h_data, indent=2, ensure_ascii=False)
+                    return json.dumps({**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
 
         result = {
             "components": components,
@@ -1448,7 +1499,19 @@ async def run_altium_script(
             {"success": False, "error": f"sandbox project missing at {SANDBOX_DIR}"}
         )
 
+    async with altium_bridge.exclusive():
+        return await _run_sandbox(script, timeout_seconds)
+
+
+async def _run_sandbox(script: str, timeout_seconds: int) -> str:
+    # The tracked SandboxScript/ files are a template: each run works on a
+    # copy in the exchange folder, so running scripts never dirties the repo.
+    work_dir = EXCHANGE_DIR / "sandbox"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    work_pas = work_dir / SANDBOX_PAS.name
+    work_prj = work_dir / SANDBOX_PRJ.name
     try:
+        work_prj.write_bytes(SANDBOX_PRJ.read_bytes())
         src = SANDBOX_PAS.read_text(encoding="utf-8")
         pre, rest = src.split(SANDBOX_BEGIN, 1)
         marker_line, rest = rest.split("\n", 1)
@@ -1457,7 +1520,7 @@ async def run_altium_script(
             "        " + ln if ln.strip() else ln
             for ln in script.strip("\n").splitlines()
         )
-        SANDBOX_PAS.write_text(
+        work_pas.write_text(
             pre
             + SANDBOX_BEGIN
             + marker_line
@@ -1480,7 +1543,7 @@ async def run_altium_script(
 
     # Altium runs outside Claude Desktop's MSIX package and cannot see the
     # virtualized AppData path this process sees (issue #19)
-    sandbox_prj = AltiumBridge._resolve_msix_path(str(SANDBOX_PRJ))
+    sandbox_prj = AltiumBridge._resolve_msix_path(str(work_prj))
     cmd = (
         f'"{altium_bridge.config.altium_exe_path}" -RScriptingSystem:RunScript('
         f'ProjectName="{sandbox_prj}"^|ProcName="Sandbox>Run")'
@@ -1924,21 +1987,47 @@ SHEET_STYLES = {
 }
 
 
-def _bad_spec_value(value: Any) -> str | None:
-    """First string in value that would corrupt the pipe/line spec format."""
-    if isinstance(value, str):
-        return value if any(ch in value for ch in "|\r\n") else None
-    if isinstance(value, dict):
-        items = [*value.keys(), *value.values()]
-    elif isinstance(value, (list, tuple)):
-        items = list(value)
-    else:
+def _spec_line(*fields: Any) -> str:
+    """One spec record. Fields are percent-encoded ('%', '|', line breaks), so
+    values may contain them; the script decodes them again (SpecField)."""
+    return "|".join(
+        str(f)
+        .replace("%", "%25")
+        .replace("|", "%7C")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+        for f in fields
+    )
+
+
+def _param_pairs(params: dict | None) -> list[tuple[str, str]]:
+    """Non-empty (name, value) pairs of a parameter dict."""
+    return [
+        (str(k), str(v))
+        for k, v in (params or {}).items()
+        if v is not None and str(v).strip()
+    ]
+
+
+def _wire_points(item: dict) -> list[int] | None:
+    pts = item.get("points", [])
+    if len(pts) < 4 or len(pts) % 2 != 0:
         return None
-    for item in items:
-        bad = _bad_spec_value(item)
-        if bad is not None:
-            return bad
-    return None
+    return [int(v) for v in pts]
+
+
+def _wire_label_positions(item: dict, pts: list[int]) -> tuple[list, list]:
+    from harness_router import label_positions
+
+    des_pos = item.get("designator_pos")
+    com_pos = item.get("comment_pos")
+    if not des_pos or not com_pos:
+        auto_des, auto_com = label_positions(
+            pts, str(item.get("label_position", "above")).lower()
+        )
+        des_pos = des_pos or auto_des
+        com_pos = com_pos or auto_com
+    return [int(v) for v in des_pos], [int(v) for v in com_pos]
 
 
 @mcp.tool()
@@ -1954,6 +2043,7 @@ async def add_harness_wiring(
     rectangles: list | None = None,
     parts: list | None = None,
     wire_updates: list | None = None,
+    reroutes: list | None = None,
     cavity_crimps: list | None = None,
     clear_existing: bool = False,
     sheet_style: str | None = None,
@@ -1966,6 +2056,7 @@ async def add_harness_wiring(
 
     Parameters are upserted: setting a parameter that already exists updates it and removes
     any duplicates with the same name, so repeated runs never stack conflicting values.
+    Any value may contain '|' or line breaks.
 
     The result reports what was done ("wires_updated", "parameters_set", "crimps", ...) and lists
     every wire, connector, pin or symbol that could not be found under "not_found"; "success" is
@@ -1976,21 +2067,26 @@ async def add_harness_wiring(
         (1 DXP schematic unit = 10 mils, e.g., X=1640 in Altium -> 16400 in API).
 
     Args:
-        wires (list): List of wire dicts, e.g.:
+        document_path (str): Target .WirDoc / .SchDoc path. Required.
+        wires (list): New wires, e.g.:
             [
                 {
                     "designator": "W1",
-                    "net": "BMSS_C01_POS",
+                    "net": "BMSS_C01_POS",           # written as the wire's Comment
                     "points": [16700, 8400, 11600, 8400, 11600, 13200, 6500, 13200],
-                    "parameters": {"Gauge": "22 AWG", "Color": "Orange", "Border": "None"},
+                    "parameters": {"Gauge": "22 AWG", "Color": "Orange"},
+                    "tcolor": 42495,                 # optional explicit drawing colour (TColor)
                     "label_position": "above",       # "above" (default) or "below"
-                    "designator_pos": [13500, 8415], # optional [x, y] in mils (side-by-side with comment)
-                    "comment_pos": [13900, 8415]     # optional [x, y] in mils
+                    "designator_pos": [13500, 8415], # optional [x, y] in mils
+                    "comment_pos": [13875, 8415]     # optional [x, y] in mils
                 }
             ]
             points are alternating x, y coordinates in true mils (even length >= 4).
-            If designator_pos / comment_pos are omitted, labels are automatically positioned side-by-side
-            along the longest horizontal segment (offset by +/-200 mils horizontally) to prevent text overlap.
+            Omitted label positions default to side-by-side (375 mils apart) at the midpoint of
+            the longest horizontal segment.
+        reroutes (list): Move EXISTING wires in place (keeps UniqueID, parameters, colour and
+            library link), e.g. [{"designator": "W1", "points": [...]}] with optional
+            designator_pos / comment_pos / label_position as for wires.
         splices (list, optional): List of splice dicts, e.g.:
             [
                 {"designator": "SP1", "x": 7800, "y": 13300}
@@ -2005,21 +2101,22 @@ async def add_harness_wiring(
             ]
         net_labels (list): Deprecated alias of labels.
         wire_updates (list): Parameters to upsert on existing wires, e.g.:
-            [{"designator": "W1", "parameters": {"Gauge": "22 AWG"}}]
+            [{"designator": "W1", "parameters": {"Gauge": "22 AWG"}, "tcolor": 0}]
         cavity_crimps (list): Terminals to put in connector cavities, e.g.:
             [{"connector": "P1", "pin": "1", "terminal": "64900613722DEC",
-              "source_library": "my.DbLib", "source_table": "terminals-db.csv"}]
+              "source_library": "my.DbLib", "source_table": "terminals-db.csv",
+              "parameters": {"Description": "...", "Manufacturer 1": "..."}}]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
             and harness no-connects (only those) before adding new ones. Defaults to False.
         sheet_style (str, optional): Change the sheet size, e.g. "D" or "A3". Left unchanged
             when omitted.
-        document_path (str): Target .WirDoc / .SchDoc path. Required.
 
     Returns:
         str: JSON string reporting counts, saved state and not_found items.
     """
     logger.info(
         f"Adding harness wiring: {len(wires or [])} wires, "
+        f"{len(reroutes or [])} reroutes, "
         f"{len(splices or [])} splices, "
         f"{len(no_connects or [])} no-connects, "
         f"{len(labels or net_labels or [])} labels"
@@ -2029,19 +2126,8 @@ async def add_harness_wiring(
         return json.dumps(
             {"success": False, "error": "document_path is required"}
         )
-    bad = _bad_spec_value(
-        [wires, splices, no_connects, net_labels, labels, connectors,
-         rectangles, parts, wire_updates, cavity_crimps, document_path]
-    )
-    if bad is not None:
-        return json.dumps(
-            {
-                "success": False,
-                "error": f"values may not contain '|' or line breaks: {bad!r}",
-            }
-        )
 
-    lines = [f"DOCUMENT|{Path(document_path).resolve()}"]
+    lines = [_spec_line("DOCUMENT", Path(document_path).resolve())]
     if clear_existing:
         lines.append("CLEAR_EXISTING")
     if sheet_style:
@@ -2054,80 +2140,48 @@ async def add_harness_wiring(
                     f"use one of {sorted(SHEET_STYLES)}",
                 }
             )
-        lines.append(f"SHEET_STYLE|{style}")
+        lines.append(_spec_line("SHEET_STYLE", style))
 
     for c in connectors or []:
-        c_des = str(c.get("designator", "")).strip()
-        cx = int(c.get("x", 0))
-        cy = int(c.get("y", 0))
-        lines.append(f"CONNECTOR|{c_des}|{cx}|{cy}")
+        lines.append(
+            _spec_line(
+                "CONNECTOR",
+                str(c.get("designator", "")).strip(),
+                int(c.get("x", 0)),
+                int(c.get("y", 0)),
+            )
+        )
 
     for s in splices or []:
-        s_des = str(s.get("designator", "SP?")).strip()
-        sx = int(s.get("x", 0))
-        sy = int(s.get("y", 0))
-        lines.append(f"SPLICE|{s_des}|{sx}|{sy}")
+        lines.append(
+            _spec_line(
+                "SPLICE",
+                str(s.get("designator", "SP?")).strip(),
+                int(s.get("x", 0)),
+                int(s.get("y", 0)),
+            )
+        )
 
     for w in wires or []:
-        des = str(w.get("designator", "")).strip()
-        net = str(w.get("net", "")).strip()
-        pts = w.get("points", [])
-        if len(pts) < 4 or len(pts) % 2 != 0:
+        pts = _wire_points(w)
+        if pts is None:
             return json.dumps(
                 {
                     "success": False,
                     "error": f"wire needs an even count of >=4 coords: {w}",
                 }
             )
-        pts = [int(v) for v in pts]
-        pts_str = "|".join(str(v) for v in pts)
-
-        # Compute label positions above the wire if not provided
-        des_pos = w.get("designator_pos")
-        com_pos = w.get("comment_pos")
-        label_pos_mode = str(w.get("label_position", "above")).lower()
-        if not des_pos or not com_pos:
-            best_seg = None
-            max_dx = -1
-            for k in range(0, len(pts) - 2, 2):
-                xa, ya = pts[k], pts[k + 1]
-                xb, yb = pts[k + 2], pts[k + 3]
-                if ya == yb:
-                    dx = abs(xb - xa)
-                    if dx > max_dx:
-                        max_dx = dx
-                        best_seg = (min(xa, xb), max(xa, xb), ya)
-            if best_seg and max_dx >= 300:
-                mid_x = (best_seg[0] + best_seg[1]) // 2
-                y_wire = best_seg[2]
-                if label_pos_mode == "below":
-                    if not des_pos:
-                        des_pos = [mid_x - 200, y_wire - 85]
-                    if not com_pos:
-                        com_pos = [mid_x + 200, y_wire - 85]
-                else:
-                    if not des_pos:
-                        des_pos = [mid_x - 200, y_wire + 15]
-                    if not com_pos:
-                        com_pos = [mid_x + 200, y_wire + 15]
-            else:
-                xa, ya = pts[0], pts[1]
-                xb, yb = pts[2], pts[3]
-                mid_y = (ya + yb) // 2
-                if label_pos_mode == "below":
-                    if not des_pos:
-                        des_pos = [xa + 20, mid_y - 20]
-                    if not com_pos:
-                        com_pos = [xa + 20, mid_y - 40]
-                else:
-                    if not des_pos:
-                        des_pos = [xa + 20, mid_y + 20]
-                    if not com_pos:
-                        com_pos = [xa + 20, mid_y - 20]
-
+        des_pos, com_pos = _wire_label_positions(w, pts)
         lines.append(
-            f"WIRE|{des}|{net}|AT|{int(des_pos[0])}|{int(des_pos[1])}|"
-            f"{int(com_pos[0])}|{int(com_pos[1])}|{pts_str}"
+            _spec_line(
+                "WIRE",
+                str(w.get("designator", "")).strip(),
+                str(w.get("net", "")).strip(),
+                "AT",
+                *des_pos,
+                *com_pos,
+                *pts,
+            )
         )
 
         params = dict(w.get("parameters", {}))
@@ -2137,59 +2191,95 @@ async def add_harness_wiring(
             params["Color"] = w["color"]
         if "border" in w and "Border" not in params:
             params["Border"] = w["border"]
+        for pk, pv in _param_pairs(params):
+            lines.append(_spec_line("WIREPARAM", pk, pv))
+        if w.get("tcolor") is not None:
+            lines.append(_spec_line("WIRECOLOR", "", int(w["tcolor"])))
 
-        for pk, pv in params.items():
-            if pv is not None and str(pv).strip():
-                lines.append(f"WIREPARAM|{pk}|{pv}")
+    for rr in reroutes or []:
+        pts = _wire_points(rr)
+        if pts is None:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"reroute needs an even count of >=4 coords: {rr}",
+                }
+            )
+        des_pos, com_pos = _wire_label_positions(rr, pts)
+        lines.append(
+            _spec_line(
+                "REROUTE",
+                str(rr.get("designator", "")).strip(),
+                "AT",
+                *des_pos,
+                *com_pos,
+                *pts,
+            )
+        )
 
     for i, nc in enumerate(no_connects or []):
-        x = int(nc.get("x", 0))
-        y = int(nc.get("y", 0))
-        nc_name = nc.get("name") or nc.get("designator") or f"NC{i + 1}"
-        show_name = "1" if nc.get("show_name", False) else "0"
-        lines.append(f"NOCONNECT|{x}|{y}|{nc_name}|{show_name}")
+        lines.append(
+            _spec_line(
+                "NOCONNECT",
+                int(nc.get("x", 0)),
+                int(nc.get("y", 0)),
+                nc.get("name") or nc.get("designator") or f"NC{i + 1}",
+                "1" if nc.get("show_name", False) else "0",
+            )
+        )
 
     for nl in labels or net_labels or []:
-        x = int(nl.get("x", 0))
-        y = int(nl.get("y", 0))
-        ori = int(nl.get("orientation", 0))
         text = str(nl.get("text", "")).strip()
         if text:
-            lines.append(f"NETLABEL|{x}|{y}|{ori}|{text}")
+            lines.append(
+                _spec_line(
+                    "LABEL",
+                    int(nl.get("x", 0)),
+                    int(nl.get("y", 0)),
+                    int(nl.get("orientation", 0)),
+                    text,
+                )
+            )
 
     for r in rectangles or []:
-        x1 = int(r.get("x1", 0))
-        y1 = int(r.get("y1", 0))
-        x2 = int(r.get("x2", 0))
-        y2 = int(r.get("y2", 0))
-        lw = int(r.get("line_width", 2))
-        col = int(r.get("color", 16711935))
-        area = int(r.get("area_color", 11599871))
-        lines.append(f"RECTANGLE|{x1}|{y1}|{x2}|{y2}|{lw}|{col}|{area}")
+        lines.append(
+            _spec_line(
+                "RECTANGLE",
+                int(r.get("x1", 0)),
+                int(r.get("y1", 0)),
+                int(r.get("x2", 0)),
+                int(r.get("y2", 0)),
+                int(r.get("line_width", 2)),
+                int(r.get("color", 16711935)),
+                int(r.get("area_color", 11599871)),
+            )
+        )
 
     for p in parts or []:
-        des = str(p.get("designator", "")).strip()
-        lib = str(p.get("symbol_library", "")).strip()
-        sym = str(p.get("symbol", "")).strip()
-        px = int(p.get("x", 0))
-        py = int(p.get("y", 0))
-        ori = int(p.get("orientation", 0))
-        mir = "1" if p.get("mirror", False) else "0"
-        com = str(p.get("comment", "")).strip()
-        desc = str(p.get("description", "")).strip()
-        foot = str(p.get("footprint", "")).strip()
         lines.append(
-            f"PART|{des}|{lib}|{sym}|{px}|{py}|{ori}|{mir}|{com}|{desc}|{foot}"
+            _spec_line(
+                "PART",
+                str(p.get("designator", "")).strip(),
+                str(p.get("symbol_library", "")).strip(),
+                str(p.get("symbol", "")).strip(),
+                int(p.get("x", 0)),
+                int(p.get("y", 0)),
+                int(p.get("orientation", 0)),
+                "1" if p.get("mirror", False) else "0",
+                str(p.get("comment", "")).strip(),
+                str(p.get("description", "")).strip(),
+                str(p.get("footprint", "")).strip(),
+            )
         )
-        for pk, pv in (p.get("parameters") or {}).items():
-            if pv is not None and str(pv).strip():
-                lines.append(f"PARTPARAM|{pk}|{pv}")
+        for pk, pv in _param_pairs(p.get("parameters")):
+            lines.append(_spec_line("PARTPARAM", pk, pv))
 
     for wu in wire_updates or []:
         w_des = str(wu.get("designator", "")).strip()
-        for pk, pv in (wu.get("parameters") or {}).items():
-            if pv is not None and str(pv).strip():
-                lines.append(f"UPDATE_WIREPARAM|{w_des}|{pk}|{pv}")
+        for pk, pv in _param_pairs(wu.get("parameters")):
+            lines.append(_spec_line("UPDATE_WIREPARAM", w_des, pk, pv))
+        if wu.get("tcolor") is not None:
+            lines.append(_spec_line("WIRECOLOR", w_des, int(wu["tcolor"])))
 
     for cc in cavity_crimps or []:
         conn_des = str(cc.get("connector", "")).strip()
@@ -2201,20 +2291,36 @@ async def add_harness_wiring(
             or cc.get("part_number")
             or ""
         ).strip()
-        src_lib = str(cc.get("source_library", "")).strip()
-        src_tbl = str(cc.get("source_table", "")).strip()
-        if conn_des and pin_des and terminal:
-            if src_lib or src_tbl:
-                lines.append(
-                    f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}|{src_lib}|{src_tbl}"
-                )
-            else:
-                lines.append(f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}")
+        if not (conn_des and pin_des and terminal):
+            continue
+        fields = [
+            "CAVITYCRIMP",
+            conn_des,
+            pin_des,
+            terminal,
+            str(cc.get("source_library", "")).strip(),
+            str(cc.get("source_table", "")).strip(),
+        ]
+        pairs = _param_pairs(cc.get("parameters"))
+        if pairs:
+            for pk, pv in pairs:
+                fields.extend([pk, pv])
+        else:
+            while fields[-1] == "":
+                fields.pop()
+        lines.append(_spec_line(*fields))
 
-    HARNESS_SPEC_FILE.parent.mkdir(parents=True, exist_ok=True)
-    write_altium_text(HARNESS_SPEC_FILE, "\n".join(lines) + "\n")
-
-    response = await altium_bridge.execute_command("add_harness_wiring", {})
+    # Spec file and command under one hold of the bridge: another server
+    # process must not replace the spec between writing and running it
+    try:
+        async with altium_bridge.exclusive():
+            HARNESS_SPEC_FILE.parent.mkdir(parents=True, exist_ok=True)
+            write_altium_text(HARNESS_SPEC_FILE, "\n".join(lines) + "\n")
+            response = await altium_bridge._execute_command_locked(
+                "add_harness_wiring", {}
+            )
+    except TimeoutError as e:
+        response = {"success": False, "error": str(e)}
     if not response.get("success", False):
         return json.dumps(
             {"success": False, "error": response.get("error", "unknown error")}
@@ -2265,34 +2371,37 @@ async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> st
 @mcp.tool()
 async def reroute_harness_wiring(
     ctx: Context,
-    document_path: str | None = None,
+    document_path: str,
     trunk_x_start: int | None = None,
-    splice_x: int | None = None,
     channel_spacing_mils: int = 300,
-    clear_existing: bool = True,
+    dry_run: bool = False,
 ) -> str:
-    """Automatically clean up, un-rubber-band, and reroute an Altium Harness Wiring Diagram (.WirDoc).
+    """Re-route every wire of an Altium Harness Wiring Diagram (.WirDoc) orthogonally, in place.
 
-    Extracts connector positions from the active or specified .WirDoc, resolves net
-    connectivity, calculates optimal orthogonal routing with topological vertical
-    trunk channels (300 mil pitch, nested concentric staircases, co-linear channel re-use),
-    places splices with certified runways, positions midpoint labels without collisions,
-    and commits directly to Altium Designer.
+    Use after connectors moved and wires rubber-banded. Endpoints stay on their pins and
+    splices; only the path between them and the label positions change. Wires are moved in
+    place, so their UniqueIDs, parameters, colours, library links and layout-drawing (.LdrDoc)
+    links survive. Text, rectangles, splices and no-connects are not touched.
 
-    Only harness wires, splices and harness no-connects are replaced; text, rectangles
-    and other graphics on the sheet are left untouched. Wires are currently deleted and
-    recreated, so their UniqueIDs change (links from .LdrDoc layout drawings are lost).
+    Routing rules (see harness_router.py): straight wires stay straight; vertical drops live
+    in per-connector-pair corridors near the destination side; 300 mil channel pitch; UP and
+    DOWN wires nested as concentric staircases; channels shared only when that adds no
+    crossing; channels and labels keep clear of pin names and splices; labels side by side on
+    the longest horizontal run, staggered by 900 mils on tight parallel runs.
+
+    The routes are computed from the SAVED file: save the document in Altium first.
 
     Args:
         document_path: Full path to target .WirDoc file. Required.
-        trunk_x_start: Optional X coordinate in mils for vertical trunk start.
-            Defaults to the middle of the wire endpoints' X span.
-        splice_x: Optional X coordinate in mils for harness splices.
-        channel_spacing_mils: Distance between vertical trunk channels (default 300 mils / 3 grid units).
-        clear_existing: Whether to clear existing wires before rerouting (default True).
+        trunk_x_start: Optional X (mils) of the first channel of every corridor. By default each
+            corridor starts next to its destination side.
+        channel_spacing_mils: Distance between vertical channels (default 300 mils).
+        dry_run: Only compute and report the routes, change nothing.
 
     Returns:
-        JSON string reporting reroute execution details and primitive counts.
+        JSON with success, summary (corridors, channels, crossings, ...), warnings
+        (pin-name or splice clearance problems, wires that could not be rerouted) and
+        Altium's report.
     """
     import harness_router
 
@@ -2300,50 +2409,271 @@ async def reroute_harness_wiring(
         return json.dumps(
             {"success": False, "error": "document_path to a .WirDoc is required"}
         )
-    target_path = document_path
 
     try:
-        routing_data = harness_router.calculate_harness_reroute(
-            document_path=target_path,
+        routing = harness_router.calculate_harness_reroute(
+            document_path=document_path,
             trunk_x_start=trunk_x_start,
-            splice_x=splice_x,
             channel_spacing_mils=channel_spacing_mils,
         )
     except Exception as e:
         logger.error(f"Error calculating harness reroute: {e}")
         return json.dumps(
-            {
-                "success": False,
-                "error": f"Failed to calculate reroute: {e!s}",
-            }
+            {"success": False, "error": f"Failed to calculate reroute: {e!s}"}
         )
 
-    # Execute wiring placement
-    res_str = await add_harness_wiring(
-        ctx,
-        wires=routing_data["wires"],
-        splices=routing_data["splices"],
-        no_connects=routing_data["no_connects"],
-        connectors=routing_data.get("connectors"),
-        rectangles=routing_data.get("rectangles"),
-        clear_existing=clear_existing,
-        document_path=target_path,
-    )
+    if dry_run:
+        return json.dumps({"success": True, "dry_run": True, **routing}, indent=2)
 
+    res_str = await add_harness_wiring(
+        ctx, document_path=document_path, reroutes=routing["reroutes"]
+    )
     try:
         res_json = json.loads(res_str)
-    except Exception:
-        res_json = {"raw": res_str}
+    except ValueError:
+        res_json = {"success": False, "raw": res_str}
 
     return json.dumps(
         {
-            "success": res_json.get("success", False),
-            "document_path": target_path,
-            "summary": routing_data["summary"],
+            "success": bool(res_json.get("success")),
+            "document_path": str(Path(document_path).resolve()),
+            "summary": routing["summary"],
+            "warnings": routing["warnings"],
             "altium_response": res_json,
         },
         indent=2,
     )
+
+
+def _awg(text: str | None) -> str | None:
+    """Gauge number in a text like '22 AWG (Twisted Pair)'."""
+    match = re.search(r"(\d+(?:/\d+)?)\s*AWG", text or "", re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+async def _sync_harness_from_library(
+    ctx: Context,
+    document_path: str | None,
+    library: Any,
+    sync_wires: bool,
+    sync_cavities: bool,
+    wire_designator_map: dict | None,
+    cavity_map: dict | None,
+    color_map: dict | None,
+    parameter_aliases: dict | None,
+    extra_wire_parameters: dict | None,
+    source_library_name: str | None,
+) -> dict[str, Any]:
+    """Shared engine of sync_harness_library and sync_harness_wires."""
+    target_path = str(Path(document_path).resolve())
+    src_lib = source_library_name or library.name
+    aliases = parameter_aliases or {}
+    doc_data = parse_wirdoc(target_path)
+    unresolved: list[dict[str, str]] = []
+    warnings: list[str] = []
+
+    def with_aliases(params: dict[str, str]) -> dict[str, str]:
+        out = dict(params)
+        for alias, column in aliases.items():
+            if params.get(column):
+                out[alias] = params[column]
+        return out
+
+    wire_updates = []
+    if sync_wires:
+        des_map = wire_designator_map or {}
+        for w in doc_data.get("wires", []):
+            des = w.get("designator", "").strip()
+            if not des or des == "?":
+                continue
+            wp = w.get("parameters", {})
+            part_num = (
+                des_map.get(des)
+                or wp.get("PartNumber")
+                or wp.get("Design Item Id")
+                or w.get("design_item_id")
+            )
+            if not part_num:
+                gauge = _awg(wp.get("Gauge") or wp.get("Wire Gauge"))
+                color = wp.get("Color", "").lower()
+                matches = [
+                    pn
+                    for table in library.tables.values()
+                    for pn, row in table.rows.items()
+                    if row.get("Color", "").lower() == color
+                    and _awg(row.get("Wire Gauge") or row.get("Gauge")) == gauge
+                ]
+                if len(matches) != 1:
+                    unresolved.append(
+                        {
+                            "designator": des,
+                            "reason": f"{len(matches)} database rows match gauge "
+                            f"{gauge!r} and color {color!r}",
+                        }
+                    )
+                    continue
+                part_num = matches[0]
+            found = library.find(part_num)
+            if found is None:
+                unresolved.append(
+                    {"designator": des, "reason": f"PartNumber {part_num!r} not in database"}
+                )
+                continue
+            table, row = found
+            params = with_aliases(table.parameters(row))
+            params.update(extra_wire_parameters or {})
+            params["Design Item Id"] = part_num
+            params["PartNumber"] = part_num
+            params["Source Table"] = table.name
+            if src_lib:
+                params["Source Library"] = src_lib
+            update: dict[str, Any] = {"designator": des, "parameters": params}
+            tcolor = color_to_tcolor(row.get("Color", ""), color_map)
+            if tcolor is not None:
+                update["tcolor"] = tcolor
+            elif row.get("Color"):
+                warnings.append(
+                    f"{des}: no drawing colour for {row['Color']!r}; pass color_map"
+                )
+            wire_updates.append(update)
+
+    cavity_crimps = []
+    if sync_cavities:
+        wanted = {
+            (str(conn), str(pin)): str(pn)
+            for conn, pins in (cavity_map or {}).items()
+            for pin, pn in pins.items()
+        }
+        for c in doc_data.get("connectors", []):
+            for pin in c.get("pins", []):
+                key = (c["designator"], pin["designator"])
+                part_num = wanted.pop(key, None)
+                if part_num is None and pin.get("cavity_parts"):
+                    part_num = pin["cavity_parts"][0]["part_number"]
+                if not part_num:
+                    continue
+                found = library.find(part_num)
+                if found is None:
+                    unresolved.append(
+                        {
+                            "designator": f"{key[0]}.{key[1]}",
+                            "reason": f"terminal {part_num!r} not in database",
+                        }
+                    )
+                    continue
+                table, row = found
+                cavity_crimps.append(
+                    {
+                        "connector": key[0],
+                        "pin": key[1],
+                        "terminal": part_num,
+                        "source_library": src_lib,
+                        "source_table": table.name,
+                        "parameters": with_aliases(table.parameters(row)),
+                    }
+                )
+        for conn, pin in wanted:
+            unresolved.append(
+                {"designator": f"{conn}.{pin}", "reason": "pin not found on the sheet"}
+            )
+
+    if wire_updates or cavity_crimps:
+        res_str = await add_harness_wiring(
+            ctx,
+            document_path=target_path,
+            wire_updates=wire_updates,
+            cavity_crimps=cavity_crimps,
+        )
+        try:
+            res_json = json.loads(res_str)
+        except ValueError:
+            res_json = {"success": False, "raw": res_str}
+    else:
+        res_json = {"success": True, "note": "nothing to update"}
+
+    return {
+        "success": bool(res_json.get("success")) and not unresolved,
+        "document_path": target_path,
+        "source_library": src_lib,
+        "wires_synced_count": res_json.get("wires_updated", len(wire_updates)),
+        "cavities_synced_count": res_json.get("crimps", len(cavity_crimps)),
+        "unresolved": unresolved,
+        "warnings": warnings,
+        "altium_response": res_json,
+    }
+
+
+@mcp.tool()
+async def sync_harness_library(
+    ctx: Context,
+    document_path: str,
+    dblib_path: str | None = None,
+    wires: bool = True,
+    cavities: bool = True,
+    wire_designator_map: dict | None = None,
+    cavity_map: dict | None = None,
+    color_map: dict | None = None,
+    parameter_aliases: dict | None = None,
+) -> str:
+    """Link harness wires and cavity terminals to a local CSV-backed .DbLib and copy their parameters.
+
+    Altium's harness editor cannot pick wires or cavity terminals from a desktop .DbLib, so this
+    tool writes the library link (Design Item Id, Source Library, Source Table) and every part
+    parameter from the database row onto the .WirDoc itself, then saves it. Running it again
+    updates values in place (no duplicates).
+
+    Wires are matched by wire_designator_map, else their PartNumber / Design Item Id, else the one
+    row whose gauge and Color match the wire's. Cavities keep their current terminal unless
+    cavity_map assigns one. Anything that cannot be matched is listed under "unresolved" and left
+    unchanged.
+
+    Args:
+        document_path: Target .WirDoc path. Required.
+        dblib_path: The .DbLib to read. Defaults to $ALTIUM_DBLIB_PATH, else the first .DbLib
+            found walking up from the document (in each folder and up to two levels below).
+        wires: Sync harness wires (default True).
+        cavities: Sync cavity terminals (default True).
+        wire_designator_map: Wire designator -> part number, e.g. {"W1": "5875 BK005"}.
+        cavity_map: Terminals to assign: {connector: {pin: part number}}, e.g.
+            {"J1": {"1": "1060-20-0122"}}.
+        color_map: Extra wire drawing colours, {name: "#RRGGBB"}, on top of the defaults
+            (black, brown, red, orange, yellow, green, blue, violet, purple, gray/grey, white,
+            pink, tan, light blue, light green). Striped names use their base colour.
+        parameter_aliases: Extra parameter names copied from a column, {alias: column},
+            e.g. {"Gauge": "Wire Gauge"}.
+
+    Returns:
+        str: JSON with counts, unresolved items, warnings and Altium's report.
+    """
+    if not document_path or not Path(document_path).exists():
+        return json.dumps(
+            {"success": False, "error": f"document_path to an existing .WirDoc is required: {document_path!r}"}
+        )
+    lib_path = Path(dblib_path) if dblib_path else find_dblib(Path(document_path).resolve())
+    if not lib_path or not lib_path.exists():
+        return json.dumps(
+            {"success": False, "error": "No .DbLib found; pass dblib_path or set ALTIUM_DBLIB_PATH"}
+        )
+    try:
+        library = load_dblib(lib_path)
+    except (OSError, ValueError) as e:
+        return json.dumps({"success": False, "error": f"Cannot read {lib_path}: {e}"})
+
+    result = await _sync_harness_from_library(
+        ctx,
+        document_path,
+        library,
+        sync_wires=wires,
+        sync_cavities=cavities,
+        wire_designator_map=wire_designator_map,
+        cavity_map=cavity_map,
+        color_map=color_map,
+        parameter_aliases=parameter_aliases,
+        extra_wire_parameters=None,
+        source_library_name=None,
+    )
+    result["dblib_path"] = str(lib_path)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -2353,28 +2683,29 @@ async def sync_harness_wires(
     wires_db_path: str | None = None,
     source_library_name: str | None = None,
     wire_designator_map: dict | None = None,
+    color_map: dict | None = None,
 ) -> str:
     """Synchronize harness wire parameters, design item IDs, and visual colors from a wire database CSV onto a .WirDoc.
 
-    Because Altium Designer's internal harness engine rejects desktop .DbLib components via the GUI 'Replace Component'
-    dialog (it requires a cloud ISchHarnessWire model with ObjectID=82 rather than a .SchLib symbol),
-    this tool provides the official automated library synchronization mechanism:
-    1. Loads master wire definitions from the wire database CSV (PartNumber, Description, Gauge, Color, Voltage Rating, etc.).
-    2. Identifies all wires in the target .WirDoc.
-    3. Resolves each wire's PartNumber from its current parameters or an explicit wire_designator_map.
-    4. Propagates all engineering parameters, native design item IDs, and visual TColor rendering onto the wires in Altium.
-    5. Commits changes to disk via DoFileSave.
+    Wire-only variant of sync_harness_library, kept for existing workflows. On top of the database
+    columns it writes the legacy parameters Gauge (from Wire Gauge), VoltageRating (from Voltage
+    Rating), Border=None and ComponentType=Wire.
+
+    Because Altium Designer's harness engine rejects desktop .DbLib components in the GUI
+    'Replace Component' dialog, this tool writes the library link and all parameters itself and
+    saves the document. Parameters are updated in place (no duplicates).
 
     Args:
         document_path (str): Target .WirDoc file path. Required.
         wires_db_path (str, optional): Path to the wire database CSV. If omitted, uses the
-            ALTIUM_WIRES_DB_PATH environment variable, else searches upwards from the document's
-            folder for wires-db.csv (directly, in components/, or in */components/).
+            ALTIUM_WIRES_DB_PATH environment variable, else the .DbLib found walking up from the
+            document (see sync_harness_library).
         source_library_name (str, optional): Name of the parent database library (e.g. 'components.DbLib').
-        wire_designator_map (dict, optional): Optional mapping of wire designator to PartNumber, e.g. {"W1": "5875 BK005"}.
+        wire_designator_map (dict, optional): Wire designator -> PartNumber, e.g. {"W1": "5875 BK005"}.
             Otherwise each wire is resolved from its PartNumber / Design Item Id, or from the one
             database row matching both its gauge and color. Wires that cannot be resolved
             unambiguously are listed under "unresolved" and left unchanged.
+        color_map (dict, optional): Extra wire drawing colours, {name: "#RRGGBB"}.
 
     Returns:
         str: JSON string detailing updated wires, unresolved wires and Altium's report.
@@ -2386,158 +2717,39 @@ async def sync_harness_wires(
                 "error": f"document_path to an existing .WirDoc is required: {document_path!r}",
             }
         )
-    target_path = str(Path(document_path).resolve())
 
-    db_file: Path | None = None
-    if wires_db_path:
-        db_file = Path(wires_db_path).resolve()
-    elif os.environ.get("ALTIUM_WIRES_DB_PATH"):
-        db_file = Path(os.environ["ALTIUM_WIRES_DB_PATH"]).resolve()
-    else:
-        for folder in Path(target_path).parents:
-            found = [
-                *folder.glob("wires-db.csv"),
-                *folder.glob("components/wires-db.csv"),
-                *folder.glob("*/components/wires-db.csv"),
-            ]
-            if found:
-                db_file = found[0].resolve()
-                break
+    csv_path = wires_db_path or os.environ.get("ALTIUM_WIRES_DB_PATH")
+    try:
+        if csv_path:
+            library = load_csv_table(Path(csv_path).resolve())
+            if not source_library_name:
+                found = find_dblib(Path(csv_path).resolve().parent)
+                source_library_name = found.name if found else None
+            db_label = str(Path(csv_path).resolve())
+        else:
+            lib_path = find_dblib(Path(document_path).resolve())
+            if not lib_path:
+                return json.dumps({"success": False, "error": "Wire database not found. Please provide wires_db_path."})
+            library = load_dblib(lib_path)
+            db_label = str(lib_path)
+    except (OSError, ValueError) as e:
+        return json.dumps({"success": False, "error": f"Cannot read wire database: {e}"})
 
-    if not db_file or not db_file.exists():
-        return json.dumps({"success": False, "error": "Wire database CSV not found. Please provide wires_db_path."})
-
-    import csv
-    wire_db: dict[str, dict[str, str]] = {}
-    with open(db_file, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            pn = row.get("PartNumber", "").strip()
-            if pn:
-                wire_db[pn] = {k: (v or "").strip() for k, v in row.items()}
-
-    def awg(text: str | None) -> str | None:
-        match = re.search(r"(\d+(?:/\d+)?)\s*AWG", text or "", re.IGNORECASE)
-        return match.group(1) if match else None
-
-    doc_data = parse_wirdoc(target_path)
-    wires = doc_data.get("wires", [])
-    if not wires:
-        return json.dumps({"success": False, "error": f"No wires found in {target_path}"})
-
-    wire_updates = []
-    unresolved: list[dict[str, str]] = []
-    des_map = wire_designator_map or {}
-
-    for w in wires:
-        des = w.get("designator", "").strip()
-        if not des or des == "?":
-            continue
-
-        wp = w.get("parameters", {})
-        part_num = (
-            des_map.get(des)
-            or wp.get("PartNumber")
-            or wp.get("Design Item Id")
-            or w.get("design_item_id")
-        )
-        if not part_num:
-            gauge = awg(wp.get("Gauge") or wp.get("Wire Gauge"))
-            color = wp.get("Color", "").lower()
-            matches = [
-                pn
-                for pn, row in wire_db.items()
-                if row.get("Color", "").lower() == color
-                and awg(row.get("Wire Gauge") or row.get("Gauge")) == gauge
-            ]
-            if len(matches) == 1:
-                part_num = matches[0]
-            else:
-                unresolved.append(
-                    {
-                        "designator": des,
-                        "reason": f"{len(matches)} database rows match gauge "
-                        f"{gauge!r} and color {color!r}",
-                    }
-                )
-                continue
-
-        if part_num not in wire_db:
-            unresolved.append(
-                {"designator": des, "reason": f"PartNumber {part_num!r} not in database"}
-            )
-            continue
-
-        row = wire_db[part_num]
-        params = {
-            "Design Item Id": part_num,
-            "PartNumber": part_num,
-            "Description": row.get("Description", ""),
-            "Manufacturer 1": row.get("Manufacturer 1", ""),
-            "Manufacturer Part Number 1": row.get("Manufacturer Part Number 1", ""),
-            "Manufacturer Series": row.get("Manufacturer Series", ""),
-            "Wire Gauge": row.get("Wire Gauge") or row.get("Gauge", ""),
-            "Gauge": row.get("Gauge") or row.get("Wire Gauge", ""),
-            "Color": row.get("Color", ""),
-            "Color Code": row.get("Color Code", ""),
-            "Outer Diameter": row.get("Outer Diameter", ""),
-            "Linear Weight": row.get("Linear Weight", ""),
-            "Min Bend Radius": row.get("Min Bend Radius", ""),
-            "Conductor Material": row.get("Conductor Material", ""),
-            "Conductor Stranding": row.get("Conductor Stranding", ""),
-            "Insulation Material": row.get("Insulation Material", ""),
-            "Insulation Color": row.get("Insulation Color", ""),
-            "Voltage Rating": row.get("Voltage Rating") or row.get("VoltageRating", ""),
-            "VoltageRating": row.get("VoltageRating") or row.get("Voltage Rating", ""),
-            "Max Current Rating": row.get("Max Current Rating", ""),
-            "Max Operating Temperature": row.get("Max Operating Temperature", ""),
-            "Min Operating Temperature": row.get("Min Operating Temperature", ""),
-            "Flammability Rating": row.get("Flammability Rating", ""),
-            "ComponentType": "Wire",
-            "Border": "None",
-            "Source Table": db_file.name,
-        }
-        src_lib = source_library_name or row.get("Source Library")
-        if not src_lib:
-            dblib_candidates = list(db_file.parent.glob("*.DbLib"))
-            if dblib_candidates:
-                src_lib = dblib_candidates[0].name
-        if src_lib:
-            params["Source Library"] = src_lib
-
-        for k in ["ComponentLink1Description", "ComponentLink1URL", "ComponentLink2Description", "ComponentLink2URL"]:
-            if row.get(k):
-                params[k] = row[k]
-
-        wire_updates.append({
-            "designator": des,
-            "parameters": params,
-        })
-
-    if wire_updates:
-        res_str = await add_harness_wiring(
-            ctx,
-            wire_updates=wire_updates,
-            document_path=target_path,
-        )
-        try:
-            res_json = json.loads(res_str)
-        except Exception:
-            res_json = {"success": False, "raw": res_str}
-    else:
-        res_json = {"success": True, "note": "nothing to update"}
-
-    return json.dumps(
-        {
-            "success": bool(res_json.get("success")) and not unresolved,
-            "document_path": target_path,
-            "wires_synced_count": res_json.get("wires_updated", len(wire_updates)),
-            "unresolved": unresolved,
-            "wires_db_path": str(db_file),
-            "altium_response": res_json,
-        },
-        indent=2,
+    result = await _sync_harness_from_library(
+        ctx,
+        document_path,
+        library,
+        sync_wires=True,
+        sync_cavities=False,
+        wire_designator_map=wire_designator_map,
+        cavity_map=None,
+        color_map=color_map,
+        parameter_aliases={"Gauge": "Wire Gauge", "VoltageRating": "Voltage Rating"},
+        extra_wire_parameters={"Border": "None", "ComponentType": "Wire"},
+        source_library_name=source_library_name,
     )
+    result["wires_db_path"] = db_label
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -2980,7 +3192,7 @@ async def get_net_connections(
             logger.info(
                 f"Retrieved {len(out_nets)} harness net connections as fallback"
             )
-            return json.dumps({"nets": out_nets, "source": "harness_parser"}, indent=2)
+            return json.dumps({"nets": out_nets, **_disk_source(h_path)}, indent=2)
 
         error_msg = response.get("error", "Unknown error")
         logger.error(f"Error getting net connections: {error_msg}")
@@ -3605,7 +3817,7 @@ async def get_screenshot(
 
                     # Save a local copy of the screenshot for debugging (non-fatal if it fails)
                     try:
-                        debug_filename = str(MCP_DIR / f"screenshot_{view_type}.png")
+                        debug_filename = str(_data_dir() / f"screenshot_{view_type}.png")
                         img.save(debug_filename)
                         logger.info(f"Saved debug screenshot to {debug_filename}")
                     except Exception as save_error:
@@ -3971,24 +4183,35 @@ async def get_outjob_settings(ctx: Context, outjob_path: str) -> str:
 
 
 @mcp.tool()
-async def get_harness_data(ctx: Context, file_path: str = "") -> str:
+async def get_harness_data(
+    ctx: Context,
+    file_path: str = "",
+    summary_only: bool = False,
+    designators: list | None = None,
+) -> str:
     """
     Read an Altium Harness Wiring Diagram (.WirDoc) or Harness Project (.PrjHar).
 
     Works without Altium GUI and on files that are not open. It extracts
-    connectors, pins, wires, and connected net labels directly from the document.
-    If file_path is omitted or empty, it automatically detects the active harness
-    project or wiring diagram in the workspace.
+    connectors, pins (with cavity terminals), wires, splices and net labels from
+    the SAVED file (unsaved Altium edits are not included). If file_path is omitted,
+    it reads the harness project or document Altium has focused.
+
+    A full wiring diagram can be very large; use summary_only or designators to keep
+    the answer small.
 
     Args:
         file_path (str, optional): Full path to the .WirDoc, .LdrDoc, or .PrjHar file.
-            Defaults to empty string (auto-detect).
+            Defaults to empty string (the document focused in Altium).
+        summary_only (bool): Connectors without pins, wires without geometry. Default False.
+        designators (list, optional): Only these connectors (with their pins) and the wires
+            that touch them.
 
     Returns:
         str: JSON with file_path, summary (connector_count, total_pins,
              connected_pins, net_label_count), connectors (designator,
-             lib_reference, description, location, unique_id, pins with nets),
-             and net_labels.
+             lib_reference, description, location, unique_id, pins with nets and
+             cavity_parts), wires, splices, no_connects, net_labels and source.
     """
     try:
         p: Path | None = None
@@ -4011,6 +4234,39 @@ async def get_harness_data(ctx: Context, file_path: str = "") -> str:
             data = parse_prjhar(p)
         elif p.suffix.lower() in [".wirdoc", ".ldrdoc"]:
             data = parse_wirdoc(p)
+            if designators:
+                wanted = set(designators)
+                data["connectors"] = [
+                    c for c in data["connectors"] if c["designator"] in wanted
+                ]
+                touching = {
+                    pin["connected_wire"]
+                    for c in data["connectors"]
+                    for pin in c["pins"]
+                    if pin.get("connected_wire")
+                }
+                data["wires"] = [w for w in data["wires"] if w["designator"] in touching]
+            if summary_only:
+                data["connectors"] = [
+                    {
+                        "designator": c["designator"],
+                        "comment": c["comment"],
+                        "lib_reference": c["lib_reference"],
+                        "location": c["location"],
+                        "pin_count": len(c["pins"]),
+                    }
+                    for c in data["connectors"]
+                ]
+                data["wires"] = [
+                    {
+                        "designator": w["designator"],
+                        "net": w["net"],
+                        "part_number": w.get("design_item_id", ""),
+                    }
+                    for w in data["wires"]
+                ]
+                data.pop("net_labels", None)
+                data.pop("net_connections", None)
         else:
             return json.dumps(
                 {
@@ -4019,6 +4275,7 @@ async def get_harness_data(ctx: Context, file_path: str = "") -> str:
             )
     except Exception as e:
         return json.dumps({"error": f"Could not parse harness document: {e}"})
+    data.update(_disk_source(p))
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
@@ -4056,16 +4313,6 @@ async def get_project_info(ctx: Context) -> str:
     response = await altium_bridge.execute_command("get_project_info", {})
     if response.get("success", False):
         result = response.get("result", {})
-        global _last_known_project_path
-        if isinstance(result, str):
-            try:
-                res_dict = json.loads(result)
-                if "project_path" in res_dict:
-                    _last_known_project_path = res_dict["project_path"]
-            except Exception:
-                pass
-        elif isinstance(result, dict) and "project_path" in result:
-            _last_known_project_path = result["project_path"]
         return (
             result
             if isinstance(result, str)
@@ -4096,7 +4343,7 @@ async def get_project_info(ctx: Context) -> str:
                         for d in data["documents"]
                     ],
                     "variants": [],
-                    "source": "harness_parser_fallback",
+                    **_disk_source(h_path),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -4149,7 +4396,7 @@ async def get_project_components(ctx: Context, include_parameters: bool = False)
                 {
                     "component_count": len(components),
                     "components": components,
-                    "source": "harness_parser",
+                    **_disk_source(h_path),
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -4196,7 +4443,7 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
         h_path = await _get_active_harness_path()
         if h_path:
             violations = get_harness_erc_violations(h_path)
-            return json.dumps(violations, indent=2, ensure_ascii=False)
+            return json.dumps({**violations, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
     except Exception as e:
         logger.warning(f"ERC harness fallback failed: {e}")
 
@@ -4242,7 +4489,7 @@ async def get_board_summary(ctx: Context) -> str:
                     "connector_count": len(components),
                     "unique_nets_count": len(nets),
                     "connectors": [c["designator"] for c in components],
-                    "source": "harness_summary",
+                    **_disk_source(h_path),
                 },
                 indent=2,
                 ensure_ascii=False,

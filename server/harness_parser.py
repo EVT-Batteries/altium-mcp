@@ -61,15 +61,31 @@ def extract_ole_records(
         block = data[offset : offset + block_len]
         offset += block_len
 
-        # Altium strings are UTF-8 with fallback to Latin-1
-        try:
-            text = block.decode("utf-8").rstrip("\x00")
-        except UnicodeDecodeError:
-            text = block.decode("latin-1", errors="replace").rstrip("\x00")
-
-        records.append(parse_pipe_record(text))
+        records.append(_decode_record(block.rstrip(b"\x00")))
 
     return records
+
+
+def _decode_record(block: bytes) -> dict[str, str]:
+    """Fields of one record, each decoded the way Altium wrote it.
+
+    Plain fields are in the ANSI code page (cp1252), with '|' inside a value
+    escaped as byte 0x8E. Non-ASCII text also comes as a '%UTF8%<key>' field
+    holding the UTF-8 form (there '|' is escaped as U+00A6 '¦'), which wins
+    over the plain one. Decoding the whole record at once mangles one or the
+    other.
+    """
+    fields = parse_pipe_record(block.decode("latin-1"))  # byte-preserving
+    record: dict[str, str] = {}
+    utf8: dict[str, str] = {}
+    for key, value in fields.items():
+        raw = value.encode("latin-1")
+        if key.startswith("%UTF8%"):
+            utf8[key[6:]] = raw.decode("utf-8", errors="replace").replace("¦", "|")
+        else:
+            record[key] = raw.replace(b"\x8e", b"|").decode("cp1252", errors="replace")
+    record.update(utf8)
+    return record
 
 
 def _coord(props: dict[str, str], key: str) -> int | float:
@@ -94,7 +110,13 @@ def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
     raw_records = extract_ole_records(file_path, "FileHeader")
     if not raw_records:
         return {"error": "Empty or invalid FileHeader stream", "connectors": []}
+    return parse_wirdoc_records(raw_records, file_path)
 
+
+def parse_wirdoc_records(
+    raw_records: list[dict[str, str]], file_path: Path | str
+) -> dict[str, Any]:
+    """parse_wirdoc on already extracted records (record 0 is the header)."""
     # Record 0 is the stream header (|HEADER=...|Weight=...|...)
     header_rec = raw_records[0] if raw_records else {}
     records = raw_records[1:]  # 0-indexed matches internal Altium OwnerIndex

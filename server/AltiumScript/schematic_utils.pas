@@ -2033,6 +2033,18 @@ begin
     else Result := 8388608;
 end;
 
+// Field Index of a spec line, percent-decoded: the server encodes '%', '|'
+// and line breaks so values may contain them without breaking the format.
+function SpecField(Rec: String; Index: Integer): String;
+begin
+    Result := GetFieldFromPipeString(Rec, Index);
+    if (Pos('%', Result) = 0) then Exit;
+    Result := StringReplace(Result, '%7C', '|', REPLACEALL);
+    Result := StringReplace(Result, '%0D', #13, REPLACEALL);
+    Result := StringReplace(Result, '%0A', #10, REPLACEALL);
+    Result := StringReplace(Result, '%25', '%', REPLACEALL);
+end;
+
 // Set parameter PName on Owner: update the first match, delete any further
 // parameters with the same name (repeated runs used to stack duplicates with
 // conflicting values), or create a hidden one. Returns True if it existed.
@@ -2269,9 +2281,9 @@ begin
 
         for i := 0 to Spec.Count - 1 do
         begin
-            if (GetFieldFromPipeString(Spec[i], 0) = 'DOCUMENT') then
-                TargetDocPath := StringReplace(GetFieldFromPipeString(Spec[i], 1), '/', '\', REPLACEALL)
-            else if (GetFieldFromPipeString(Spec[i], 0) = 'CLEAR_EXISTING') then
+            if (SpecField(Spec[i], 0) = 'DOCUMENT') then
+                TargetDocPath := StringReplace(SpecField(Spec[i], 1), '/', '\', REPLACEALL)
+            else if (SpecField(Spec[i], 0) = 'CLEAR_EXISTING') then
                 ClearExisting := True;
         end;
 
@@ -2355,21 +2367,21 @@ begin
         for i := 0 to Spec.Count - 1 do
         begin
             Rec := Spec[i];
-            Kind := GetFieldFromPipeString(Rec, 0);
+            Kind := SpecField(Rec, 0);
             if (Kind = 'SHEET_STYLE') then
             begin
                 // SHEET_STYLE|<TSheetStyle ordinal>; only sent when asked for
                 SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
-                TargetDoc.SheetStyle := StrToInt(GetFieldFromPipeString(Rec, 1));
+                TargetDoc.SheetStyle := StrToInt(SpecField(Rec, 1));
                 SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
                 TargetDoc.GraphicallyInvalidate;
             end
             else if (Kind = 'CONNECTOR') then
             begin
                 // CONNECTOR|<Designator>|<x_mils>|<y_mils>
-                ConnDes := GetFieldFromPipeString(Rec, 1);
-                ConnX := MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2)));
-                ConnY := MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3)));
+                ConnDes := SpecField(Rec, 1);
+                ConnX := MilsToCoord(StrToInt(SpecField(Rec, 2)));
+                ConnY := MilsToCoord(StrToInt(SpecField(Rec, 3)));
                 Obj := FindPlacedComponent(TargetDoc, ConnDes);
                 if (Obj = nil) then
                     Misses.Add('connector:' + ConnDes)
@@ -2386,15 +2398,15 @@ begin
             begin
                 // WIRE|<Designator>|<NetName>|x1|y1|... OR
                 // WIRE|<Designator>|<NetName>|AT|<des_x>|<des_y>|<com_x>|<com_y>|x1|y1|...
-                WireDes := GetFieldFromPipeString(Rec, 1);
-                NetName := GetFieldFromPipeString(Rec, 2);
+                WireDes := SpecField(Rec, 1);
+                NetName := SpecField(Rec, 2);
 
-                if (GetFieldFromPipeString(Rec, 3) = 'AT') then
+                if (SpecField(Rec, 3) = 'AT') then
                 begin
-                    des_x := StrToInt(GetFieldFromPipeString(Rec, 4));
-                    des_y := StrToInt(GetFieldFromPipeString(Rec, 5));
-                    com_x := StrToInt(GetFieldFromPipeString(Rec, 6));
-                    com_y := StrToInt(GetFieldFromPipeString(Rec, 7));
+                    des_x := StrToInt(SpecField(Rec, 4));
+                    des_y := StrToInt(SpecField(Rec, 5));
+                    com_x := StrToInt(SpecField(Rec, 6));
+                    com_y := StrToInt(SpecField(Rec, 7));
                     fld := 8;
                 end
                 else
@@ -2413,10 +2425,10 @@ begin
                 if (Obj <> nil) then
                 begin
                     start_fld := fld;
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, start_fld))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, start_fld + 1))));
+                    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, start_fld))),
+                                          MilsToCoord(StrToInt(SpecField(Rec, start_fld + 1))));
                     vtx := 0;
-                    while (GetFieldFromPipeString(Rec, fld) <> '') do
+                    while (SpecField(Rec, fld) <> '') do
                     begin
                         vtx := vtx + 1;
                         fld := fld + 2;
@@ -2427,8 +2439,8 @@ begin
                         fld := start_fld;
                         for vtx := 1 to Obj.VerticesCount do
                         begin
-                            Obj.Vertex[vtx] := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
-                                                     MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
+                            Obj.Vertex[vtx] := Point(MilsToCoord(StrToInt(SpecField(Rec, fld))),
+                                                     MilsToCoord(StrToInt(SpecField(Rec, fld + 1))));
                             fld := fld + 2;
                         end;
                     except
@@ -2474,8 +2486,8 @@ begin
             else if (Kind = 'WIREPARAM') and (LastWire <> nil) then
             begin
                 // WIREPARAM|<ParamName>|<ParamValue>
-                PName := GetFieldFromPipeString(Rec, 1);
-                PVal  := GetFieldFromPipeString(Rec, 2);
+                PName := SpecField(Rec, 1);
+                PVal  := SpecField(Rec, 2);
                 if (AnsiUpperCase(PName) <> 'COMMENT') then
                     UpsertSchParameter(LastWire, PName, PVal);
                 ApplyHarnessWireProperty(LastWire, PName, PVal);
@@ -2490,14 +2502,14 @@ begin
 
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3))));
+                    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 2))),
+                                          MilsToCoord(StrToInt(SpecField(Rec, 3))));
                     try
                         if (Obj.Designator <> nil) then
                         begin
-                            Obj.Designator.Text := GetFieldFromPipeString(Rec, 1);
-                            Obj.Designator.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2)) + 20),
-                                                             MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3)) + 20));
+                            Obj.Designator.Text := SpecField(Rec, 1);
+                            Obj.Designator.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 2)) + 20),
+                                                             MilsToCoord(StrToInt(SpecField(Rec, 3)) + 20));
                         end;
                     except
                     end;
@@ -2517,21 +2529,21 @@ begin
 
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+                    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 1))),
+                                          MilsToCoord(StrToInt(SpecField(Rec, 2))));
                     try
                         Obj.Style := 1; // Thick Cross
                     except
                     end;
                     try
-                        if (GetFieldFromPipeString(Rec, 3) <> '') then
-                            Obj.Text := GetFieldFromPipeString(Rec, 3)
+                        if (SpecField(Rec, 3) <> '') then
+                            Obj.Text := SpecField(Rec, 3)
                         else
                             Obj.Text := 'NC' + IntToStr(NcCount + 1);
                     except
                     end;
                     try
-                        if (GetFieldFromPipeString(Rec, 4) = '1') or (GetFieldFromPipeString(Rec, 4) = 'True') then
+                        if (SpecField(Rec, 4) = '1') or (SpecField(Rec, 4) = 'True') then
                             Obj.ShowName := True
                         else
                             Obj.ShowName := False;
@@ -2550,13 +2562,13 @@ begin
                 Obj := SchServer.SchObjectFactory(eLabel, eCreate_GlobalCopy);
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+                    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 1))),
+                                          MilsToCoord(StrToInt(SpecField(Rec, 2))));
                     try
-                        Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
+                        Obj.Orientation := StrToInt(SpecField(Rec, 3));
                     except
                     end;
-                    Obj.Text := GetFieldFromPipeString(Rec, 4);
+                    Obj.Text := SpecField(Rec, 4);
                     try
                         Obj.Color := 8388608;
                     except
@@ -2574,20 +2586,20 @@ begin
                 Obj := SchServer.SchObjectFactory(eRectangle, eCreate_Default);
                 if (Obj <> nil) then
                 begin
-                    Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
-                    Obj.Corner   := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 3))),
-                                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 4))));
-                    if (GetFieldFromPipeString(Rec, 5) <> '') then
-                        Obj.LineWidth := StrToInt(GetFieldFromPipeString(Rec, 5))
+                    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 1))),
+                                          MilsToCoord(StrToInt(SpecField(Rec, 2))));
+                    Obj.Corner   := Point(MilsToCoord(StrToInt(SpecField(Rec, 3))),
+                                          MilsToCoord(StrToInt(SpecField(Rec, 4))));
+                    if (SpecField(Rec, 5) <> '') then
+                        Obj.LineWidth := StrToInt(SpecField(Rec, 5))
                     else
                         Obj.LineWidth := 2;
-                    if (GetFieldFromPipeString(Rec, 6) <> '') then
-                        Obj.Color := StrToInt(GetFieldFromPipeString(Rec, 6))
+                    if (SpecField(Rec, 6) <> '') then
+                        Obj.Color := StrToInt(SpecField(Rec, 6))
                     else
                         Obj.Color := 16711935;
-                    if (GetFieldFromPipeString(Rec, 7) <> '') then
-                        Obj.AreaColor := StrToInt(GetFieldFromPipeString(Rec, 7))
+                    if (SpecField(Rec, 7) <> '') then
+                        Obj.AreaColor := StrToInt(SpecField(Rec, 7))
                     else
                         Obj.AreaColor := 11599871;
                     Obj.IsSolid := False;
@@ -2601,19 +2613,19 @@ begin
             else if (Kind = 'PART') then
             begin
                 // PART|Designator|LibPath|LibRef|x_mils|y_mils|orientation|mirror|comment|description|footprint
-                PartDes := GetFieldFromPipeString(Rec, 1);
-                PartLib := GetFieldFromPipeString(Rec, 2);
-                PartSym := GetFieldFromPipeString(Rec, 3);
-                PartX   := StrToInt(GetFieldFromPipeString(Rec, 4));
-                PartY   := StrToInt(GetFieldFromPipeString(Rec, 5));
-                if (GetFieldFromPipeString(Rec, 6) <> '') then
-                    PartOri := StrToInt(GetFieldFromPipeString(Rec, 6))
+                PartDes := SpecField(Rec, 1);
+                PartLib := SpecField(Rec, 2);
+                PartSym := SpecField(Rec, 3);
+                PartX   := StrToInt(SpecField(Rec, 4));
+                PartY   := StrToInt(SpecField(Rec, 5));
+                if (SpecField(Rec, 6) <> '') then
+                    PartOri := StrToInt(SpecField(Rec, 6))
                 else
                     PartOri := 0;
-                PartMir  := GetFieldFromPipeString(Rec, 7);
-                PartCom  := GetFieldFromPipeString(Rec, 8);
-                PartDesc := GetFieldFromPipeString(Rec, 9);
-                PartFoot := GetFieldFromPipeString(Rec, 10);
+                PartMir  := SpecField(Rec, 7);
+                PartCom  := SpecField(Rec, 8);
+                PartDesc := SpecField(Rec, 9);
+                PartFoot := SpecField(Rec, 10);
 
                 FoundOnSheet := False;
                 Iter := TargetDoc.SchIterator_Create;
@@ -2712,17 +2724,17 @@ begin
             else if (Kind = 'PARTPARAM') and (LastComp <> nil) then
             begin
                 // PARTPARAM|Name|Value
-                PName := GetFieldFromPipeString(Rec, 1);
-                PVal  := GetFieldFromPipeString(Rec, 2);
+                PName := SpecField(Rec, 1);
+                PVal  := SpecField(Rec, 2);
                 UpsertSchParameter(LastComp, PName, PVal);
                 ParamCount := ParamCount + 1;
             end
             else if (Kind = 'UPDATE_WIREPARAM') then
             begin
                 // UPDATE_WIREPARAM|<WireDesignator>|<ParamName>|<ParamValue>
-                WireDes := GetFieldFromPipeString(Rec, 1);
-                PName   := GetFieldFromPipeString(Rec, 2);
-                PVal    := GetFieldFromPipeString(Rec, 3);
+                WireDes := SpecField(Rec, 1);
+                PName   := SpecField(Rec, 2);
+                PVal    := SpecField(Rec, 3);
 
                 Obj := nil;
                 if (CachedWireObj <> nil) and (AnsiUpperCase(CachedWireDes) = AnsiUpperCase(WireDes)) then
@@ -2748,14 +2760,81 @@ begin
                     ParamCount := ParamCount + 1;
                 end;
             end
+            else if (Kind = 'REROUTE') then
+            begin
+                // REROUTE|<WireDesignator>|AT|<des_x>|<des_y>|<com_x>|<com_y>|x1|y1|...
+                // Moves an existing wire in place: UniqueID, parameters,
+                // colour and library link survive (layout drawings keep
+                // their links), unlike delete + recreate.
+                WireDes := SpecField(Rec, 1);
+                Obj := FindHarnessWire(TargetDoc, WireDes);
+                if (Obj = nil) then
+                    Misses.Add('wire:' + WireDes)
+                else
+                begin
+                    des_x := StrToInt(SpecField(Rec, 3));
+                    des_y := StrToInt(SpecField(Rec, 4));
+                    com_x := StrToInt(SpecField(Rec, 5));
+                    com_y := StrToInt(SpecField(Rec, 6));
+                    start_fld := 7;
+                    fld := start_fld;
+                    vtx := 0;
+                    while (SpecField(Rec, fld) <> '') do
+                    begin
+                        vtx := vtx + 1;
+                        fld := fld + 2;
+                    end;
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    Obj.VerticesCount := vtx;
+                    fld := start_fld;
+                    for j := 1 to vtx do
+                    begin
+                        Obj.Vertex[j] := Point(MilsToCoord(StrToInt(SpecField(Rec, fld))),
+                                               MilsToCoord(StrToInt(SpecField(Rec, fld + 1))));
+                        fld := fld + 2;
+                    end;
+                    if (Obj.Designator <> nil) then
+                        Obj.Designator.Location := Point(MilsToCoord(des_x), MilsToCoord(des_y));
+                    if (Obj.Comment <> nil) then
+                        Obj.Comment.Location := Point(MilsToCoord(com_x), MilsToCoord(com_y));
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    Obj.GraphicallyInvalidate;
+                    WiresUpdated := WiresUpdated + 1;
+                end;
+            end
+            else if (Kind = 'WIRECOLOR') then
+            begin
+                // WIRECOLOR|<WireDesignator>|<TColor>; empty designator = last wire placed
+                WireDes := SpecField(Rec, 1);
+                if (WireDes = '') then
+                    Obj := LastWire
+                else if (CachedWireObj <> nil) and (AnsiUpperCase(CachedWireDes) = AnsiUpperCase(WireDes)) then
+                    Obj := CachedWireObj
+                else
+                begin
+                    Obj := FindHarnessWire(TargetDoc, WireDes);
+                    if (Obj <> nil) then
+                    begin
+                        CachedWireDes := WireDes;
+                        CachedWireObj := Obj;
+                    end;
+                end;
+                if (Obj = nil) then
+                begin
+                    if (Misses.IndexOf('wire:' + WireDes) < 0) then
+                        Misses.Add('wire:' + WireDes);
+                end
+                else
+                    Obj.Color := StrToInt(SpecField(Rec, 2));
+            end
             else if (Kind = 'CAVITYCRIMP') then
             begin
                 // CAVITYCRIMP|<ConnDes>|<PinDes>|<CrimpPartNumber>[|<SourceLibraryName>[|<DatabaseTableName>]]
-                ConnDes := GetFieldFromPipeString(Rec, 1);
-                PName   := GetFieldFromPipeString(Rec, 2);
-                PVal    := GetFieldFromPipeString(Rec, 3);
-                SrcLib  := GetFieldFromPipeString(Rec, 4);
-                DbTbl   := GetFieldFromPipeString(Rec, 5);
+                ConnDes := SpecField(Rec, 1);
+                PName   := SpecField(Rec, 2);
+                PVal    := SpecField(Rec, 3);
+                SrcLib  := SpecField(Rec, 4);
+                DbTbl   := SpecField(Rec, 5);
                 Obj := FindPlacedComponent(TargetDoc, ConnDes);
                 if (Obj = nil) then
                     Misses.Add('connector:' + ConnDes)
@@ -2789,6 +2868,14 @@ begin
                                     CavityComp.SourceLibraryName := SrcLib;
                                 if (DbTbl <> '') then
                                     CavityComp.DatabaseTableName := DbTbl;
+                                // Optional |Name|Value pairs from field 6 on:
+                                // the terminal's database parameters
+                                fld := 6;
+                                while (SpecField(Rec, fld) <> '') do
+                                begin
+                                    UpsertSchParameter(CavityComp, SpecField(Rec, fld), SpecField(Rec, fld + 1));
+                                    fld := fld + 2;
+                                end;
                                 try
                                     Prim.RemoveAllOfType(0);
                                 except

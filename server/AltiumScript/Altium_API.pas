@@ -1247,6 +1247,8 @@ begin
             Result := ExecuteAddHarnessWiring(ROOT_DIR, ROOT_DIR + 'harness_wiring_spec.txt');
         'convert_netlabels_to_text':
             Result := ExecuteConvertNetlabelsToTextCommand(RequestData);
+        'get_active_document':
+            Result := GetActiveDocument(ROOT_DIR);
     else
         LogScriptError('Error: Unknown command: ' + CommandName);
     end;

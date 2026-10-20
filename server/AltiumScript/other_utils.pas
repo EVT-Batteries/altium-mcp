@@ -157,6 +157,7 @@ begin
     if (CommandName = 'search_library_symbol') or
        (CommandName = 'build_circuit') or
        (CommandName = 'add_harness_wiring') or
+       (CommandName = 'get_active_document') or
        (CommandName = 'convert_netlabels_to_text') or
        (CommandName = 'take_view_screenshot') or
        (CommandName = 'get_symbol_primitives') or
@@ -1301,6 +1302,64 @@ begin
         end;
     finally
         CompArray.Free;
+        ResultProps.Free;
+    end;
+end;
+
+// Focused document and the project that contains it, without changing focus.
+// The focused PROJECT alone is unreliable: after a script run it is often the
+// script project itself, so the project is looked up from the document.
+function GetActiveDocument(ROOT_DIR: String): String;
+var
+    ResultProps : TStringList;
+    OutputLines : TStringList;
+    Project     : IProject;
+    Doc         : IDocument;
+    P, I        : Integer;
+    DocPath     : String;
+    DocKind     : String;
+    PrjPath     : String;
+    IsModified  : Boolean;
+begin
+    DocPath := '';
+    DocKind := '';
+    PrjPath := '';
+    IsModified := False;
+    if (Client.CurrentView <> nil) and (Client.CurrentView.OwnerDocument <> nil) then
+    begin
+        DocPath := Client.CurrentView.OwnerDocument.FileName;
+        DocKind := Client.CurrentView.OwnerDocument.Kind;
+        IsModified := Client.CurrentView.OwnerDocument.Modified;
+    end;
+
+    if (DocPath <> '') then
+        for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+        begin
+            Project := GetWorkspace.DM_Projects(P);
+            if (Project = nil) then Continue;
+            for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+            begin
+                Doc := Project.DM_LogicalDocuments(I);
+                if (Doc <> nil) and (NormalizedPath(Doc.DM_FullPath) = NormalizedPath(DocPath)) then
+                begin
+                    PrjPath := Project.DM_ProjectFullPath;
+                    Break;
+                end;
+            end;
+            if (PrjPath <> '') then Break;
+        end;
+
+    ResultProps := TStringList.Create;
+    OutputLines := TStringList.Create;
+    try
+        AddJSONProperty(ResultProps, 'document_path', DocPath);
+        AddJSONProperty(ResultProps, 'document_kind', DocKind);
+        AddJSONBoolean(ResultProps, 'document_modified', IsModified);
+        AddJSONProperty(ResultProps, 'project_path', PrjPath);
+        OutputLines.Text := BuildJSONObject(ResultProps);
+        Result := WriteJSONToFile(OutputLines, ROOT_DIR + 'temp_active_document.json');
+    finally
+        OutputLines.Free;
         ResultProps.Free;
     end;
 end;
