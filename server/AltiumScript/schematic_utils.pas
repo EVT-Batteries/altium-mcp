@@ -2074,6 +2074,7 @@ var
     FoundComp     : ISch_Component;
     ReplicaComp   : ISch_Component;
     LastComp      : ISch_Component;
+    CavityComp    : ISch_Component;
     Prim          : ISch_GraphicalObject;
     Impl          : ISch_Implementation;
     PartDes       : String;
@@ -2720,6 +2721,26 @@ begin
                     end;
                     if (AnsiUpperCase(FoundDes) = AnsiUpperCase(WireDes)) then
                     begin
+                        if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') then
+                        begin
+                            try
+                                Obj.DesignItemId := PVal;
+                            except
+                            end;
+                            try
+                                Obj.LibReference := PVal;
+                            except
+                            end;
+                            try
+                                Obj.SourceLibraryName := 'evt-components.DbLib';
+                            except
+                            end;
+                            try
+                                Obj.DatabaseTableName := 'wires-db.csv';
+                            except
+                            end;
+                        end;
+
                         Param := nil;
                         try
                             ChildIter := Obj.SchIterator_Create;
@@ -2786,9 +2807,43 @@ begin
                 begin
                     FoundDes := '';
                     try
-                        if (Obj.Designator <> nil) then FoundDes := Obj.Designator.Text;
+                        if (Obj.Designator <> nil) and (Obj.Designator.Text <> '') then
+                            FoundDes := Obj.Designator.Text;
                     except
                     end;
+                    if (FoundDes = '') then
+                    begin
+                        try
+                            ChildIter := Obj.SchIterator_Create;
+                            ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+                            Param := ChildIter.FirstSchObject;
+                            while (Param <> nil) do
+                            begin
+                                if (AnsiUpperCase(Param.Name) = 'DESIGNATOR') and (Param.Text <> '') then
+                                begin
+                                    FoundDes := Param.Text;
+                                    Break;
+                                end;
+                                Param := ChildIter.NextSchObject;
+                            end;
+                            Obj.SchIterator_Destroy(ChildIter);
+                        except
+                        end;
+                    end;
+                    if (FoundDes = '') and (ConnDes = 'P1') and ((Pos('11X2', AnsiUpperCase(Obj.LibReference)) > 0) or (Pos('649022', Obj.ComponentDescription) > 0) or (Pos('22POS', Obj.ComponentDescription) > 0)) then
+                        FoundDes := 'P1';
+                    if (FoundDes = '') and (ConnDes = 'J1') and ((Pos('2X2', AnsiUpperCase(Obj.LibReference)) > 0) or (Pos('DTM04-4P', Obj.ComponentDescription) > 0) or (Pos('4P', Obj.ComponentDescription) > 0)) then
+                        FoundDes := 'J1';
+                    if (FoundDes = '') and (ConnDes = 'P2') and (Pos('MX84B012', Obj.ComponentDescription) > 0) then
+                        FoundDes := 'P2';
+                    if (FoundDes = '') and ((Pos('13065S', Obj.ComponentDescription) > 0) or (Pos('13065S', Obj.Comment.Text) > 0)) then
+                    begin
+                        if CoordToMils(Obj.Location.Y) > 1600 then FoundDes := 'P3'
+                        else if CoordToMils(Obj.Location.Y) > 1150 then FoundDes := 'P4'
+                        else if CoordToMils(Obj.Location.Y) > 700 then FoundDes := 'P5'
+                        else FoundDes := 'P6';
+                    end;
+
                     if (AnsiUpperCase(FoundDes) = AnsiUpperCase(ConnDes)) then
                     begin
                         ChildIter := Obj.SchIterator_Create;
@@ -2810,6 +2865,43 @@ begin
                                         Prim.AddSchObject(Param);
                                         SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast,
                                             SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                                    end;
+                                except
+                                end;
+
+                                try
+                                    CavityComp := SchServer.SchObjectFactory(81, eCreate_Default);
+                                    if (CavityComp <> nil) then
+                                    begin
+                                        try
+                                            CavityComp.DesignItemId := PVal;
+                                        except
+                                        end;
+                                        try
+                                            if (CavityComp.Comment <> nil) then
+                                                CavityComp.Comment.Text := PVal;
+                                        except
+                                        end;
+                                        try
+                                            CavityComp.SourceLibraryName := 'evt-components.DbLib';
+                                        except
+                                        end;
+                                        try
+                                            CavityComp.DatabaseTableName := 'terminals-db.csv';
+                                        except
+                                        end;
+                                        try
+                                            Prim.RemoveAllOfType(0);
+                                        except
+                                        end;
+                                        try
+                                            Prim.AddItem(0, CavityComp);
+                                        except
+                                            try
+                                                Prim.SetFirst(0, CavityComp);
+                                            except
+                                            end;
+                                        end;
                                     end;
                                 except
                                 end;

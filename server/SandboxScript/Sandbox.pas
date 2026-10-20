@@ -44,10 +44,18 @@ begin
 
     try
         // === BEGIN EXPERIMENT (rewritten by the run_altium_script tool) ===
-        ResetParameters;
-        AddStringParameter('Action', 'All');
-        RunProcess('Sch:Zoom');
-        ResultText := 'Zoomed';
+        SandboxLog('1. Factory 81');
+        Obj1 := SchServer.SchObjectFactory(81, 1);
+        SandboxLog('2. Set DesignItemId');
+        Obj1.DesignItemId := 'TEST-CRIMP';
+        SandboxLog('3. Check Comment');
+        if Obj1.Comment <> nil then Obj1.Comment.Text := 'TEST-CRIMP';
+        SandboxLog('4. Set SourceLibraryName');
+        Obj1.SourceLibraryName := 'evt-components.DbLib';
+        SandboxLog('5. Set DatabaseTableName');
+        Obj1.DatabaseTableName := 'terminals-db.csv';
+        SandboxLog('6. Finished Comp');
+        ResultText := '{"success": true}';
         // === END EXPERIMENT ===
     except
         SandboxLog('EXCEPTION escaped the script body');
