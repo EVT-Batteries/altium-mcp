@@ -5,14 +5,14 @@ or from server/:      python -m unittest tests.test_harness_parser -v
 """
 import json
 import os
-from pathlib import Path
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from harness_parser import (  # noqa: E402
+from harness_parser import (
     get_harness_components,
     parse_pipe_record,
     parse_prjhar,
@@ -21,7 +21,7 @@ from harness_parser import (  # noqa: E402
 
 # Reference sample files from workspace
 WORKSPACE_DIR = Path(__file__).resolve().parents[3]
-MAIN_WIRDOC = WORKSPACE_DIR / "P42C-1_Main_Harness" / "P42C-1_Main_Harness.WirDoc"
+MAIN_WIRDOC = WORKSPACE_DIR / "P42C-1_Main_Harness" / "P42C-1_Main_Harness_Master_1.WirDoc"
 MAIN_PRJHAR = WORKSPACE_DIR / "P42C-1_Main_Harness" / "P42C-1_Main_Harness.PrjHar"
 SLAVE_WIRDOC = (
     WORKSPACE_DIR / "P42C-1_Slave_Harness" / "P42C-1_Slave_Sense_Harness.WirDoc"
@@ -46,7 +46,7 @@ class TestHarnessParser(unittest.TestCase):
         self.assertIn("documents", res)
         self.assertGreater(res["document_count"], 0)
         doc_paths = [d["path"] for d in res["documents"]]
-        self.assertIn("P42C-1_Main_Harness.WirDoc", doc_paths)
+        self.assertIn("P42C-1_Main_Harness_Master_1.WirDoc", doc_paths)
         self.assertEqual(res["parameters"].get("PROJECT_REVISION"), "A")
 
     def test_parse_main_wirdoc(self):
@@ -58,32 +58,30 @@ class TestHarnessParser(unittest.TestCase):
         self.assertIn("summary", res)
         summary = res["summary"]
 
-        self.assertGreaterEqual(summary["connector_count"], 9)
-        self.assertGreater(summary["total_pins"], 100)
-        self.assertGreater(summary["connected_pins"], 50)
+        self.assertGreaterEqual(summary["connector_count"], 4)
+        self.assertGreater(summary["total_pins"], 50)
+        self.assertGreater(summary["connected_pins"], 20)
 
         # Verify specific connectors and designators
         designators = {c["designator"]: c for c in res["connectors"]}
         self.assertIn("P1", designators)
         self.assertIn("P2", designators)
         self.assertIn("P3", designators)
-        self.assertIn("P4", designators)
-        self.assertIn("P5", designators)
-        self.assertIn("P6", designators)
+        self.assertIn("X1", designators)
 
         # Check P1 pins and nets
         p1 = designators["P1"]
         self.assertEqual(len(p1["pins"]), 26)
         p1_nets = {p["designator"]: p["net"] for p in p1["pins"]}
-        self.assertEqual(p1_nets.get("1"), "BMSM1_ALWAYS_ON_PWR")
-        self.assertEqual(p1_nets.get("2"), "BMSM1_READY_PWR")
+        self.assertEqual(p1_nets.get("18"), "BMSM1_CAN1_H")
+        self.assertEqual(p1_nets.get("14"), "BMSM1_MPI2_PROX")
 
         # Check P2 (Current sensor / remote)
         p2 = designators["P2"]
         self.assertEqual(len(p2["pins"]), 28)
         p2_nets = {p["designator"]: p["net"] for p in p2["pins"]}
-        self.assertEqual(p2_nets.get("1"), "BMSM1_REMOTE_COMM_A_POS")
-        self.assertEqual(p2_nets.get("2"), "BMSM1_REMOTE_COMM_A_NEG")
+        self.assertEqual(p2_nets.get("27"), "BMSM1_CURR_SENSE_GND")
+        self.assertEqual(p2_nets.get("28"), "BMSM1_CURR_SENSE_5V")
 
     def test_parse_slave_wirdoc(self):
         if not SLAVE_WIRDOC.exists():
@@ -99,7 +97,7 @@ class TestHarnessParser(unittest.TestCase):
 
         components = get_harness_components(MAIN_WIRDOC)
         self.assertIsInstance(components, list)
-        self.assertGreaterEqual(len(components), 9)
+        self.assertGreaterEqual(len(components), 4)
         des_list = [c["designator"] for c in components]
         self.assertIn("P1", des_list)
         self.assertIn("P2", des_list)
@@ -134,7 +132,7 @@ class TestHarnessParser(unittest.TestCase):
         res = get_harness_schematic_data(MAIN_WIRDOC, ["P1"])
         self.assertEqual(len(res), 1)
         self.assertEqual(res[0]["designator"], "P1")
-        self.assertEqual(res[0]["sheet"], "P42C-1_Main_Harness.WirDoc")
+        self.assertEqual(res[0]["sheet"], MAIN_WIRDOC.name)
         self.assertGreaterEqual(len(res[0]["pins"]), 26)
 
     def test_get_harness_component_pins(self):
@@ -146,8 +144,8 @@ class TestHarnessParser(unittest.TestCase):
         self.assertEqual(len(res), 1)
         self.assertEqual(res[0]["designator"], "P1")
         self.assertEqual(len(res[0]["pins"]), 26)
-        pin1 = [p for p in res[0]["pins"] if p["designator"] == "1"][0]
-        self.assertEqual(pin1["net"], "BMSM1_ALWAYS_ON_PWR")
+        pin18 = [p for p in res[0]["pins"] if p["designator"] == "18"][0]
+        self.assertEqual(pin18["net"], "BMSM1_CAN1_H")
 
     def test_get_harness_nets_and_connections(self):
         if not MAIN_WIRDOC.exists():
@@ -187,9 +185,13 @@ class TestHarnessParser(unittest.TestCase):
         from harness_parser import get_harness_erc_violations
         erc = get_harness_erc_violations(MAIN_WIRDOC)
         self.assertGreater(erc["total"], 0)
-        self.assertGreaterEqual(erc["errors"], 1)  # P? unannotated
-        unannotated = [v for v in erc["violations"] if v["type"] == "Unannotated Designator"]
-        self.assertTrue(any("P?" in v["detail"] for v in unannotated))
+        self.assertGreaterEqual(erc["warnings"], 1)
+
+        if SLAVE_WIRDOC.exists():
+            slave_erc = get_harness_erc_violations(SLAVE_WIRDOC)
+            self.assertGreaterEqual(slave_erc["errors"], 1)
+            unannotated = [v for v in slave_erc["violations"] if v["type"] == "Unannotated Designator"]
+            self.assertTrue(any("?" in v["detail"] for v in unannotated))
 
     def test_find_workspace_harness(self):
         from harness_parser import find_workspace_harness
@@ -235,7 +237,7 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         data_wir = json.loads(raw_wir)
         self.assertIn("connectors", data_wir)
         self.assertIn("summary", data_wir)
-        self.assertGreaterEqual(data_wir["summary"]["connector_count"], 9)
+        self.assertGreaterEqual(data_wir["summary"]["connector_count"], 4)
 
     async def test_fallback_get_all_nets(self):
         import main
@@ -435,6 +437,75 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         nc_parts = nc_line.split("|")
         self.assertEqual(nc_parts[3], "NC1")
         self.assertEqual(nc_parts[4], "0")
+
+
+    async def test_add_harness_wiring_cavity_crimps_serialization(self):
+        import main
+        self.mock_bridge.return_value = {
+            "success": True,
+            "result": json.dumps({"success": True, "wires": 0, "cavity_crimps": 2}),
+        }
+        res = await main.add_harness_wiring(
+            None,
+            cavity_crimps=[
+                {
+                    "connector": "P1",
+                    "pin": "1",
+                    "crimp_part_number": "13065S",
+                    "source_library": "my-components.DbLib",
+                    "source_table": "terminals-db.csv",
+                },
+                {
+                    "connector": "P1",
+                    "pin": "2",
+                    "crimp_part_number": "13065S",
+                },
+            ],
+            document_path=r"C:\test\sheet.WirDoc",
+        )
+        data = json.loads(res)
+        self.assertTrue(data.get("success"))
+        from altium_files import read_altium_text
+        spec = read_altium_text(Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt"))
+        lines = spec.splitlines()
+        self.assertIn("CAVITYCRIMP|P1|1|13065S|my-components.DbLib|terminals-db.csv", lines)
+        self.assertIn("CAVITYCRIMP|P1|2|13065S", lines)
+
+    async def test_sync_harness_wires_generic_dispatch(self):
+        import tempfile
+
+        import main
+        # Create a temporary wire database CSV
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8") as f:
+            f.write("PartNumber,Gauge,Color,Border,Voltage Rating,Outer Diameter\n")
+            f.write("W-TEST-01,22 AWG,Black,None,600V,1.2mm\n")
+            temp_db = f.name
+
+        try:
+            self.mock_bridge.return_value = {
+                "success": True,
+                "result": json.dumps({"success": True, "wires": 1}),
+            }
+            res = await main.sync_harness_wires(
+                None,
+                document_path=str(SLAVE_WIRDOC),
+                wires_db_path=temp_db,
+                source_library_name="custom.DbLib",
+                wire_designator_map={"W1": "W-TEST-01"},
+            )
+            data = json.loads(res)
+            self.assertTrue(data.get("success"))
+            self.assertEqual(data.get("wires_synced_count"), 1)
+            from altium_files import read_altium_text
+            spec = read_altium_text(Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt"))
+            lines = spec.splitlines()
+            self.assertIn("UPDATE_WIREPARAM|W1|Design Item Id|W-TEST-01", lines)
+            self.assertIn("UPDATE_WIREPARAM|W1|Source Library|custom.DbLib", lines)
+            self.assertIn("UPDATE_WIREPARAM|W1|Gauge|22 AWG", lines)
+            self.assertIn("UPDATE_WIREPARAM|W1|Color|Black", lines)
+        finally:
+            if os.path.exists(temp_db):
+                os.remove(temp_db)
 
 
 if __name__ == "__main__":

@@ -2083,6 +2083,7 @@ var
     PartX, PartY  : Integer;
     PartOri       : Integer;
     PartCom       : String;
+    SrcLib, DbTbl : String;
     CachedWireDes : String;
     CachedWireObj : ISch_GraphicalObject;
     PartDesc      : String;
@@ -2464,18 +2465,14 @@ begin
                     except
                     end;
                 end;
-                if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') then
+                if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') or (AnsiUpperCase(PName) = 'DESIGNITEMID') then
                 begin
                     try
                         LastWire.DesignItemId := PVal;
                     except
                     end;
-                    try
-                        LastWire.SourceLibraryName := 'evt-components.DbLib';
-                    except
-                    end;
                 end;
-                if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') then
+                if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') or (AnsiUpperCase(PName) = 'SOURCELIBRARYNAME') then
                 begin
                     try
                         LastWire.SourceLibraryName := PVal;
@@ -2769,18 +2766,14 @@ begin
                         except
                         end;
                     end;
-                    if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') then
+                    if (AnsiUpperCase(PName) = 'DESIGN ITEM ID') or (AnsiUpperCase(PName) = 'PARTNUMBER') or (AnsiUpperCase(PName) = 'DESIGNITEMID') then
                     begin
                         try
                             Obj.DesignItemId := PVal;
                         except
                         end;
-                        try
-                            Obj.SourceLibraryName := 'evt-components.DbLib';
-                        except
-                        end;
                     end;
-                    if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') then
+                    if (AnsiUpperCase(PName) = 'SOURCE LIBRARY') or (AnsiUpperCase(PName) = 'SOURCELIBRARYNAME') then
                     begin
                         try
                             Obj.SourceLibraryName := PVal;
@@ -2839,10 +2832,12 @@ begin
             end
             else if (Kind = 'CAVITYCRIMP') then
             begin
-                // CAVITYCRIMP|<ConnDes>|<PinDes>|<CrimpPartNumber>
+                // CAVITYCRIMP|<ConnDes>|<PinDes>|<CrimpPartNumber>[|<SourceLibraryName>[|<DatabaseTableName>]]
                 ConnDes := GetFieldFromPipeString(Rec, 1);
                 PName   := GetFieldFromPipeString(Rec, 2);
                 PVal    := GetFieldFromPipeString(Rec, 3);
+                SrcLib  := GetFieldFromPipeString(Rec, 4);
+                DbTbl   := GetFieldFromPipeString(Rec, 5);
                 Iter := TargetDoc.SchIterator_Create;
                 Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
                 Obj := Iter.FirstSchObject;
@@ -2873,20 +2868,6 @@ begin
                         except
                         end;
                     end;
-                    if (FoundDes = '') and (ConnDes = 'P1') and ((Pos('11X2', AnsiUpperCase(Obj.LibReference)) > 0) or (Pos('649022', Obj.ComponentDescription) > 0) or (Pos('22POS', Obj.ComponentDescription) > 0)) then
-                        FoundDes := 'P1';
-                    if (FoundDes = '') and (ConnDes = 'J1') and ((Pos('2X2', AnsiUpperCase(Obj.LibReference)) > 0) or (Pos('DTM04-4P', Obj.ComponentDescription) > 0) or (Pos('4P', Obj.ComponentDescription) > 0)) then
-                        FoundDes := 'J1';
-                    if (FoundDes = '') and (ConnDes = 'P2') and (Pos('MX84B012', Obj.ComponentDescription) > 0) then
-                        FoundDes := 'P2';
-                    if (FoundDes = '') and ((Pos('13065S', Obj.ComponentDescription) > 0) or (Pos('13065S', Obj.Comment.Text) > 0)) then
-                    begin
-                        if CoordToMils(Obj.Location.Y) > 1600 then FoundDes := 'P3'
-                        else if CoordToMils(Obj.Location.Y) > 1150 then FoundDes := 'P4'
-                        else if CoordToMils(Obj.Location.Y) > 700 then FoundDes := 'P5'
-                        else FoundDes := 'P6';
-                    end;
-
                     if (AnsiUpperCase(FoundDes) = AnsiUpperCase(ConnDes)) then
                     begin
                         ChildIter := Obj.SchIterator_Create;
@@ -2937,13 +2918,19 @@ begin
                                                 CavityComp.Comment.Text := PVal;
                                         except
                                         end;
-                                        try
-                                            CavityComp.SourceLibraryName := 'evt-components.DbLib';
-                                        except
+                                        if (SrcLib <> '') then
+                                        begin
+                                            try
+                                                CavityComp.SourceLibraryName := SrcLib;
+                                            except
+                                            end;
                                         end;
-                                        try
-                                            CavityComp.DatabaseTableName := 'terminals-db.csv';
-                                        except
+                                        if (DbTbl <> '') then
+                                        begin
+                                            try
+                                                CavityComp.DatabaseTableName := DbTbl;
+                                            except
+                                            end;
                                         end;
                                         try
                                             Prim.RemoveAllOfType(0);

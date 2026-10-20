@@ -2125,9 +2125,22 @@ async def add_harness_wiring(
     for cc in cavity_crimps or []:
         conn_des = str(cc.get("connector", "")).strip()
         pin_des = str(cc.get("pin") or cc.get("cavity", "")).strip()
-        terminal = str(cc.get("terminal") or cc.get("crimp", "")).strip()
+        terminal = str(
+            cc.get("terminal")
+            or cc.get("crimp")
+            or cc.get("crimp_part_number")
+            or cc.get("part_number")
+            or ""
+        ).strip()
+        src_lib = str(cc.get("source_library", "")).strip()
+        src_tbl = str(cc.get("source_table", "")).strip()
         if conn_des and pin_des and terminal:
-            lines.append(f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}")
+            if src_lib or src_tbl:
+                lines.append(
+                    f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}|{src_lib}|{src_tbl}"
+                )
+            else:
+                lines.append(f"CAVITYCRIMP|{conn_des}|{pin_des}|{terminal}")
 
     spec_path = Path("C:/Users/Public/altium_mcp/harness_wiring_spec.txt")
     spec_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2269,36 +2282,55 @@ async def reroute_harness_wiring(
 
 
 @mcp.tool()
-@mcp.tool()
 async def sync_harness_wires(
     ctx: Context,
     document_path: str | None = None,
-    wires_db_path: str = "c:/evt_gits/altium-librairies/components/wires-db.csv",
+    wires_db_path: str | None = None,
+    source_library_name: str | None = None,
     wire_designator_map: dict | None = None,
 ) -> str:
-    """Synchronize harness wire parameters, design item IDs, and visual colors from wires-db.csv onto a .WirDoc.
+    """Synchronize harness wire parameters, design item IDs, and visual colors from a wire database CSV onto a .WirDoc.
 
-    Because Altium Designer's internal harness engine rejects .DbLib components via the GUI 'Replace Component'
+    Because Altium Designer's internal harness engine rejects desktop .DbLib components via the GUI 'Replace Component'
     dialog (it requires a cloud ISchHarnessWire model with ObjectID=82 rather than a .SchLib symbol),
     this tool provides the official automated library synchronization mechanism:
-    1. Loads master wire definitions from wires-db.csv (PartNumber, Description, Gauge, Color, Voltage Rating, etc.).
+    1. Loads master wire definitions from the wire database CSV (PartNumber, Description, Gauge, Color, Voltage Rating, etc.).
     2. Identifies all wires in the target .WirDoc.
     3. Resolves each wire's PartNumber from its current parameters or an explicit wire_designator_map.
-    4. Propagates all engineering parameters, design item IDs, and visual TColor rendering onto the wires in Altium.
-    5. Saves changes to disk via DoFileSave.
+    4. Propagates all engineering parameters, native design item IDs, and visual TColor rendering onto the wires in Altium.
+    5. Commits changes to disk via DoFileSave.
 
     Args:
-        document_path (str, optional): Target .WirDoc file path. Defaults to active document.
-        wires_db_path (str): Path to wires-db.csv.
+        document_path (str, optional): Target .WirDoc file path. Defaults to active document in Altium.
+        wires_db_path (str, optional): Path to wires-db.csv. If omitted, searches standard local paths or environment ALTIUM_WIRES_DB_PATH.
+        source_library_name (str, optional): Name of the parent database library (e.g. 'components.DbLib').
         wire_designator_map (dict, optional): Optional mapping of wire designator to PartNumber, e.g. {"W1": "5875 BK005"}.
             If omitted, wires are resolved using their existing PartNumber / Design Item Id or Gauge + Color.
 
     Returns:
         str: JSON string detailing updated wires and applied parameters.
     """
-    db_file = Path(wires_db_path).resolve()
-    if not db_file.exists():
-        return json.dumps({"success": False, "error": f"wires-db.csv not found: {db_file}"})
+    db_file = None
+    if wires_db_path:
+        db_file = Path(wires_db_path).resolve()
+    else:
+        env_p = os.environ.get("ALTIUM_WIRES_DB_PATH")
+        if env_p and Path(env_p).exists():
+            db_file = Path(env_p).resolve()
+        else:
+            candidates = [
+                Path("components/wires-db.csv"),
+                Path("altium-librairies/components/wires-db.csv"),
+                Path("../altium-librairies/components/wires-db.csv"),
+                Path("c:/evt_gits/altium-librairies/components/wires-db.csv"),
+            ]
+            for c in candidates:
+                if c.exists():
+                    db_file = c.resolve()
+                    break
+
+    if not db_file or not db_file.exists():
+        return json.dumps({"success": False, "error": "Wire database CSV not found. Please provide wires_db_path."})
 
     import csv
     wire_db: dict[str, dict[str, str]] = {}
@@ -2321,12 +2353,15 @@ async def sync_harness_wires(
                 target_path = str(doc_path.resolve())
                 break
         if not target_path:
-            default_p = Path("c:/evt_gits/electrical-p42c-1/P42C-1_Slave_Harness/P42C-1_Slave_Sense_Harness.WirDoc")
-            if default_p.exists():
-                target_path = str(default_p.resolve())
+            h_path = await _get_active_harness_path()
+            if h_path and str(h_path).lower().endswith(".wirdoc"):
+                target_path = str(Path(h_path).resolve())
 
     if not target_path or not Path(target_path).exists():
-        return json.dumps({"success": False, "error": f"Target .WirDoc document not found: {target_path}"})
+        return json.dumps({
+            "success": False,
+            "error": f"Target .WirDoc document not found: {target_path or 'No document specified and no active .WirDoc detected'}"
+        })
 
     doc_data = parse_wirdoc(target_path)
     wires = doc_data.get("wires", [])
@@ -2352,7 +2387,7 @@ async def sync_harness_wires(
                     break
 
         if not part_num or part_num not in wire_db:
-            logger.warning(f"Wire {des} PartNumber '{part_num}' not found in {wires_db_path}")
+            logger.warning(f"Wire {des} PartNumber '{part_num}' not found in {db_file}")
             continue
 
         row = wire_db[part_num]
@@ -2363,8 +2398,8 @@ async def sync_harness_wires(
             "Manufacturer 1": row.get("Manufacturer 1", ""),
             "Manufacturer Part Number 1": row.get("Manufacturer Part Number 1", ""),
             "Manufacturer Series": row.get("Manufacturer Series", ""),
-            "Wire Gauge": row.get("Wire Gauge", ""),
-            "Gauge": row.get("Wire Gauge", ""),
+            "Wire Gauge": row.get("Wire Gauge") or row.get("Gauge", ""),
+            "Gauge": row.get("Gauge") or row.get("Wire Gauge", ""),
             "Color": row.get("Color", ""),
             "Color Code": row.get("Color Code", ""),
             "Outer Diameter": row.get("Outer Diameter", ""),
@@ -2374,23 +2409,27 @@ async def sync_harness_wires(
             "Conductor Stranding": row.get("Conductor Stranding", ""),
             "Insulation Material": row.get("Insulation Material", ""),
             "Insulation Color": row.get("Insulation Color", ""),
-            "Voltage Rating": row.get("Voltage Rating", ""),
-            "VoltageRating": row.get("Voltage Rating", ""),
+            "Voltage Rating": row.get("Voltage Rating") or row.get("VoltageRating", ""),
+            "VoltageRating": row.get("VoltageRating") or row.get("Voltage Rating", ""),
             "Max Current Rating": row.get("Max Current Rating", ""),
             "Max Operating Temperature": row.get("Max Operating Temperature", ""),
             "Min Operating Temperature": row.get("Min Operating Temperature", ""),
             "Flammability Rating": row.get("Flammability Rating", ""),
             "ComponentType": "Wire",
             "Border": "None",
-            "Source Library": "evt-components.DbLib",
-            "Source Table": "wires-db.csv",
+            "Source Table": db_file.name,
         }
+        src_lib = source_library_name or row.get("Source Library")
+        if not src_lib:
+            dblib_candidates = list(db_file.parent.glob("*.DbLib"))
+            if dblib_candidates:
+                src_lib = dblib_candidates[0].name
+        if src_lib:
+            params["Source Library"] = src_lib
+
         for k in ["ComponentLink1Description", "ComponentLink1URL", "ComponentLink2Description", "ComponentLink2URL"]:
             if row.get(k):
                 params[k] = row[k]
-
-        if des == "W10" and (not w.get("net") or w.get("net") == "?"):
-            params["Comment"] = "MOD1_NTC2_GND"
 
         wire_updates.append({
             "designator": des,
