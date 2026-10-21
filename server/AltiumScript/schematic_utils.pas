@@ -2301,6 +2301,50 @@ begin
     Doc.SchIterator_Destroy(Iter);
 end;
 
+// Set the designator of a twist or shield: they hold it as a child
+// designator object (ObjectId 25) but, unlike cables, expose no Designator
+// property (reading Obj.Designator is a runtime error). False if none.
+function SetChildDesignator(Obj: ISch_GraphicalObject; Des: String): Boolean;
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+begin
+    Result := False;
+    ChildIter := Obj.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(25));
+    Prim := ChildIter.FirstSchObject;
+    Obj.SchIterator_Destroy(ChildIter);
+    if (Prim = nil) then Exit;
+    SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    Prim.Text := Des;
+    SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+    Result := True;
+end;
+
+// First sheet text (eLabel) at X, Y mils whose text is OldText (any text
+// when OldText is empty), or nil.
+function FindLabelAt(Doc: ISch_Document; X, Y: Integer; OldText: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eLabel));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (CoordToMils(Obj.Location.X) = X) and (CoordToMils(Obj.Location.Y) = Y) and
+           ((OldText = '') or (Obj.Text = OldText)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
 // Upsert the Name|Value pairs of Rec from field FirstField on.
 procedure ApplySpecParameters(Owner: ISch_BasicContainer; Rec: String; FirstField: Integer);
 var
@@ -2454,6 +2498,7 @@ var
     CableCount    : Integer;
     BreakCount    : Integer;
     UnchangedCount: Integer;
+    LabelsUpdated : Integer;
     RX1, RY1      : Integer;
     RX2, RY2      : Integer;
     GeoChanged    : Boolean;
@@ -2572,6 +2617,7 @@ begin
         CableCount := 0;
         BreakCount := 0;
         UnchangedCount := 0;
+        LabelsUpdated := 0;
         // Wire geometry changed: twists, shields, cables and wire breaks
         // must then be linked again (see the reopen below)
         GeoChanged := False;
@@ -3150,8 +3196,8 @@ begin
             end
             else if (Kind = 'TWIST') or (Kind = 'SHIELD') or (Kind = 'CABLE') then
             begin
-                // TWIST|x1|y1|x2|y2|<rotation 0-3>
-                // SHIELD|x1|y1|x2|y2|<rotation 0-3>|<style: 0 shield, 1 shield with connection>
+                // TWIST|x1|y1|x2|y2|<rotation 0-3>[|<Designator>]
+                // SHIELD|x1|y1|x2|y2|<rotation 0-3>|<style: 0 shield, 1 shield with connection>[|<Designator>]
                 // CABLE|x1|y1|x2|y2|<rotation 0-3>|<Designator>|<Comment>|<PartNumber>|<SourceLibraryName>[|Name|Value...]
                 // A rectangle across the wires; Altium links every wire it
                 // touches. An identical rectangle (or, for a cable, the same
@@ -3223,9 +3269,36 @@ begin
                     // cavity parts, keep a Description parameter
                     if (j = 98) then
                         ApplySpecParameters(Obj, Rec, 10);
+                    // Twist / shield designator (after registration: the
+                    // designator object exists once the object is placed)
+                    if (j = 93) then PName := SpecField(Rec, 6)
+                    else if (j = 92) then PName := SpecField(Rec, 7)
+                    else PName := '';
+                    if (PName <> '') and not SetChildDesignator(Obj, PName) then
+                        Misses.Add('designator:' + PName);
                     if (j = 93) then TwistCount := TwistCount + 1
                     else if (j = 92) then ShieldCount := ShieldCount + 1
                     else CableCount := CableCount + 1;
+                end;
+            end
+            else if (Kind = 'RELINK') then
+                // RELINK - recompute twist/shield/cable/wire break links even
+                // without a geometry change (e.g. objects copied in the GUI
+                // keep their source's links until the sheet is reloaded)
+                GeoChanged := True
+            else if (Kind = 'LABELTEXT') then
+            begin
+                // LABELTEXT|x|y|<old text, empty = any>|<new text>
+                Obj := FindLabelAt(TargetDoc, StrToInt(SpecField(Rec, 1)), StrToInt(SpecField(Rec, 2)), SpecField(Rec, 3));
+                if (Obj = nil) then
+                    Misses.Add('label@' + SpecField(Rec, 1) + ',' + SpecField(Rec, 2) + ':' + SpecField(Rec, 3))
+                else
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    Obj.Text := SpecField(Rec, 4);
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    Obj.GraphicallyInvalidate;
+                    LabelsUpdated := LabelsUpdated + 1;
                 end;
             end
             else if (Kind = 'WIREBREAK') then
@@ -3326,6 +3399,7 @@ begin
                   ', "cables": ' + IntToStr(CableCount) +
                   ', "wire_breaks": ' + IntToStr(BreakCount) +
                   ', "already_placed": ' + IntToStr(UnchangedCount) +
+                  ', "labels_updated": ' + IntToStr(LabelsUpdated) +
                   ', "relinked": ' + LowerCase(BoolToStr(Relinked, True)) +
                   ', "components_updated": ' + IntToStr(CompsUpdated) +
                   ', "connectors_moved": ' + IntToStr(MovedCount) +

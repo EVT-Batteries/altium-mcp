@@ -2107,6 +2107,8 @@ async def add_harness_wiring(
     shields: list | None = None,
     cables: list | None = None,
     wire_breaks: list | None = None,
+    label_updates: list | None = None,
+    relink: bool = False,
 ) -> str:
     """
     Add or update wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
@@ -2181,11 +2183,12 @@ async def add_harness_wiring(
             The listed parts replace the owner's associated parts; "part_number": "" only
             removes them.
         twists (list): Twist marks; a rectangle in mils across the wires to twist, e.g.
-            [{"x1": 13300, "y1": 8000, "x2": 13400, "y2": 8600}]. Altium links every wire
-            the rectangle crosses or touches.
+            [{"x1": 13300, "y1": 8000, "x2": 13400, "y2": 8600, "designator": "TW1"}].
+            Altium links every wire the rectangle crosses or touches. Sending the rectangle of
+            an existing twist (or shield) with a designator only re-annotates it.
         shields (list): Shields, a rectangle across the shielded wires, e.g.
             [{"x1": 13800, "y1": 7700, "x2": 14300, "y2": 8700, "style": "with_connection",
-              "rotation": 0}]
+              "rotation": 0, "designator": "SH1"}]
             style "with_connection" adds the shield's connection pin, where a drain wire
             ends: at rotation 0 the middle of the bottom edge ((x1+x2)/2, min y), rotation 1
             the middle of the right edge, 2 the top edge, 3 the left edge.
@@ -2203,6 +2206,11 @@ async def add_harness_wiring(
             lost) and reports the links read back from the file under "links". A
             rectangle that links no wire or a break on no wire end is listed in not_found.
             Placing an identical rectangle or a break at the same point again updates it.
+        relink (bool): Reopen the document after saving to recompute those links even when
+            no geometry changed (e.g. twists copied in the GUI keep the copied links).
+        label_updates (list): Change existing sheet texts (eLabel), e.g.
+            [{"x": 7400, "y": 8200, "text": "OLD", "new_text": "NEW"}]; x/y in mils, the
+            label's location; "text" (optional) must match the current text.
         component_updates (list): Parameters to upsert on placed connectors/components, e.g.:
             [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"}}]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
@@ -2414,7 +2422,9 @@ async def add_harness_wiring(
             lines.append(_spec_line("ASSOCPART", owner, *_part_fields(ap)))
 
     for t in twists or []:
-        lines.append(_spec_line("TWIST", *_rect(t), _rotation(t)))
+        lines.append(
+            _spec_line("TWIST", *_rect(t), _rotation(t), str(t.get("designator", "")).strip())
+        )
 
     for sh in shields or []:
         style = sh.get("style", 0)
@@ -2428,7 +2438,11 @@ async def add_harness_wiring(
                     f"use one of {sorted(SHIELD_STYLES)}",
                 }
             )
-        lines.append(_spec_line("SHIELD", *_rect(sh), _rotation(sh), style))
+        lines.append(
+            _spec_line(
+                "SHIELD", *_rect(sh), _rotation(sh), style, str(sh.get("designator", "")).strip()
+            )
+        )
 
     for cb in cables or []:
         fields = [
@@ -2449,6 +2463,19 @@ async def add_harness_wiring(
 
     for wb in wire_breaks or []:
         lines.append(_spec_line("WIREBREAK", int(wb.get("x", 0)), int(wb.get("y", 0))))
+
+    for lu in label_updates or []:
+        lines.append(
+            _spec_line(
+                "LABELTEXT",
+                int(lu.get("x", 0)),
+                int(lu.get("y", 0)),
+                str(lu.get("text", "")),
+                str(lu.get("new_text", "")),
+            )
+        )
+    if relink:
+        lines.append("RELINK")
 
     for cu in component_updates or []:
         c_des = str(cu.get("designator", "")).strip()
@@ -2521,6 +2548,8 @@ def _check_harness_links(
             if obj is None or not obj["wires"]:
                 misses.append(f"{label} (links no wire)")
             entry = {"rect_mils": _rect(item), "wires": obj["wires"] if obj else []}
+            if obj and obj.get("designator"):
+                entry["designator"] = obj["designator"]
             if kind == "shield" and obj:
                 entry["drain_wires"] = obj["drain_wires"]
                 pin = obj.get("pin")
@@ -2822,10 +2851,18 @@ async def _sync_harness_from_library(
                 )
             wire_updates.append(update)
 
-    def library_parts(where: str, part_numbers: list[str]) -> list[dict] | None:
+    def library_parts(
+        where: str, part_numbers: list[str], current: list[dict] | None = None
+    ) -> list[dict] | None:
         """Database-backed part dicts for part_numbers, or None (reported)
         when one is not in the database: a slot is replaced as a whole, so
-        it is left alone rather than losing that part."""
+        it is left alone rather than losing that part. Parameters the
+        current part of the same number carries beyond the database row
+        (e.g. a strip length typed in Altium) are kept: replacing the part
+        would otherwise drop them."""
+        kept = {
+            p["part_number"]: p.get("parameters", {}) for p in current or [] if p.get("part_number")
+        }
         parts = []
         for pn in part_numbers:
             found = library.find(pn)
@@ -2836,6 +2873,9 @@ async def _sync_harness_from_library(
                 return None
             table, row = found
             params = with_aliases(table.parameters(row))
+            for name, value in kept.get(pn, {}).items():
+                if name not in params and name != "Description" and value:
+                    params[name] = value
             parts.append(
                 {
                     "part_number": pn,
@@ -2880,7 +2920,12 @@ async def _sync_harness_from_library(
                             {"connector": key[0], "pin": key[1], "type": cav_type, "part_number": ""}
                         )
                         continue
-                    for part in library_parts(where, pns) or []:
+                    current = [
+                        p
+                        for p in pin.get("cavity_parts", [])
+                        if _cavity_type(p.get("type", "crimp")) == cav_type
+                    ]
+                    for part in library_parts(where, pns, current) or []:
                         cavity_parts.append(
                             {"connector": key[0], "pin": key[1], "type": cav_type, **part}
                         )
@@ -2901,7 +2946,7 @@ async def _sync_harness_from_library(
                 if current:  # emptied by associated_map
                     associated_parts.append({"owner": des, "part_number": ""})
                 continue
-            for part in library_parts(des, pns) or []:
+            for part in library_parts(des, pns, owner.get("associated_parts")) or []:
                 associated_parts.append({"owner": des, **part})
         for des in wanted_assoc:
             unresolved.append({"designator": des, "reason": "connector or splice not found on the sheet"})

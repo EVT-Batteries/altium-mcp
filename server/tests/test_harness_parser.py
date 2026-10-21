@@ -172,7 +172,7 @@ class TestHarnessParser(unittest.TestCase):
         conn = res["connectors"][0]
         self.assertEqual(conn["pins"][0]["cavity_parts"], [
             {"type": "seal", "part_number": "SEAL-1", "source_library": "", "source_table": "",
-             "description": "Wire seal", "unique_id": "K1"}])
+             "description": "Wire seal", "unique_id": "K1", "parameters": {}}])
         self.assertEqual([p["part_number"] for p in conn["associated_parts"]], ["BOOT-1"])
         self.assertEqual(res["twists"][0]["wires"], ["W1"])
         shield = res["shields"][0]
@@ -629,7 +629,10 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
                 {"connector": "P1", "pin": "4", "type": 3, "part_number": "O-1"},
             ],
             associated_parts=[{"owner": "SP1", "part_number": "HS-1", "description": "Heat shrink"}],
-            twists=[{"x1": 100, "y1": 200, "x2": 50, "y2": 400}],
+            twists=[{"x1": 100, "y1": 200, "x2": 50, "y2": 400},
+                    {"x1": 0, "y1": 0, "x2": 1, "y2": 1, "designator": "TW2"}],
+            label_updates=[{"x": 7400, "y": 8200, "text": "OLD|1", "new_text": "NEW"}],
+            relink=True,
             shields=[{"x1": 0, "y1": 0, "x2": 500, "y2": 1000, "style": "with_connection",
                       "rotation": 1}],
             cables=[{"designator": "C1", "x1": 0, "y1": 0, "x2": 10, "y2": 10,
@@ -643,8 +646,11 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CAVITYPART|P1|4|2||||", lines)
         self.assertIn("CAVITYPART|P1|4|3|O-1|||", lines)
         self.assertIn("ASSOCPART|SP1|HS-1|||Heat shrink", lines)
-        self.assertIn("TWIST|100|200|50|400|", lines)
-        self.assertIn("SHIELD|0|0|500|1000|1|1", lines)
+        self.assertIn("TWIST|100|200|50|400||", lines)
+        self.assertIn("TWIST|0|0|1|1||TW2", lines)
+        self.assertIn("SHIELD|0|0|500|1000|1|1|", lines)
+        self.assertIn("LABELTEXT|7400|8200|OLD%7C1|NEW", lines)
+        self.assertEqual(lines[-1], "RELINK")
         self.assertIn(
             "CABLE|0|0|10|10||C1|BELDEN 8771|8771||Manufacturer|Belden|Description|Cable", lines
         )
@@ -875,7 +881,9 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
                     # current seal kept and refreshed, crimp replaced by the map
                     {"designator": "1", "cavity_parts": [
                         {"type": "crimp", "part_number": "OLD"},
-                        {"type": "seal", "part_number": "S-1"}]},
+                        # a value typed in Altium survives, database values win
+                        {"type": "seal", "part_number": "S-1",
+                         "parameters": {"StripLength": "4mm", "Manufacturer 1": "Old"}}]},
                     # unknown "other" part: that slot is left alone
                     {"designator": "2", "cavity_parts": [
                         {"type": "other", "part_number": "NOPE"}]},
@@ -899,7 +907,8 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         cav = [l for l in lines if l.startswith("CAVITYPART|")]
         self.assertEqual(cav, [
             "CAVITYPART|P1|1|0|T-1|lib.DbLib|parts.csv|Socket|PartNumber|T-1|Manufacturer 1|Acme",
-            "CAVITYPART|P1|1|1|S-1|lib.DbLib|parts.csv|Seal|PartNumber|S-1|Manufacturer 1|Acme",
+            "CAVITYPART|P1|1|1|S-1|lib.DbLib|parts.csv|Seal|PartNumber|S-1|Manufacturer 1|Acme"
+            "|StripLength|4mm",
             "CAVITYPART|P1|3|2||||",
         ])
         assoc = [l for l in lines if l.startswith("ASSOCPART|")]

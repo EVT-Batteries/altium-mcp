@@ -165,7 +165,9 @@ def parse_wirdoc_records(
     # Components nested in pin cavities (RECORD 106 owned by a RECORD 131
     # cavity container owned by the pin) or attached to a connector/splice
     # (106 in a RECORD 125 container), resolved after the first pass
-    cavity_parts: list[tuple[int, dict[str, str]]] = []
+    cavity_parts: list[tuple[int, int, dict[str, str]]] = []
+    # Parameters of records not otherwise collected (e.g. cavity parts)
+    other_params: dict[int, dict[str, str]] = {}
     # Twists, shields, cables (rectangles across wires) and wire breaks
     rect_objects: dict[int, dict[str, Any]] = {}
     wire_breaks: list[dict[str, Any]] = []
@@ -176,7 +178,7 @@ def parse_wirdoc_records(
 
         if rtype == "106" and "OwnerIndex" in props:
             # Crimp/seal/plug in a cavity or an associated part, not a placed connector
-            cavity_parts.append((int(props["OwnerIndex"]), props))
+            cavity_parts.append((int(props["OwnerIndex"]), idx, props))
         elif rtype in RECT_OBJECTS and "OwnerIndex" not in props:
             xa, xb = _coord(props, "Location.X"), _coord(props, "Corner.X")
             ya, yb = _coord(props, "Location.Y"), _coord(props, "Corner.Y")
@@ -186,6 +188,7 @@ def parse_wirdoc_records(
                 "y1": min(ya, yb),
                 "x2": max(xa, xb),
                 "y2": max(ya, yb),
+                "designator": "",
                 "rotation": int(props.get("Rotation", 0) or 0),
                 "unique_id": props.get("UniqueID", ""),
                 "wire_uids": _uid_list(
@@ -198,9 +201,9 @@ def parse_wirdoc_records(
                 obj["drain_wire_uids"] = _uid_list(
                     props, "ConnectedPinWiresUniqueIdsCount", "ConnectedPinWireUniqueId"
                 )
-            if rtype == "123":
-                obj["designator"] = ""
+            if rtype in ("117", "123"):
                 obj["comment"] = ""
+            if rtype == "123":
                 obj["part_number"] = _text(props, "DesignItemId")
                 obj["source_library"] = _text(props, "SourceLibraryName")
             rect_objects[idx] = obj
@@ -307,10 +310,11 @@ def parse_wirdoc_records(
                 obj = rect_objects[owner]
                 value = "" if val == "*" else val
                 if name in ("Designator", "Comment"):
-                    if "designator" in obj:  # cables only
-                        obj[name.lower()] = value
+                    obj[name.lower()] = value
                 else:
                     obj["parameters"][name] = value
+            elif name and rtype == "41":
+                other_params.setdefault(owner, {})[name] = val
         elif rtype == "113":  # Harness Connector Pin
             owner = int(props.get("OwnerIndex", -1))
             if owner in connectors:
@@ -379,8 +383,13 @@ def parse_wirdoc_records(
     # slot) -> 113 pin; associated parts: 106 -> 125 -> connector 106 or
     # splice 108. Altium writes each crimp twice with the same UniqueID;
     # keep one.
-    for container_idx, props in cavity_parts:
+    for container_idx, part_idx, props in cavity_parts:
         container = records[container_idx] if container_idx < len(records) else {}
+        params = {
+            k: v
+            for k, v in other_params.get(part_idx, {}).items()
+            if k != "Comment" and v != "*"
+        }
         owner_idx = int(container.get("OwnerIndex", -1))
         if container.get("RECORD") == "125":
             owner = connectors.get(owner_idx) or splices_dict.get(owner_idx)
@@ -395,7 +404,9 @@ def parse_wirdoc_records(
         if parts is None:
             continue
         uid = props.get("UniqueID", "")
-        if any(p["unique_id"] == uid for p in parts):
+        known = next((p for p in parts if p["unique_id"] == uid), None)
+        if known is not None:  # second copy of the part, which holds its parameters
+            known["parameters"].update(params)
             continue
         part = {
             "part_number": _text(props, "DesignItemId"),
@@ -403,6 +414,7 @@ def parse_wirdoc_records(
             "source_table": _text(props, "DatabaseTableName"),
             "description": _text(props, "ComponentDescription"),
             "unique_id": uid,
+            "parameters": params,
         }
         if part_type is not None:
             part = {"type": part_type, **part}

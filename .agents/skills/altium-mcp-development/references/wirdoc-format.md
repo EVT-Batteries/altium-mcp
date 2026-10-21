@@ -94,8 +94,15 @@ Gotchas found:
   open project. There are no setters for the links.
 - `Internal_GetState_*` methods and `ShieldPinLocation` are not callable from DelphiScript
   (runtime error); use the property form (`Style`, `Orientation`) or `GetState_*` methods.
-- Twists and shields have no `Designator` object in DelphiScript (reading `Obj.Designator`
-  crashes), although the file holds a Designator parameter for them; cables do have one.
+- Twists and shields have no `Designator` property in DelphiScript (reading `Obj.Designator`
+  crashes); their designator is a child object (ObjectId 25, RECORD 34) found with
+  `Obj.SchIterator_Create` + `AddFilter_ObjectSet(MkSet(25))`, and setting its `Text` persists.
+  Cables do have the property.
+- Twists copied/pasted in the GUI keep the copied twist's links (`ConnectedWireUniqueId<n>` of the
+  source) until the sheet is reloaded - another reason to relink after edits.
+- A cavity part replaced by a script loses parameters the database does not supply (e.g.
+  `StripLength`, `PullOffLength`, which the GUI adds empty as `*`); the sync carries non-empty
+  ones over to the new part.
 - Altium normalises a rectangle's corners (Location = min, Corner = max) when it saves.
 - The sandbox's provided `List1` breaks scripts here; create your own `TStringList` (and use
   `.Strings[i]`; `GetFieldFromPipeString` and other production helpers are not in the sandbox).
