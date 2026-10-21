@@ -2196,6 +2196,29 @@ begin
     Doc.SchIterator_Destroy(Iter);
 end;
 
+// Harness connector (81), wire (82), splice (83) or no-connect (94) on Doc
+// with the given UniqueId, or nil.
+function FindHarnessObjectByUid(Doc: ISch_Document; Uid: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(81, 82, 83, 94));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (Obj.UniqueId = Uid) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
 // First harness splice (83) on Doc with the given designator, or nil.
 function FindHarnessSplice(Doc: ISch_Document; Des: String): ISch_GraphicalObject;
 var
@@ -2499,6 +2522,7 @@ var
     BreakCount    : Integer;
     UnchangedCount: Integer;
     LabelsUpdated : Integer;
+    DesUpdated    : Integer;
     RX1, RY1      : Integer;
     RX2, RY2      : Integer;
     GeoChanged    : Boolean;
@@ -2618,6 +2642,7 @@ begin
         BreakCount := 0;
         UnchangedCount := 0;
         LabelsUpdated := 0;
+        DesUpdated := 0;
         // Wire geometry changed: twists, shields, cables and wire breaks
         // must then be linked again (see the reopen below)
         GeoChanged := False;
@@ -3301,6 +3326,32 @@ begin
                     LabelsUpdated := LabelsUpdated + 1;
                 end;
             end
+            else if (Kind = 'DESIGNATOR') then
+            begin
+                // DESIGNATOR|<UniqueId>|<new designator>|<show name: '', 0 or 1>
+                // Renames a connector, wire or splice (its Designator) or a
+                // no-connect (its name) in place, found by UniqueId.
+                Obj := FindHarnessObjectByUid(TargetDoc, SpecField(Rec, 1));
+                if (Obj = nil) then
+                    Misses.Add('unique_id:' + SpecField(Rec, 1))
+                else
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    if (Obj.ObjectId = 94) then
+                    begin
+                        Obj.Text := SpecField(Rec, 2);
+                        if (SpecField(Rec, 3) = '1') then
+                            Obj.ShowName := True
+                        else if (SpecField(Rec, 3) = '0') then
+                            Obj.ShowName := False;
+                    end
+                    else if (Obj.Designator <> nil) then
+                        Obj.Designator.Text := SpecField(Rec, 2);
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    Obj.GraphicallyInvalidate;
+                    DesUpdated := DesUpdated + 1;
+                end;
+            end
             else if (Kind = 'WIREBREAK') then
             begin
                 // WIREBREAK|x|y - on a free wire end; it takes the wire's
@@ -3400,6 +3451,7 @@ begin
                   ', "wire_breaks": ' + IntToStr(BreakCount) +
                   ', "already_placed": ' + IntToStr(UnchangedCount) +
                   ', "labels_updated": ' + IntToStr(LabelsUpdated) +
+                  ', "designators_updated": ' + IntToStr(DesUpdated) +
                   ', "relinked": ' + LowerCase(BoolToStr(Relinked, True)) +
                   ', "components_updated": ' + IntToStr(CompsUpdated) +
                   ', "connectors_moved": ' + IntToStr(MovedCount) +

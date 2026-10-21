@@ -2109,6 +2109,7 @@ async def add_harness_wiring(
     wire_breaks: list | None = None,
     label_updates: list | None = None,
     relink: bool = False,
+    designator_updates: list | None = None,
 ) -> str:
     """
     Add or update wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
@@ -2211,6 +2212,13 @@ async def add_harness_wiring(
         label_updates (list): Change existing sheet texts (eLabel), e.g.
             [{"x": 7400, "y": 8200, "text": "OLD", "new_text": "NEW"}]; x/y in mils, the
             label's location; "text" (optional) must match the current text.
+        designator_updates (list): Rename existing connectors, wires, splices (Designator)
+            or no-connects (name) in place, found by the unique_id get_harness_data reports,
+            e.g. [{"unique_id": "QOWDFIRS", "designator": "P3"},
+                  {"unique_id": "HDWLTHQJ", "designator": "NC1", "show_name": False}].
+            Use it for unannotated objects ("P?", "*") that no designator can address.
+            Applied before every other change of the call, so later entries may use the
+            new designators. show_name only applies to no-connects.
         component_updates (list): Parameters to upsert on placed connectors/components, e.g.:
             [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"}}]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
@@ -2248,6 +2256,17 @@ async def add_harness_wiring(
                 }
             )
         lines.append(_spec_line("SHEET_STYLE", style))
+
+    for du in designator_updates or []:
+        show = du.get("show_name")
+        lines.append(
+            _spec_line(
+                "DESIGNATOR",
+                str(du.get("unique_id", "")).strip(),
+                str(du.get("designator", "")).strip(),
+                "" if show is None else ("1" if show else "0"),
+            )
+        )
 
     for c in connectors or []:
         lines.append(

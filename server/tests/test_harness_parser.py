@@ -656,6 +656,27 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("WIREBREAK|14700|7700", lines)
 
+    async def test_add_harness_wiring_designator_updates_first(self):
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            wire_updates=[{"designator": "W1", "parameters": {"PartNumber": "X"}}],
+            designator_updates=[
+                {"unique_id": "ABCDEFGH", "designator": "W1"},
+                {"unique_id": " NCUID ", "designator": "NC1", "show_name": False},
+                {"unique_id": "CONNUID", "designator": "P|1", "show_name": True},
+            ],
+        )
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertEqual(lines[1], "DESIGNATOR|ABCDEFGH|W1|")
+        self.assertEqual(lines[2], "DESIGNATOR|NCUID|NC1|0")
+        self.assertEqual(lines[3], "DESIGNATOR|CONNUID|P%7C1|1")
+        # Renames come before records that address the new designators
+        self.assertGreater(lines.index("UPDATE_WIREPARAM|W1|PartNumber|X"), 3)
+
     async def test_add_harness_wiring_rejects_unknown_types(self):
         import main
         res = json.loads(await main.add_harness_wiring(
