@@ -2196,6 +2196,188 @@ begin
     Doc.SchIterator_Destroy(Iter);
 end;
 
+// First harness splice (83) on Doc with the given designator, or nil.
+function FindHarnessSplice(Doc: ISch_Document; Des: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(83));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (Obj.Designator <> nil) and (AnsiUpperCase(Obj.Designator.Text) = AnsiUpperCase(Des)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+function MinInt(A, B: Integer): Integer;
+begin
+    if (A < B) then Result := A else Result := B;
+end;
+
+function MaxInt(A, B: Integer): Integer;
+begin
+    if (A > B) then Result := A else Result := B;
+end;
+
+// First object of ObjId (twist 93, shield 92, cable 98) whose rectangle is
+// X1..X2 x Y1..Y2 (mils, normalised), or nil. Altium normalises the corners
+// only when it saves, so both corner orders match.
+function FindHarnessRect(Doc: ISch_Document; ObjId: Integer; X1, Y1, X2, Y2: Integer): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(ObjId));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (CoordToMils(MinInt(Obj.Location.X, Obj.Corner.X)) = X1) and
+           (CoordToMils(MinInt(Obj.Location.Y, Obj.Corner.Y)) = Y1) and
+           (CoordToMils(MaxInt(Obj.Location.X, Obj.Corner.X)) = X2) and
+           (CoordToMils(MaxInt(Obj.Location.Y, Obj.Corner.Y)) = Y2) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// First harness cable (98) on Doc with the given designator, or nil.
+// Cables have a designator object; twists and shields do not (reading it
+// is a runtime error).
+function FindHarnessCable(Doc: ISch_Document; Des: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(98));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (AnsiUpperCase(Obj.Designator.Text) = AnsiUpperCase(Des)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// First wire break (cross-sheet connector, 106) at X, Y mils, or nil.
+function FindWireBreakAt(Doc: ISch_Document; X, Y: Integer): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(106));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (CoordToMils(Obj.Location.X) = X) and (CoordToMils(Obj.Location.Y) = Y) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// Upsert the Name|Value pairs of Rec from field FirstField on.
+procedure ApplySpecParameters(Owner: ISch_BasicContainer; Rec: String; FirstField: Integer);
+var
+    fld : Integer;
+begin
+    fld := FirstField;
+    while (SpecField(Rec, fld) <> '') do
+    begin
+        UpsertSchParameter(Owner, SpecField(Rec, fld), SpecField(Rec, fld + 1));
+        fld := fld + 2;
+    end;
+end;
+
+// A harness part (81) as held by a cavity or as an associated part. Its
+// Comment is the part number (Altium's cavity table shows the Comment). The
+// description goes into the component description: Altium drops a
+// 'Description' parameter on these parts whenever it saves.
+function NewHarnessPart(PN, SrcLib, DbTbl, Desc: String): ISch_GraphicalObject;
+begin
+    Result := SchServer.SchObjectFactory(81, eCreate_Default);
+    if (Result = nil) then Exit;
+    Result.DesignItemId := PN;
+    UpsertSchParameter(Result, 'Comment', PN);
+    if (Result.Comment <> nil) then
+        Result.Comment.Text := PN;
+    if (SrcLib <> '') then
+        Result.SourceLibraryName := SrcLib;
+    if (DbTbl <> '') then
+        Result.DatabaseTableName := DbTbl;
+    if (Desc <> '') then
+        Result.ComponentDescription := Desc;
+end;
+
+// Put part PN into slot CavType (0 crimp, 1 seal, 2 plug, 3 other) of pin
+// PinDes on connector Conn; parameters are the Name|Value pairs of Rec from
+// field ParamField on. The first record for a slot in a run empties it, so
+// repeated runs never stack parts while one run can still put several
+// "other" parts into a cavity. An empty PN only empties the slot.
+// Returns False if the pin does not exist.
+function AddCavityPart(Conn: ISch_GraphicalObject; ConnDes, PinDes: String; CavType: Integer;
+    PN, SrcLib, DbTbl, Desc, Rec: String; ParamField: Integer; Cleared: TStringList): Boolean;
+var
+    ChildIter : ISch_Iterator;
+    Pin       : ISch_GraphicalObject;
+    Part      : ISch_GraphicalObject;
+    Key       : String;
+begin
+    Result := False;
+    ChildIter := Conn.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(88, ePin));
+    Pin := ChildIter.FirstSchObject;
+    while (Pin <> nil) do
+    begin
+        // Designator only: a pin NAME can equal another pin's number
+        if (Pin.Designator = PinDes) then Break;
+        Pin := ChildIter.NextSchObject;
+    end;
+    Conn.SchIterator_Destroy(ChildIter);
+    if (Pin = nil) then Exit;
+    Result := True;
+
+    Key := AnsiUpperCase(ConnDes + '.' + PinDes + '.' + IntToStr(CavType));
+    if (Cleared.IndexOf(Key) < 0) then
+    begin
+        Pin.RemoveAllOfType(CavType);
+        Cleared.Add(Key);
+    end;
+    if (PN = '') then Exit;
+
+    if (CavType = 0) then
+        UpsertSchParameter(Pin, 'Crimp', PN);
+    Part := NewHarnessPart(PN, SrcLib, DbTbl, Desc);
+    if (Part = nil) then Exit;
+    ApplySpecParameters(Part, Rec, ParamField);
+    Pin.AddItem(CavType, Part);
+end;
+
 // Add wires, splices, no-connect directives, and net labels to the current wiring diagram or schematic
 function ExecuteAddHarnessWiring(ROOT_DIR: String; SpecPath: String): String;
 var
@@ -2236,7 +2418,6 @@ var
     FoundComp     : ISch_Component;
     ReplicaComp   : ISch_Component;
     LastComp      : ISch_Component;
-    CavityComp    : ISch_Component;
     Prim          : ISch_GraphicalObject;
     Impl          : ISch_Implementation;
     PartDes       : String;
@@ -2264,6 +2445,20 @@ var
     CachedCompObj : ISch_GraphicalObject;
     MovedCount    : Integer;
     ParamCount    : Integer;
+    Cleared       : TStringList;
+    CavType       : Integer;
+    CavPartCount  : Integer;
+    AssocCount    : Integer;
+    TwistCount    : Integer;
+    ShieldCount   : Integer;
+    CableCount    : Integer;
+    BreakCount    : Integer;
+    UnchangedCount: Integer;
+    RX1, RY1      : Integer;
+    RX2, RY2      : Integer;
+    GeoChanged    : Boolean;
+    Relinked      : Boolean;
+    DocName       : String;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
@@ -2275,6 +2470,7 @@ begin
 
     Spec := TStringList.Create;
     Misses := TStringList.Create;
+    Cleared := TStringList.Create;
     try
         Spec.LoadFromFile(SpecPath);
         TargetDoc := nil;
@@ -2369,6 +2565,17 @@ begin
         LastComp := nil;
         CachedWireDes := '';
         CachedWireObj := nil;
+        CavPartCount := 0;
+        AssocCount := 0;
+        TwistCount := 0;
+        ShieldCount := 0;
+        CableCount := 0;
+        BreakCount := 0;
+        UnchangedCount := 0;
+        // Wire geometry changed: twists, shields, cables and wire breaks
+        // must then be linked again (see the reopen below)
+        GeoChanged := False;
+        Relinked := False;
 
         for i := 0 to Spec.Count - 1 do
         begin
@@ -2398,6 +2605,7 @@ begin
                     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
                     Obj.GraphicallyInvalidate;
                     MovedCount := MovedCount + 1;
+                    GeoChanged := True;
                 end;
             end
             else if (Kind = 'WIRE') then
@@ -2487,6 +2695,7 @@ begin
                         SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
                     WireCount := WireCount + 1;
                     LastWire := Obj;
+                    GeoChanged := True;
                 end;
             end
             else if (Kind = 'WIREPARAM') and (LastWire <> nil) then
@@ -2524,6 +2733,7 @@ begin
                     SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
                         SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
                     SpliceCount := SpliceCount + 1;
+                    GeoChanged := True;
                 end;
             end
             else if (Kind = 'NOCONNECT') then
@@ -2833,6 +3043,7 @@ begin
                     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
                     Obj.GraphicallyInvalidate;
                     WiresUpdated := WiresUpdated + 1;
+                    GeoChanged := True;
                 end;
             end
             else if (Kind = 'WIRECOLOR') then
@@ -2860,75 +3071,184 @@ begin
                 else
                     Obj.Color := StrToInt(SpecField(Rec, 2));
             end
-            else if (Kind = 'CAVITYCRIMP') then
+            else if (Kind = 'CAVITYCRIMP') or (Kind = 'CAVITYPART') then
             begin
-                // CAVITYCRIMP|<ConnDes>|<PinDes>|<CrimpPartNumber>[|<SourceLibraryName>[|<DatabaseTableName>]]
+                // CAVITYPART|<ConnDes>|<PinDes>|<Type 0-3>|<PartNumber>|<SourceLibraryName>|<DatabaseTableName>|<Description>[|Name|Value...]
+                //   type 0 crimp, 1 seal, 2 plug, 3 other; empty PartNumber = empty the slot
+                // CAVITYCRIMP|<ConnDes>|<PinDes>|<PartNumber>[|<SourceLibraryName>[|<DatabaseTableName>[|Name|Value...]]]
+                //   older form of a type 0 part
                 ConnDes := SpecField(Rec, 1);
                 PName   := SpecField(Rec, 2);
-                PVal    := SpecField(Rec, 3);
-                SrcLib  := SpecField(Rec, 4);
-                DbTbl   := SpecField(Rec, 5);
-                Obj := FindPlacedComponent(TargetDoc, ConnDes);
-                if (Obj = nil) then
-                    Misses.Add('connector:' + ConnDes)
+                if (Kind = 'CAVITYPART') then
+                begin
+                    CavType  := StrToInt(SpecField(Rec, 3));
+                    PVal     := SpecField(Rec, 4);
+                    SrcLib   := SpecField(Rec, 5);
+                    DbTbl    := SpecField(Rec, 6);
+                    PartDesc := SpecField(Rec, 7);
+                    fld := 8;
+                end
                 else
                 begin
-                    FoundOnSheet := False;
-                    ChildIter := Obj.SchIterator_Create;
-                    ChildIter.AddFilter_ObjectSet(MkSet(88, ePin));
-                    Prim := ChildIter.FirstSchObject;
-                    while (Prim <> nil) do
+                    CavType  := 0;
+                    PVal     := SpecField(Rec, 3);
+                    SrcLib   := SpecField(Rec, 4);
+                    DbTbl    := SpecField(Rec, 5);
+                    PartDesc := '';
+                    fld := 6;
+                end;
+                Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                if (Obj = nil) then
+                begin
+                    if (Misses.IndexOf('connector:' + ConnDes) < 0) then
+                        Misses.Add('connector:' + ConnDes);
+                end
+                else if not AddCavityPart(Obj, ConnDes, PName, CavType, PVal, SrcLib, DbTbl,
+                                          PartDesc, Rec, fld, Cleared) then
+                    Misses.Add('pin:' + ConnDes + '.' + PName)
+                else if (PVal <> '') then
+                begin
+                    CavPartCount := CavPartCount + 1;
+                    if (CavType = 0) then
+                        CrimpCount := CrimpCount + 1;
+                end;
+            end
+            else if (Kind = 'ASSOCPART') then
+            begin
+                // ASSOCPART|<Connector or splice designator>|<PartNumber>|<SourceLibraryName>|<DatabaseTableName>|<Description>[|Name|Value...]
+                // Boots, backshells, heat shrink... The first record for an
+                // owner in a run replaces its associated parts; an empty
+                // PartNumber only removes them.
+                ConnDes := SpecField(Rec, 1);
+                PVal    := SpecField(Rec, 2);
+                Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                if (Obj = nil) then
+                    Obj := FindHarnessSplice(TargetDoc, ConnDes);
+                if (Obj = nil) then
+                begin
+                    if (Misses.IndexOf('owner:' + ConnDes) < 0) then
+                        Misses.Add('owner:' + ConnDes);
+                end
+                else
+                begin
+                    if (Cleared.IndexOf('ASSOC:' + AnsiUpperCase(ConnDes)) < 0) then
                     begin
-                        // Designator only: a pin NAME can equal another pin's number
-                        if (Prim.Designator = PName) then
-                        begin
-                            FoundOnSheet := True;
-                            CrimpCount := CrimpCount + 1;
-                            UpsertSchParameter(Prim, 'Crimp', PVal);
-
-                            // The cavity's crimp slot (type 0) holds one
-                            // harness component carrying the terminal part.
-                            // AddItem/RemoveAllOfType/SetFirst come from the
-                            // undocumented cavity API, hence the guards.
-                            CavityComp := SchServer.SchObjectFactory(81, eCreate_Default);
-                            if (CavityComp <> nil) then
-                            begin
-                                CavityComp.DesignItemId := PVal;
-                                UpsertSchParameter(CavityComp, 'Comment', PVal);
-                                if (CavityComp.Comment <> nil) then
-                                    CavityComp.Comment.Text := PVal;
-                                if (SrcLib <> '') then
-                                    CavityComp.SourceLibraryName := SrcLib;
-                                if (DbTbl <> '') then
-                                    CavityComp.DatabaseTableName := DbTbl;
-                                // Optional |Name|Value pairs from field 6 on:
-                                // the terminal's database parameters
-                                fld := 6;
-                                while (SpecField(Rec, fld) <> '') do
-                                begin
-                                    UpsertSchParameter(CavityComp, SpecField(Rec, fld), SpecField(Rec, fld + 1));
-                                    fld := fld + 2;
-                                end;
-                                try
-                                    Prim.RemoveAllOfType(0);
-                                except
-                                end;
-                                try
-                                    Prim.AddItem(0, CavityComp);
-                                except
-                                    try
-                                        Prim.SetFirst(0, CavityComp);
-                                    except
-                                    end;
-                                end;
-                            end;
-                            Break;
-                        end;
-                        Prim := ChildIter.NextSchObject;
+                        Obj.RemoveAllAssociatedParts;
+                        Cleared.Add('ASSOC:' + AnsiUpperCase(ConnDes));
                     end;
-                    Obj.SchIterator_Destroy(ChildIter);
+                    if (PVal <> '') then
+                    begin
+                        Prim := NewHarnessPart(PVal, SpecField(Rec, 3), SpecField(Rec, 4), SpecField(Rec, 5));
+                        if (Prim <> nil) then
+                        begin
+                            ApplySpecParameters(Prim, Rec, 6);
+                            Obj.AddAssociatedPart(Prim);
+                            AssocCount := AssocCount + 1;
+                        end;
+                    end;
+                end;
+            end
+            else if (Kind = 'TWIST') or (Kind = 'SHIELD') or (Kind = 'CABLE') then
+            begin
+                // TWIST|x1|y1|x2|y2|<rotation 0-3>
+                // SHIELD|x1|y1|x2|y2|<rotation 0-3>|<style: 0 shield, 1 shield with connection>
+                // CABLE|x1|y1|x2|y2|<rotation 0-3>|<Designator>|<Comment>|<PartNumber>|<SourceLibraryName>[|Name|Value...]
+                // A rectangle across the wires; Altium links every wire it
+                // touches. An identical rectangle (or, for a cable, the same
+                // designator) is updated instead of placed again.
+                RX1 := MinInt(StrToInt(SpecField(Rec, 1)), StrToInt(SpecField(Rec, 3)));
+                RY1 := MinInt(StrToInt(SpecField(Rec, 2)), StrToInt(SpecField(Rec, 4)));
+                RX2 := MaxInt(StrToInt(SpecField(Rec, 1)), StrToInt(SpecField(Rec, 3)));
+                RY2 := MaxInt(StrToInt(SpecField(Rec, 2)), StrToInt(SpecField(Rec, 4)));
+                if (Kind = 'TWIST') then j := 93
+                else if (Kind = 'SHIELD') then j := 92
+                else j := 98;
+                Obj := nil;
+                if (j = 98) and (SpecField(Rec, 6) <> '') then
+                    Obj := FindHarnessCable(TargetDoc, SpecField(Rec, 6));
+                if (Obj = nil) then
+                    Obj := FindHarnessRect(TargetDoc, j, RX1, RY1, RX2, RY2);
+                FoundOnSheet := (Obj <> nil);
+                if FoundOnSheet then
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    UnchangedCount := UnchangedCount + 1;
+                end
+                else
+                    Obj := SchServer.SchObjectFactory(j, eCreate_Default);
+                if (Obj <> nil) then
+                begin
+                    // Only a new object or a changed rectangle, rotation or
+                    // shield style needs the links recomputed
                     if not FoundOnSheet then
-                        Misses.Add('pin:' + ConnDes + '.' + PName);
+                        GeoChanged := True
+                    else if (CoordToMils(MinInt(Obj.Location.X, Obj.Corner.X)) <> RX1) or
+                            (CoordToMils(MinInt(Obj.Location.Y, Obj.Corner.Y)) <> RY1) or
+                            (CoordToMils(MaxInt(Obj.Location.X, Obj.Corner.X)) <> RX2) or
+                            (CoordToMils(MaxInt(Obj.Location.Y, Obj.Corner.Y)) <> RY2) then
+                        GeoChanged := True
+                    else if (SpecField(Rec, 5) <> '') and (Obj.Orientation <> StrToInt(SpecField(Rec, 5))) then
+                        GeoChanged := True
+                    else if (j = 92) and (SpecField(Rec, 6) <> '') and (Obj.Style <> StrToInt(SpecField(Rec, 6))) then
+                        GeoChanged := True;
+                    Obj.Location := Point(MilsToCoord(RX1), MilsToCoord(RY1));
+                    Obj.Corner   := Point(MilsToCoord(RX2), MilsToCoord(RY2));
+                    if (SpecField(Rec, 5) <> '') then
+                        Obj.Orientation := StrToInt(SpecField(Rec, 5));
+                    if (j = 92) and (SpecField(Rec, 6) <> '') then
+                        Obj.Style := StrToInt(SpecField(Rec, 6));
+                    if (j = 98) then
+                    begin
+                        if (SpecField(Rec, 6) <> '') then
+                            Obj.Designator.Text := SpecField(Rec, 6);
+                        if (SpecField(Rec, 7) <> '') then
+                            Obj.Comment.Text := SpecField(Rec, 7);
+                        if (SpecField(Rec, 8) <> '') then
+                            Obj.DesignItemId := SpecField(Rec, 8);
+                        if (SpecField(Rec, 9) <> '') then
+                            Obj.SourceLibraryName := SpecField(Rec, 9);
+                    end;
+                    if FoundOnSheet then
+                    begin
+                        SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                        Obj.GraphicallyInvalidate;
+                    end
+                    else
+                    begin
+                        TargetDoc.RegisterSchObjectInContainer(Obj);
+                        SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    end;
+                    // Cable parameters (MPN, Description...); cables, unlike
+                    // cavity parts, keep a Description parameter
+                    if (j = 98) then
+                        ApplySpecParameters(Obj, Rec, 10);
+                    if (j = 93) then TwistCount := TwistCount + 1
+                    else if (j = 92) then ShieldCount := ShieldCount + 1
+                    else CableCount := CableCount + 1;
+                end;
+            end
+            else if (Kind = 'WIREBREAK') then
+            begin
+                // WIREBREAK|x|y - on a free wire end; it takes the wire's
+                // designator, and wires with the same designator on other
+                // sheets of the project become one connection
+                RX1 := StrToInt(SpecField(Rec, 1));
+                RY1 := StrToInt(SpecField(Rec, 2));
+                if (FindWireBreakAt(TargetDoc, RX1, RY1) <> nil) then
+                    UnchangedCount := UnchangedCount + 1
+                else
+                begin
+                    Obj := SchServer.SchObjectFactory(106, eCreate_Default);
+                    if (Obj <> nil) then
+                    begin
+                        Obj.Location := Point(MilsToCoord(RX1), MilsToCoord(RY1));
+                        TargetDoc.RegisterSchObjectInContainer(Obj);
+                        SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                        BreakCount := BreakCount + 1;
+                        GeoChanged := True;
+                    end;
                 end;
             end;
         end;
@@ -2944,6 +3264,40 @@ begin
         except
         end;
         Saved := not ServerDoc.Modified;
+        DocName := TargetDoc.DocumentName;
+
+        // Altium links twists, shields, cables and wire breaks to the wires
+        // under them (and drain wires to a shield's pin) only when it loads
+        // a wiring diagram; nothing else found recomputes them. So after a
+        // geometry change on a sheet that has such objects, close the saved
+        // document, open it again and save the recomputed links.
+        if Saved and GeoChanged and (AnsiUpperCase(ExtractFileExt(TargetDocPath)) = '.WIRDOC') then
+        begin
+            Iter := TargetDoc.SchIterator_Create;
+            Iter.AddFilter_ObjectSet(MkSet(92, 93, 98, 106));
+            Obj := Iter.FirstSchObject;
+            TargetDoc.SchIterator_Destroy(Iter);
+            if (Obj <> nil) then
+            begin
+                ResetParameters;
+                AddStringParameter('Action', 'Close');
+                AddStringParameter('FileName', TargetDocPath);
+                AddStringParameter('PromptToSave', 'False');
+                RunProcess('WorkspaceManager:CloseObject');
+                ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
+                if (ServerDoc <> nil) then
+                begin
+                    Client.ShowDocument(ServerDoc);
+                    ServerDoc.Modified := True;
+                    try
+                        ServerDoc.DoFileSave('');
+                    except
+                    end;
+                    Relinked := not ServerDoc.Modified;
+                end;
+                Saved := Relinked;
+            end;
+        end;
 
         InfoStr := '';
         for j := 0 to Misses.Count - 1 do
@@ -2960,11 +3314,19 @@ begin
             Result := Result + ', "saved": true'
         else
             Result := Result + ', "saved": false, "error": "document was not saved"';
-        Result := Result + ', "sheet": "' + JSONEscapeString(TargetDoc.DocumentName) +
+        Result := Result + ', "sheet": "' + JSONEscapeString(DocName) +
                   '", "wires": ' + IntToStr(WireCount) +
                   ', "wires_updated": ' + IntToStr(WiresUpdated) +
                   ', "parameters_set": ' + IntToStr(ParamCount) +
                   ', "crimps": ' + IntToStr(CrimpCount) +
+                  ', "cavity_parts": ' + IntToStr(CavPartCount) +
+                  ', "associated_parts": ' + IntToStr(AssocCount) +
+                  ', "twists": ' + IntToStr(TwistCount) +
+                  ', "shields": ' + IntToStr(ShieldCount) +
+                  ', "cables": ' + IntToStr(CableCount) +
+                  ', "wire_breaks": ' + IntToStr(BreakCount) +
+                  ', "already_placed": ' + IntToStr(UnchangedCount) +
+                  ', "relinked": ' + LowerCase(BoolToStr(Relinked, True)) +
                   ', "components_updated": ' + IntToStr(CompsUpdated) +
                   ', "connectors_moved": ' + IntToStr(MovedCount) +
                   ', "splices": ' + IntToStr(SpliceCount) +
@@ -2974,6 +3336,7 @@ begin
                   ', "rectangles": ' + IntToStr(RectCount) +
                   ', "not_found": [' + InfoStr + ']}';
     finally
+        Cleared.Free;
         Misses.Free;
         Spec.Free;
     end;

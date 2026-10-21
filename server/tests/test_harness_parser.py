@@ -134,6 +134,65 @@ class TestHarnessParser(unittest.TestCase):
         self.assertEqual(res["wires"][0]["design_item_id"], "WIRE-1")
         self.assertEqual([n["text"] for n in res["net_labels"]], ["Sheet note"])
 
+    def test_parse_harness_objects(self):
+        """Seal and associated part (written once, as Altium does for parts
+        added by script), twist, shield with drain wire, cable and wire break."""
+        from harness_parser import parse_wirdoc_records
+        recs = [
+            {"HEADER": "Protel for Windows - Harness"},
+            {"RECORD": "106", "LibReference": "CONN", "Location.X": "100", "Location.Y": "200", "UniqueID": "C1"},
+            {"RECORD": "34", "OwnerIndex": "0", "Name": "Designator", "Text": "P1"},
+            {"RECORD": "113", "OwnerIndex": "0", "Designator": "1", "Name": "SIG",
+             "Location.X": "100", "Location.Y": "200", "PinLength": "20", "UniqueID": "PIN1"},
+            {"RECORD": "131", "OwnerIndex": "2", "AssociatedObjectType": "1"},
+            {"RECORD": "106", "OwnerIndex": "3", "DesignItemId": "SEAL-1", "UniqueID": "K1",
+             "ComponentDescription": "Wire seal", "SourceLibraryName": "*"},
+            {"RECORD": "125", "OwnerIndex": "0"},
+            {"RECORD": "106", "OwnerIndex": "5", "DesignItemId": "BOOT-1", "UniqueID": "K2"},
+            # 7: wire W1, 9: drain wire W2
+            {"RECORD": "107", "LocationCount": "2", "X1": "0", "Y1": "800", "X2": "300", "Y2": "800", "UniqueID": "WA"},
+            {"RECORD": "34", "OwnerIndex": "7", "Name": "Designator", "Text": "W1"},
+            {"RECORD": "107", "LocationCount": "2", "X1": "0", "Y1": "770", "X2": "125", "Y2": "770", "UniqueID": "WB"},
+            {"RECORD": "34", "OwnerIndex": "9", "Name": "Designator", "Text": "W2"},
+            {"RECORD": "118", "Location.X": "50", "Location.Y": "780", "Corner.X": "60", "Corner.Y": "820",
+             "UniqueID": "TW", "ConnectedWiresUniqueIdsCount": "1", "ConnectedWireUniqueId1": "WA"},
+            {"RECORD": "117", "Location.X": "150", "Location.Y": "870", "Corner.X": "100", "Corner.Y": "770",
+             "Style": "1", "UniqueID": "SH", "ConnectedWiresUniqueIdsCount": "1", "ConnectedWireUniqueId1": "WA",
+             "ConnectedPinWiresUniqueIdsCount": "1", "ConnectedPinWireUniqueId1": "WB"},
+            {"RECORD": "123", "Location.X": "200", "Location.Y": "780", "Corner.X": "210", "Corner.Y": "820",
+             "DesignItemId": "CB-1", "UniqueID": "CA", "ConnectedWiresUniqueIdsCount": "1",
+             "ConnectedWireUniqueId1": "WA"},
+            {"RECORD": "34", "OwnerIndex": "13", "Name": "Designator", "Text": "C1"},
+            {"RECORD": "41", "OwnerIndex": "13", "Name": "Comment", "Text": "BELDEN"},
+            {"RECORD": "41", "OwnerIndex": "13", "Name": "MPN", "Text": "8771"},
+            {"RECORD": "130", "Location.X": "300", "Location.Y": "800", "Text": "W1",
+             "UniqueID": "BR", "ConnectedObjectUniqueId": "WA"},
+        ]
+        res = parse_wirdoc_records(recs, "sheet.WirDoc")
+        conn = res["connectors"][0]
+        self.assertEqual(conn["pins"][0]["cavity_parts"], [
+            {"type": "seal", "part_number": "SEAL-1", "source_library": "", "source_table": "",
+             "description": "Wire seal", "unique_id": "K1"}])
+        self.assertEqual([p["part_number"] for p in conn["associated_parts"]], ["BOOT-1"])
+        self.assertEqual(res["twists"][0]["wires"], ["W1"])
+        shield = res["shields"][0]
+        # corners normalised; pin in the middle of the bottom edge
+        self.assertEqual((shield["x1"], shield["y1"], shield["x2"], shield["y2"]), (100, 770, 150, 870))
+        self.assertEqual(shield["pin"], {"x": 125, "y": 770})
+        self.assertEqual(shield["drain_wires"], ["W2"])
+        cable = res["cables"][0]
+        self.assertEqual((cable["designator"], cable["comment"], cable["part_number"]), ("C1", "BELDEN", "CB-1"))
+        self.assertEqual(cable["parameters"], {"MPN": "8771"})
+        self.assertEqual(res["wire_breaks"][0]["wire"], "W1")
+        self.assertEqual(res["summary"]["shield_count"], 1)
+
+    def test_shield_pin_rotations(self):
+        from harness_parser import shield_pin
+        s = {"x1": 0, "y1": 0, "x2": 100, "y2": 40, "style": 1}
+        pins = [shield_pin({**s, "rotation": r}) for r in range(4)]
+        self.assertEqual(pins, [{"x": 50, "y": 0}, {"x": 100, "y": 20}, {"x": 50, "y": 40}, {"x": 0, "y": 20}])
+        self.assertIsNone(shield_pin({**s, "style": 0}))
+
     def test_decode_record_encodings(self):
         from harness_parser import _decode_record
         # Bytes as Altium writes them: plain field cp1252 with 0x8E for '|',
@@ -551,8 +610,91 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         from altium_files import read_altium_text
         spec = read_altium_text(self.spec_file)
         lines = spec.splitlines()
-        self.assertIn("CAVITYCRIMP|P1|1|13065S|my-components.DbLib|terminals-db.csv", lines)
-        self.assertIn("CAVITYCRIMP|P1|2|13065S", lines)
+        # Crimps are cavity parts of type 0
+        self.assertIn("CAVITYPART|P1|1|0|13065S|my-components.DbLib|terminals-db.csv|", lines)
+        self.assertIn("CAVITYPART|P1|2|0|13065S|||", lines)
+
+    async def test_add_harness_wiring_harness_objects_serialization(self):
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            cavity_parts=[
+                {"connector": "P1", "pin": "3", "type": "seal", "part_number": "S-1",
+                 "source_table": "seals.csv",
+                 "parameters": {"Description": "Wire seal", "Color": "Green"}},
+                {"connector": "P1", "pin": "4", "type": "plug", "part_number": ""},
+                {"connector": "P1", "pin": "4", "type": 3, "part_number": "O-1"},
+            ],
+            associated_parts=[{"owner": "SP1", "part_number": "HS-1", "description": "Heat shrink"}],
+            twists=[{"x1": 100, "y1": 200, "x2": 50, "y2": 400}],
+            shields=[{"x1": 0, "y1": 0, "x2": 500, "y2": 1000, "style": "with_connection",
+                      "rotation": 1}],
+            cables=[{"designator": "C1", "x1": 0, "y1": 0, "x2": 10, "y2": 10,
+                     "comment": "BELDEN 8771", "part_number": "8771",
+                     "parameters": {"Manufacturer": "Belden"}, "description": "Cable"}],
+            wire_breaks=[{"x": 14700, "y": 7700}],
+        )
+        lines = read_altium_text(self.spec_file).splitlines()
+        # The description is never a parameter on cavity / associated parts
+        self.assertIn("CAVITYPART|P1|3|1|S-1||seals.csv|Wire seal|Color|Green", lines)
+        self.assertIn("CAVITYPART|P1|4|2||||", lines)
+        self.assertIn("CAVITYPART|P1|4|3|O-1|||", lines)
+        self.assertIn("ASSOCPART|SP1|HS-1|||Heat shrink", lines)
+        self.assertIn("TWIST|100|200|50|400|", lines)
+        self.assertIn("SHIELD|0|0|500|1000|1|1", lines)
+        self.assertIn(
+            "CABLE|0|0|10|10||C1|BELDEN 8771|8771||Manufacturer|Belden|Description|Cable", lines
+        )
+        self.assertIn("WIREBREAK|14700|7700", lines)
+
+    async def test_add_harness_wiring_rejects_unknown_types(self):
+        import main
+        res = json.loads(await main.add_harness_wiring(
+            None, document_path=r"C:\test\sheet.WirDoc",
+            cavity_parts=[{"connector": "P1", "pin": "1", "type": "gasket", "part_number": "X"}],
+        ))
+        self.assertFalse(res["success"])
+        self.assertIn("gasket", res["error"])
+        res = json.loads(await main.add_harness_wiring(
+            None, document_path=r"C:\test\sheet.WirDoc",
+            shields=[{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "style": "braided"}],
+        ))
+        self.assertFalse(res["success"])
+        self.mock_bridge.assert_not_called()
+
+    async def test_add_harness_wiring_reports_links_from_file(self):
+        """Links are read back from the saved file: a rectangle that links no
+        wire, or a break on no wire, is not_found."""
+        import main
+        self.mock_bridge.return_value = {
+            "success": True,
+            "result": {"success": True, "saved": True, "not_found": []},
+        }
+        saved = {
+            "twists": [{"x1": 10, "y1": 20, "x2": 20, "y2": 60, "wires": ["W1", "W2"]}],
+            "shields": [{"x1": 0, "y1": 0, "x2": 50, "y2": 100, "style": 1, "rotation": 0,
+                         "wires": [], "drain_wires": [], "pin": {"x": 25.0, "y": 0}}],
+            "cables": [],
+            "wire_breaks": [{"x": 1470, "y": 770, "wire": "W3"}],
+        }
+        with patch("main.parse_wirdoc", return_value=saved):
+            res = json.loads(await main.add_harness_wiring(
+                None, document_path=r"C:\test\sheet.WirDoc",
+                twists=[{"x1": 200, "y1": 600, "x2": 100, "y2": 200}],
+                shields=[{"x1": 0, "y1": 0, "x2": 500, "y2": 1000, "style": 1}],
+                wire_breaks=[{"x": 14700, "y": 7700}, {"x": 0, "y": 0}],
+            ))
+        self.assertEqual(res["links"]["twists"][0]["wires"], ["W1", "W2"])
+        self.assertEqual(res["links"]["shields"][0]["pin_mils"], [250.0, 0])
+        self.assertEqual(res["links"]["wire_breaks"][0]["wire"], "W3")
+        self.assertEqual(
+            res["not_found"],
+            ["shield@0,0,500,1000 (links no wire)", "wire_break@0,0 (no wire end there)"],
+        )
+        self.assertFalse(res["success"])
 
     async def test_add_harness_wiring_requires_document_path(self):
         import main
@@ -659,10 +801,11 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("WIRECOLOR|W1|0", lines)
         # [Library Ref] is a system field, not a parameter
         self.assertFalse(any("|Library Ref|" in l for l in lines))
-        crimp = [l for l in lines if l.startswith("CAVITYCRIMP|")]
+        crimp = [l for l in lines if l.startswith("CAVITYPART|")]
+        # Description column -> component description, never a parameter
         self.assertEqual(
             crimp,
-            ["CAVITYCRIMP|P1|1|T-1|lib.DbLib|terms.csv|PartNumber|T-1|Description|Socket|Manufacturer 1|Acme"],
+            ["CAVITYPART|P1|1|0|T-1|lib.DbLib|terms.csv|Socket|PartNumber|T-1|Manufacturer 1|Acme"],
         )
         self.assertEqual(res["unresolved"][0]["designator"], "W2")
         self.assertFalse(res["success"])
@@ -705,6 +848,72 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines, ["UPDATE_COMPPARAM|P1|Max Operating Temperature|105°C"])
         self.assertEqual(res["connectors_refreshed"], {"P1": ["Max Operating Temperature"]})
         self.assertTrue(res["success"])
+
+    async def test_sync_harness_library_cavity_slots_associated_parts_and_cables(self):
+        import tempfile
+
+        import main
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "parts.csv").write_text(
+            "PartNumber,Description,Manufacturer 1\n"
+            "T-1,Socket,Acme\nS-1,Seal,Acme\nPL-1,Plug,Acme\nB-1,Boot,Acme\nCB-1,Cable 2C,Acme\n",
+            encoding="utf-8",
+        )
+        (tmp / "lib.DbLib").write_text(
+            "[DatabaseLinks]\n"
+            "ConnectionString=Provider=MSDASQL.1;Extended Properties=\"Driver={Microsoft Access "
+            "Text Driver (*.txt, *.csv)};Dbq=Z:\\missing\\;Extensions=csv;\"\n"
+            "[Table1]\nTableName=parts.csv\nEnabled=True\n",
+            encoding="utf-8",
+        )
+        doc = tmp / "h.WirDoc"
+        doc.write_bytes(b"")
+        fake = {
+            "wires": [],
+            "connectors": [
+                {"designator": "P1", "parameters": {}, "associated_parts": [], "pins": [
+                    # current seal kept and refreshed, crimp replaced by the map
+                    {"designator": "1", "cavity_parts": [
+                        {"type": "crimp", "part_number": "OLD"},
+                        {"type": "seal", "part_number": "S-1"}]},
+                    # unknown "other" part: that slot is left alone
+                    {"designator": "2", "cavity_parts": [
+                        {"type": "other", "part_number": "NOPE"}]},
+                    {"designator": "3", "cavity_parts": [
+                        {"type": "plug", "part_number": "PL-1"}]},
+                ]},
+            ],
+            "splices": [{"designator": "SP1", "associated_parts": [{"part_number": "B-1"}]}],
+            "cables": [{"designator": "C1", "x1": 100, "y1": 200, "x2": 110, "y2": 250,
+                        "part_number": "CB-1"}],
+        }
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        with patch("main.parse_wirdoc", return_value=fake):
+            res = json.loads(await main.sync_harness_library(
+                None, document_path=str(doc),
+                cavity_map={"P1": {"1": "T-1", "3": {"plug": []}}},
+                associated_map={"P1": ["B-1"]},
+            ))
+        from altium_files import read_altium_text
+        lines = read_altium_text(self.spec_file).splitlines()
+        cav = [l for l in lines if l.startswith("CAVITYPART|")]
+        self.assertEqual(cav, [
+            "CAVITYPART|P1|1|0|T-1|lib.DbLib|parts.csv|Socket|PartNumber|T-1|Manufacturer 1|Acme",
+            "CAVITYPART|P1|1|1|S-1|lib.DbLib|parts.csv|Seal|PartNumber|S-1|Manufacturer 1|Acme",
+            "CAVITYPART|P1|3|2||||",
+        ])
+        assoc = [l for l in lines if l.startswith("ASSOCPART|")]
+        self.assertEqual(assoc, [
+            "ASSOCPART|P1|B-1|lib.DbLib|parts.csv|Boot|PartNumber|B-1|Manufacturer 1|Acme",
+            "ASSOCPART|SP1|B-1|lib.DbLib|parts.csv|Boot|PartNumber|B-1|Manufacturer 1|Acme",
+        ])
+        # Cables keep a Description parameter; the rectangle comes back in mils
+        self.assertIn(
+            "CABLE|1000|2000|1100|2500||C1||CB-1|lib.DbLib|PartNumber|CB-1|Description|Cable 2C"
+            "|Manufacturer 1|Acme",
+            lines,
+        )
+        self.assertEqual(res["unresolved"], [{"designator": "P1.2", "reason": "part 'NOPE' not in database"}])
 
     async def test_add_harness_wiring_sheet_style_only_when_asked(self):
         import main

@@ -98,6 +98,41 @@ def _coord(props: dict[str, str], key: str) -> int | float:
     return whole + frac / 100000 if frac else whole
 
 
+# AssociatedObjectType of a cavity container (RECORD 131); omitted for crimps
+CAVITY_PART_TYPES = {0: "crimp", 1: "seal", 2: "plug", 3: "other"}
+# Wire-crossing harness objects: RECORD -> output key
+RECT_OBJECTS = {"117": "shields", "118": "twists", "123": "cables"}
+
+
+def _text(props: dict[str, str], key: str) -> str:
+    """Field value, with Altium's '*' (not set) as empty."""
+    value = props.get(key, "")
+    return "" if value == "*" else value
+
+
+def _uid_list(props: dict[str, str], count_key: str, item_key: str) -> list[str]:
+    count = int(props.get(count_key, 0) or 0)
+    return [
+        props[f"{item_key}{i}"] for i in range(1, count + 1) if f"{item_key}{i}" in props
+    ]
+
+
+def shield_pin(shield: dict[str, Any]) -> dict[str, float] | None:
+    """Connection pin of a "shield with connection" (style 1), where a drain
+    wire ends: the middle of the bottom edge, turned with the rotation
+    (1 right edge, 2 top, 3 left). None for a plain shield."""
+    if shield.get("style") != 1:
+        return None
+    x1, y1, x2, y2 = shield["x1"], shield["y1"], shield["x2"], shield["y2"]
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    return [
+        {"x": cx, "y": y1},
+        {"x": x2, "y": cy},
+        {"x": cx, "y": y2},
+        {"x": x1, "y": cy},
+    ][shield.get("rotation", 0) % 4]
+
+
 def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
     """Parse an Altium Harness Wiring Diagram (.WirDoc) or Layout Drawing (.LdrDoc).
 
@@ -128,16 +163,58 @@ def parse_wirdoc_records(
     net_labels: list[dict[str, Any]] = []
     pins_by_index: dict[int, dict[str, Any]] = {}
     # Components nested in pin cavities (RECORD 106 owned by a RECORD 131
-    # cavity container owned by the pin), resolved after the first pass
+    # cavity container owned by the pin) or attached to a connector/splice
+    # (106 in a RECORD 125 container), resolved after the first pass
     cavity_parts: list[tuple[int, dict[str, str]]] = []
+    # Twists, shields, cables (rectangles across wires) and wire breaks
+    rect_objects: dict[int, dict[str, Any]] = {}
+    wire_breaks: list[dict[str, Any]] = []
 
     # First pass: collect connectors, wires, splices, parameters, pins, and net labels
     for idx, props in enumerate(records):
         rtype = props.get("RECORD")
 
         if rtype == "106" and "OwnerIndex" in props:
-            # Crimp/seal/plug in a cavity, not a placed connector
+            # Crimp/seal/plug in a cavity or an associated part, not a placed connector
             cavity_parts.append((int(props["OwnerIndex"]), props))
+        elif rtype in RECT_OBJECTS and "OwnerIndex" not in props:
+            xa, xb = _coord(props, "Location.X"), _coord(props, "Corner.X")
+            ya, yb = _coord(props, "Location.Y"), _coord(props, "Corner.Y")
+            obj: dict[str, Any] = {
+                "kind": RECT_OBJECTS[rtype],
+                "x1": min(xa, xb),
+                "y1": min(ya, yb),
+                "x2": max(xa, xb),
+                "y2": max(ya, yb),
+                "rotation": int(props.get("Rotation", 0) or 0),
+                "unique_id": props.get("UniqueID", ""),
+                "wire_uids": _uid_list(
+                    props, "ConnectedWiresUniqueIdsCount", "ConnectedWireUniqueId"
+                ),
+                "parameters": {},
+            }
+            if rtype == "117":
+                obj["style"] = int(props.get("Style", 0) or 0)
+                obj["drain_wire_uids"] = _uid_list(
+                    props, "ConnectedPinWiresUniqueIdsCount", "ConnectedPinWireUniqueId"
+                )
+            if rtype == "123":
+                obj["designator"] = ""
+                obj["comment"] = ""
+                obj["part_number"] = _text(props, "DesignItemId")
+                obj["source_library"] = _text(props, "SourceLibraryName")
+            rect_objects[idx] = obj
+        elif rtype == "130":  # Wire break (cross-sheet connector)
+            wire_breaks.append(
+                {
+                    "designator": props.get("Text", ""),
+                    "x": _coord(props, "Location.X"),
+                    "y": _coord(props, "Location.Y"),
+                    "unique_id": props.get("UniqueID", ""),
+                    "wire_uid": props.get("ConnectedObjectUniqueId", ""),
+                    "wire": None,
+                }
+            )
         elif rtype == "106":  # Harness Connector
             connectors[idx] = {
                 "index": idx,
@@ -152,6 +229,7 @@ def parse_wirdoc_records(
                 "unique_id": props.get("UniqueID", ""),
                 "pins": [],
                 "parameters": {},
+                "associated_parts": [],
             }
         elif rtype == "107":  # Harness Wire
             count = int(props.get("LocationCount", 0))
@@ -193,6 +271,7 @@ def parse_wirdoc_records(
                 "unique_id": props.get("UniqueID", ""),
                 "connected_wires_count": conn_count,
                 "connected_wire_uids": conn_wire_uids,
+                "associated_parts": [],
             }
         elif rtype == "119":  # Harness No-Connect
             no_connects_list.append(
@@ -224,6 +303,14 @@ def parse_wirdoc_records(
                     wires_dict[owner]["parameters"][name] = val
             elif owner in splices_dict and name == "Designator" and val:
                 splices_dict[owner]["designator"] = val
+            elif owner in rect_objects and name:
+                obj = rect_objects[owner]
+                value = "" if val == "*" else val
+                if name in ("Designator", "Comment"):
+                    if "designator" in obj:  # cables only
+                        obj[name.lower()] = value
+                else:
+                    obj["parameters"][name] = value
         elif rtype == "113":  # Harness Connector Pin
             owner = int(props.get("OwnerIndex", -1))
             if owner in connectors:
@@ -288,24 +375,67 @@ def parse_wirdoc_records(
                     }
                 )
 
-    # Cavity contents: 106 -> 131 cavity container -> 113 pin. Altium writes
-    # each cavity component twice with the same UniqueID; keep one.
+    # Cavity contents: 106 -> 131 cavity container (AssociatedObjectType =
+    # slot) -> 113 pin; associated parts: 106 -> 125 -> connector 106 or
+    # splice 108. Altium writes each crimp twice with the same UniqueID;
+    # keep one.
     for container_idx, props in cavity_parts:
         container = records[container_idx] if container_idx < len(records) else {}
-        pin = pins_by_index.get(int(container.get("OwnerIndex", -1)))
-        if pin is None:
+        owner_idx = int(container.get("OwnerIndex", -1))
+        if container.get("RECORD") == "125":
+            owner = connectors.get(owner_idx) or splices_dict.get(owner_idx)
+            parts = owner["associated_parts"] if owner else None
+            part_type = None
+        else:
+            pin = pins_by_index.get(owner_idx)
+            parts = pin["cavity_parts"] if pin else None
+            part_type = CAVITY_PART_TYPES.get(
+                int(container.get("AssociatedObjectType", 0) or 0), "other"
+            )
+        if parts is None:
             continue
         uid = props.get("UniqueID", "")
-        if any(p["unique_id"] == uid for p in pin["cavity_parts"]):
+        if any(p["unique_id"] == uid for p in parts):
             continue
-        pin["cavity_parts"].append(
-            {
-                "part_number": props.get("DesignItemId", ""),
-                "source_library": props.get("SourceLibraryName", ""),
-                "source_table": props.get("DatabaseTableName", ""),
-                "unique_id": uid,
-            }
+        part = {
+            "part_number": _text(props, "DesignItemId"),
+            "source_library": _text(props, "SourceLibraryName"),
+            "source_table": _text(props, "DatabaseTableName"),
+            "description": _text(props, "ComponentDescription"),
+            "unique_id": uid,
+        }
+        if part_type is not None:
+            part = {"type": part_type, **part}
+        parts.append(part)
+
+    # Wires linked to twists/shields/cables and wire breaks, by designator
+    wire_des_by_uid = {w["unique_id"]: w["designator"] for w in wires_dict.values()}
+    rect_lists: dict[str, list[dict[str, Any]]] = {k: [] for k in RECT_OBJECTS.values()}
+    for obj in rect_objects.values():
+        obj["wires"] = [wire_des_by_uid.get(u, u) for u in obj.pop("wire_uids")]
+        if "drain_wire_uids" in obj:
+            obj["drain_wires"] = [
+                wire_des_by_uid.get(u, u) for u in obj.pop("drain_wire_uids")
+            ]
+            obj["pin"] = shield_pin(obj)
+        rect_lists[obj.pop("kind")].append(obj)
+    for brk in wire_breaks:
+        wire = next(
+            (
+                w
+                for w in wires_dict.values()
+                if w["unique_id"] == brk["wire_uid"]
+                or brk["unique_id"] in (w["end_vertex1_conn_uid"], w["end_vertex2_conn_uid"])
+                or (
+                    len(w["points"]) >= 4
+                    and (brk["x"], brk["y"])
+                    in ((w["points"][0], w["points"][1]), (w["points"][-2], w["points"][-1]))
+                )
+            ),
+            None,
         )
+        brk["wire"] = wire["designator"] if wire else None
+        brk.pop("wire_uid")
 
     # Resolve comment if "=PartNumber" or empty
     for c in connectors.values():
@@ -476,10 +606,18 @@ def parse_wirdoc_records(
             "connected_pins": connected_pins,
             "net_label_count": len(net_labels),
             "unique_net_count": len(unique_nets),
+            "twist_count": len(rect_lists["twists"]),
+            "shield_count": len(rect_lists["shields"]),
+            "cable_count": len(rect_lists["cables"]),
+            "wire_break_count": len(wire_breaks),
         },
         "connectors": connector_list,
         "wires": wires_list,
         "splices": splices_list,
+        "twists": rect_lists["twists"],
+        "shields": rect_lists["shields"],
+        "cables": sorted(rect_lists["cables"], key=lambda c: c["designator"]),
+        "wire_breaks": wire_breaks,
         "no_connects": no_connects_list,
         "net_labels": net_labels,
         "nets": unique_nets,
