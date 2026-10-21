@@ -667,6 +667,45 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["unresolved"][0]["designator"], "W2")
         self.assertFalse(res["success"])
 
+    async def test_sync_harness_library_refreshes_connector_parameters(self):
+        import tempfile
+
+        import main
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "conns.csv").write_text(
+            "PartNumber,Description,Max Operating Temperature,Gender\n"
+            "C-1,Housing,105°C,Female\n",
+            encoding="utf-8",
+        )
+        (tmp / "lib.DbLib").write_text(
+            "[DatabaseLinks]\n"
+            "ConnectionString=Provider=MSDASQL.1;Extended Properties=\"Driver={Microsoft Access "
+            "Text Driver (*.txt, *.csv)};Dbq=Z:\\missing\\;Extensions=csv;\"\n"
+            "[Table1]\nTableName=conns.csv\nEnabled=True\n",
+            encoding="utf-8",
+        )
+        doc = tmp / "h.WirDoc"
+        doc.write_bytes(b"")
+        fake = {
+            "wires": [],
+            "connectors": [
+                # mangled value -> refreshed; equal value -> untouched; Gender not
+                # placed on the connector -> not added
+                {"designator": "P1", "pins": [], "parameters": {
+                    "PartNumber": "C-1", "Description": "Housing",
+                    "Max Operating Temperature": "105Â°C"}},
+                {"designator": "P9", "pins": [], "parameters": {}},
+            ],
+        }
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        with patch("main.parse_wirdoc", return_value=fake):
+            res = json.loads(await main.sync_harness_library(None, document_path=str(doc)))
+        from altium_files import read_altium_text
+        lines = [l for l in read_altium_text(self.spec_file).splitlines() if l.startswith("UPDATE_COMPPARAM|")]
+        self.assertEqual(lines, ["UPDATE_COMPPARAM|P1|Max Operating Temperature|105°C"])
+        self.assertEqual(res["connectors_refreshed"], {"P1": ["Max Operating Temperature"]})
+        self.assertTrue(res["success"])
+
     async def test_add_harness_wiring_sheet_style_only_when_asked(self):
         import main
         from altium_files import read_altium_text

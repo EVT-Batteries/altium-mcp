@@ -2259,6 +2259,9 @@ var
     Saved         : Boolean;
     WiresUpdated  : Integer;
     CrimpCount    : Integer;
+    CompsUpdated  : Integer;
+    CachedCompDes : String;
+    CachedCompObj : ISch_GraphicalObject;
     MovedCount    : Integer;
     ParamCount    : Integer;
 begin
@@ -2351,6 +2354,9 @@ begin
 
         WiresUpdated := 0;
         CrimpCount := 0;
+        CompsUpdated := 0;
+        CachedCompDes := '';
+        CachedCompObj := nil;
         MovedCount := 0;
         ParamCount := 0;
         WireCount := 0;
@@ -2729,6 +2735,33 @@ begin
                 UpsertSchParameter(LastComp, PName, PVal);
                 ParamCount := ParamCount + 1;
             end
+            else if (Kind = 'UPDATE_COMPPARAM') then
+            begin
+                // UPDATE_COMPPARAM|<ComponentDesignator>|<ParamName>|<ParamValue>
+                // Upserts a parameter on an already placed connector/component.
+                ConnDes := SpecField(Rec, 1);
+                PName   := SpecField(Rec, 2);
+                PVal    := SpecField(Rec, 3);
+                if (CachedCompObj <> nil) and (AnsiUpperCase(CachedCompDes) = AnsiUpperCase(ConnDes)) then
+                    Obj := CachedCompObj
+                else
+                begin
+                    Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                    if (Obj <> nil) then
+                    begin
+                        CachedCompDes := ConnDes;
+                        CachedCompObj := Obj;
+                        CompsUpdated := CompsUpdated + 1;
+                    end
+                    else if (Misses.IndexOf('connector:' + ConnDes) < 0) then
+                        Misses.Add('connector:' + ConnDes);
+                end;
+                if (Obj <> nil) then
+                begin
+                    UpsertSchParameter(Obj, PName, PVal);
+                    ParamCount := ParamCount + 1;
+                end;
+            end
             else if (Kind = 'UPDATE_WIREPARAM') then
             begin
                 // UPDATE_WIREPARAM|<WireDesignator>|<ParamName>|<ParamValue>
@@ -2932,6 +2965,7 @@ begin
                   ', "wires_updated": ' + IntToStr(WiresUpdated) +
                   ', "parameters_set": ' + IntToStr(ParamCount) +
                   ', "crimps": ' + IntToStr(CrimpCount) +
+                  ', "components_updated": ' + IntToStr(CompsUpdated) +
                   ', "connectors_moved": ' + IntToStr(MovedCount) +
                   ', "splices": ' + IntToStr(SpliceCount) +
                   ', "no_connects": ' + IntToStr(NcCount) +

@@ -2045,6 +2045,7 @@ async def add_harness_wiring(
     wire_updates: list | None = None,
     reroutes: list | None = None,
     cavity_crimps: list | None = None,
+    component_updates: list | None = None,
     clear_existing: bool = False,
     sheet_style: str | None = None,
 ) -> str:
@@ -2106,6 +2107,8 @@ async def add_harness_wiring(
             [{"connector": "P1", "pin": "1", "terminal": "64900613722DEC",
               "source_library": "my.DbLib", "source_table": "terminals-db.csv",
               "parameters": {"Description": "...", "Manufacturer 1": "..."}}]
+        component_updates (list): Parameters to upsert on placed connectors/components, e.g.:
+            [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"}}]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
             and harness no-connects (only those) before adding new ones. Defaults to False.
         sheet_style (str, optional): Change the sheet size, e.g. "D" or "A3". Left unchanged
@@ -2310,6 +2313,11 @@ async def add_harness_wiring(
                 fields.pop()
         lines.append(_spec_line(*fields))
 
+    for cu in component_updates or []:
+        c_des = str(cu.get("designator", "")).strip()
+        for pk, pv in _param_pairs(cu.get("parameters")):
+            lines.append(_spec_line("UPDATE_COMPPARAM", c_des, pk, pv))
+
     # Spec file and command under one hold of the bridge: another server
     # process must not replace the spec between writing and running it
     try:
@@ -2457,6 +2465,7 @@ async def _sync_harness_from_library(
     library: Any,
     sync_wires: bool,
     sync_cavities: bool,
+    sync_connectors: bool,
     wire_designator_map: dict | None,
     cavity_map: dict | None,
     color_map: dict | None,
@@ -2577,12 +2586,39 @@ async def _sync_harness_from_library(
                 {"designator": f"{conn}.{pin}", "reason": "pin not found on the sheet"}
             )
 
-    if wire_updates or cavity_crimps:
+    # Connectors were placed from the DbLib by Altium itself, so they already
+    # carry the database columns as parameters. Refresh only those that exist
+    # and differ (e.g. values mangled by an earlier wrong CSV encoding); never
+    # add parameters Altium did not place.
+    component_updates = []
+    if sync_connectors:
+        for c in doc_data.get("connectors", []):
+            current = c.get("parameters", {})
+            part_num = current.get("PartNumber")
+            if not part_num:
+                continue
+            found = library.find(part_num)
+            if found is None:
+                unresolved.append(
+                    {"designator": c["designator"], "reason": f"PartNumber {part_num!r} not in database"}
+                )
+                continue
+            table, row = found
+            changed = {
+                name: value
+                for name, value in table.parameters(row).items()
+                if name in current and current[name] != value
+            }
+            if changed:
+                component_updates.append({"designator": c["designator"], "parameters": changed})
+
+    if wire_updates or cavity_crimps or component_updates:
         res_str = await add_harness_wiring(
             ctx,
             document_path=target_path,
             wire_updates=wire_updates,
             cavity_crimps=cavity_crimps,
+            component_updates=component_updates,
         )
         try:
             res_json = json.loads(res_str)
@@ -2597,6 +2633,7 @@ async def _sync_harness_from_library(
         "source_library": src_lib,
         "wires_synced_count": res_json.get("wires_updated", len(wire_updates)),
         "cavities_synced_count": res_json.get("crimps", len(cavity_crimps)),
+        "connectors_refreshed": {u["designator"]: sorted(u["parameters"]) for u in component_updates},
         "unresolved": unresolved,
         "warnings": warnings,
         "altium_response": res_json,
@@ -2610,6 +2647,7 @@ async def sync_harness_library(
     dblib_path: str | None = None,
     wires: bool = True,
     cavities: bool = True,
+    connectors: bool = True,
     wire_designator_map: dict | None = None,
     cavity_map: dict | None = None,
     color_map: dict | None = None,
@@ -2633,6 +2671,8 @@ async def sync_harness_library(
             found walking up from the document (in each folder and up to two levels below).
         wires: Sync harness wires (default True).
         cavities: Sync cavity terminals (default True).
+        connectors: Refresh placed connectors' existing database parameters whose values differ
+            from the database row (default True; Altium's "Update Parameters From Database").
         wire_designator_map: Wire designator -> part number, e.g. {"W1": "5875 BK005"}.
         cavity_map: Terminals to assign: {connector: {pin: part number}}, e.g.
             {"J1": {"1": "1060-20-0122"}}.
@@ -2665,6 +2705,7 @@ async def sync_harness_library(
         library,
         sync_wires=wires,
         sync_cavities=cavities,
+        sync_connectors=connectors,
         wire_designator_map=wire_designator_map,
         cavity_map=cavity_map,
         color_map=color_map,
@@ -2741,6 +2782,7 @@ async def sync_harness_wires(
         library,
         sync_wires=True,
         sync_cavities=False,
+        sync_connectors=False,
         wire_designator_map=wire_designator_map,
         cavity_map=None,
         color_map=color_map,
