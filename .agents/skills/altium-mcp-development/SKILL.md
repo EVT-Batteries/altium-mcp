@@ -113,6 +113,24 @@ Finally, for anything visual (routing, labels, graphics) take a screenshot of th
   script pauses in Altium's debugger, nothing comes back, and every later script silently does
   nothing. Recover with: `"<Altium install>\X2.EXE" -REditScript:Stop` (Altium's path is in
   `~/.altium-mcp/config.json` as `altium_exe_path`).
+- **Recovery is automatic; ask the user only when it fails.** When a sandbox run fails, and
+  when a production command times out, the server unblocks the executor itself
+  (`_recover_script_executor`). It runs `EditScript:Stop`, then presses Ctrl+F3 in the Altium
+  window (sent with scan codes, because Altium ignores virtual-key-only input), and checks
+  after each step with a trivial script. Look at the result:
+  - `executor_wedged: false` with `recovery` "Recovered automatically (stop|ctrl_f3)": the
+    executor is free. Fix your script before rerunning it.
+  - `executor_wedged: true`: both steps failed. **Do not retry.** Pass the `recovery` text on
+    to the user (focus the stuck script tab and press Ctrl+F3, close an open Altium dialog, or
+    restart Altium), and do non-Altium work while you wait.
+
+  After an Altium "Error" box the sandbox stops waiting about 3 s later rather than running to
+  its timeout. It reports dialog texts where Windows exposes them (`dismissed_dialog_texts`);
+  Altium's own themed message boxes don't expose theirs, so only their titles are reported.
+- Sandbox compile errors block the executor too: use only the declared scratch variables
+  (`S1..S3`, `I1..I3`, `B1`, `Obj1..Obj5`; there is no `Obj6`).
+- Within one `.pas` unit, define a function above its first caller; calling one defined further
+  down pauses the script at runtime.
 - Prototype unknown API calls with the `run_altium_script` sandbox first. Log a step before each
   risky statement (`SandboxLog('...')`); the last logged step tells you what died. Create your own
   `TStringList` objects rather than relying on provided ones. No inline variable declarations.

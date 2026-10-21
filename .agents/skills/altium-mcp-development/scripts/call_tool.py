@@ -5,7 +5,8 @@ Usage (with the server's venv python):
     python call_tool.py <tool_name> @kwargs.json
     python call_tool.py <tool_name>                 # no arguments
 
-Prints the tool's return value. Uses the same code path as the MCP tool
+Prints the tool's return value; images (get_screenshot) are saved as PNG files in
+the system temp folder and their paths printed. Uses the same code path as the MCP tool
 (validation, spec encoding, bridge lock), so it is safe alongside a running
 server: the bridge lock makes the two take turns.
 """
@@ -13,6 +14,8 @@ server: the bridge lock makes the two take turns.
 import asyncio
 import json
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 SERVER = Path(__file__).resolve().parents[4] / "server"
@@ -35,4 +38,12 @@ if __name__ == "__main__":
     tool = getattr(main, sys.argv[1], None)
     if tool is None or not asyncio.iscoroutinefunction(tool):
         sys.exit(f"no async tool function {sys.argv[1]!r} in {SERVER / 'main.py'}")
-    print(asyncio.run(tool(None, **_kwargs(sys.argv[2] if len(sys.argv) > 2 else None))))
+    result = asyncio.run(tool(None, **_kwargs(sys.argv[2] if len(sys.argv) > 2 else None)))
+    for item in result if isinstance(result, list) else [result]:
+        data = getattr(item, "data", None)
+        if isinstance(data, bytes):
+            out = Path(tempfile.gettempdir()) / f"altium_mcp_{sys.argv[1]}_{time.time_ns()}.png"
+            out.write_bytes(data)
+            print(f"image saved: {out}")
+        else:
+            print(item)

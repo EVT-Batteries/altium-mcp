@@ -376,9 +376,21 @@ class AltiumBridge:
 
             if not RESPONSE_FILE.exists():
                 logger.error("Timeout waiting for response from Altium")
+                # Usually the script paused in the debugger, which blocks
+                # every later call until it is stopped
+                # Tools pass only "error" on, so the outcome goes into it
+                recovery = await _recover_script_executor()
+                if recovery["recovered"]:
+                    detail = (
+                        f"script engine unblocked automatically ({recovery['method']}); "
+                        "the command did not complete, check its document before retrying"
+                    )
+                else:
+                    detail = recovery["ask_user"]
                 return {
                     "success": False,
-                    "error": "No response received from Altium (timeout)",
+                    "error": f"No response received from Altium (timeout); {detail}",
+                    "executor_wedged": not recovery["recovered"],
                 }
 
             # Read the response file and print it for debugging
@@ -1404,9 +1416,10 @@ def _dismiss_altium_dialogs():
     the Altium process (X2.EXE) are touched, so dialogs of other applications
     are never closed.
 
-    Returns (handle, class name, title) of the windows that were closed, so
-    the caller can tell the user (a closed dialog may have been one the user
-    had open).
+    Returns (handle, class name, title, text) of the windows that were closed,
+    so the caller can tell the user (a closed dialog may have been one the
+    user had open). text is the message of a Win32 dialog; Altium's own
+    TMessageForm draws its message without a window, so its text is ''.
     """
     try:
         import ctypes
@@ -1437,13 +1450,130 @@ def _dismiss_altium_dialogs():
             return True
         if _window_process_name(hwnd).lower() != "x2.exe":
             return True
-        found.append((hwnd, cls.value, title))
+        found.append((hwnd, cls.value, title, _dialog_text(hwnd)))
         return True
 
     user32.EnumWindows(cb, 0)
-    for h, _, _ in found:
+    for h, *_ in found:
         user32.PostMessageW(h, 0x0010, 0, 0)
     return found
+
+
+def _dialog_text(hwnd) -> str:
+    """Text of a dialog's static controls (the message of a #32770 box)."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    parts = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(child, lparam):
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(child, cls, 64)
+        if cls.value == "Static":
+            n = user32.GetWindowTextLengthW(child)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(child, buf, n + 1)
+            if buf.value.strip():
+                parts.append(buf.value.strip())
+        return True
+
+    user32.EnumChildWindows(hwnd, cb, 0)
+    return "\n".join(parts)
+
+
+def _altium_main_window():
+    """Handle of Altium's main frame (largest visible X2.EXE window titled
+    "Altium Designer"), or None."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    best = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, lparam):
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+            return True
+        n = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        if "Altium Designer" not in buf.value:
+            return True
+        if _window_process_name(hwnd).lower() != "x2.exe":
+            return True
+        r = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        best.append(((r.right - r.left) * (r.bottom - r.top), hwnd))
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return max(best)[1] if best else None
+
+
+def _send_ctrl_f3() -> bool:
+    """Press Ctrl+F3 (Run » Stop, stops a paused script) in Altium's main
+    window. Keys carry scan codes: Altium ignores virtual-key-only events.
+    Returns False when Altium could not be brought to the front, in which case
+    nothing is typed (the keys would go to another application)."""
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    hwnd = _altium_main_window()
+    if not hwnd:
+        return False
+    # A synthetic Alt press lets a background process take the foreground
+    user32.keybd_event(0x12, 0, 0, 0)
+    user32.keybd_event(0x12, 0, 2, 0)
+    user32.SetForegroundWindow(hwnd)
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        time.sleep(0.1)
+        fg = user32.GetForegroundWindow()
+        if fg and _window_process_name(fg).lower() == "x2.exe":
+            break
+    else:
+        return False
+    for vk, flags in ((0x11, 0), (0x72, 0), (0x72, 2), (0x11, 2)):  # Ctrl, F3
+        user32.keybd_event(vk, user32.MapVirtualKeyW(vk, 0), flags, 0)
+        time.sleep(0.05)
+    return True
+
+
+async def _script_engine_responds() -> bool:
+    """True when Altium runs a trivial sandbox script to its end."""
+    result = json.loads(await _run_sandbox("ResultText := 'pong';", 20, recover=False))
+    return result.get("success") is True and result.get("result") == "pong"
+
+
+async def _recover_script_executor() -> dict[str, Any]:
+    """Unblock Altium's script engine after a script paused in the debugger
+    or a run that never started. Tries EditScript:Stop, then Ctrl+F3 in the
+    Altium window, checking after each with a trivial script. The caller holds
+    the bridge lock.
+
+    Returns {"recovered": bool, "method": "stop" | "ctrl_f3" | None}; when
+    nothing worked, "ask_user" holds what to ask the user to do.
+    """
+    _dismiss_altium_dialogs()
+    exe = altium_bridge.config.altium_exe_path
+    subprocess.run(f'"{exe}" -REditScript:Stop', shell=True)
+    await asyncio.sleep(2)
+    if await _script_engine_responds():
+        return {"recovered": True, "method": "stop"}
+    if _send_ctrl_f3():
+        await asyncio.sleep(2)
+        if await _script_engine_responds():
+            return {"recovered": True, "method": "ctrl_f3"}
+    return {
+        "recovered": False,
+        "method": None,
+        "ask_user": "Altium's script engine is still blocked after EditScript:Stop and "
+        "Ctrl+F3. Stop retrying and ask the user to focus the stuck script tab in "
+        "Altium and press Ctrl+F3 (Run » Stop), close any open Altium dialog, or "
+        "restart Altium; then try again.",
+    }
 
 
 @mcp.tool()
@@ -1459,7 +1589,10 @@ async def run_altium_script(
     runtime error leaves the script PAUSED IN THE DEBUGGER with no dialog,
     after which every later script run silently does nothing until the
     debugger is stopped (Ctrl+F3) or Altium is restarted. This tool detects
-    that state and reports exactly which statement died.
+    that state, reports exactly which statement died, and then unblocks the
+    executor itself (EditScript:Stop, then Ctrl+F3 in the Altium window,
+    each checked with a trivial script). If both fail, "executor_wedged"
+    stays true and "recovery" says what to ask the user: do not retry then.
 
     The script runs in a SEPARATE script project, so a crash here can never
     break the other MCP tools.
@@ -1488,9 +1621,10 @@ async def run_altium_script(
         timeout_seconds (int): How long to wait for completion (default 120).
 
     Returns:
-        str: JSON with success, the step log, the script's ResultText, and on
-             failure the last step reached plus whether Altium's script
-             executor is now wedged and needs recovery.
+        str: JSON with success, the step log, the script's ResultText, the
+             dialogs it closed (titles, and texts where Windows exposes them),
+             and on failure the last step reached, whether the executor is
+             still wedged after the automatic recovery, and "recovery".
     """
     logger.info(f"run_altium_script: {len(script.splitlines())} lines")
 
@@ -1503,7 +1637,7 @@ async def run_altium_script(
         return await _run_sandbox(script, timeout_seconds)
 
 
-async def _run_sandbox(script: str, timeout_seconds: int) -> str:
+async def _run_sandbox(script: str, timeout_seconds: int, recover: bool = True) -> str:
     # The tracked SandboxScript/ files are a template: each run works on a
     # copy in the exchange folder, so running scripts never dirties the repo.
     work_dir = EXCHANGE_DIR / "sandbox"
@@ -1554,50 +1688,36 @@ async def _run_sandbox(script: str, timeout_seconds: int) -> str:
     # Keyed by window: a dialog that ignores WM_CLOSE (Yes/No boxes do) is
     # found again on every pass and must be reported once
     dismissed = {}
+    error_seen_at = None
     while not SANDBOX_RESULT.exists() and time.time() - start < timeout_seconds:
         await asyncio.sleep(0.5)
         if time.time() - start > 6:
-            for h, c, t in _dismiss_altium_dialogs():
-                dismissed[h] = (c, t)
+            for h, c, t, text in _dismiss_altium_dialogs():
+                dismissed[h] = (c, t, text)
+                if t == "Error" and error_seen_at is None:
+                    error_seen_at = time.time()
+        # Altium's error box means the script died or never started: no
+        # result is coming, so stop waiting soon after it
+        if error_seen_at and time.time() - error_seen_at > 3:
+            break
 
     dialogs = list(dismissed.values())
-    titles = [t for _, t in dialogs]
+    titles = [t for _, t, _ in dialogs]
+    texts = [text for _, _, text in dialogs if text]
     steps = []
     if SANDBOX_LOG.exists():
         steps = read_altium_text(SANDBOX_LOG).splitlines()
+    report = {"dialogs_dismissed": len(dialogs), "dismissed_dialog_titles": titles}
+    if texts:
+        report["dismissed_dialog_texts"] = texts
 
     if SANDBOX_RESULT.exists():
         result_text = read_altium_text(SANDBOX_RESULT).strip()
         return json.dumps(
-            {
-                "success": True,
-                "result": result_text,
-                "steps": steps,
-                "dialogs_dismissed": len(dialogs),
-                "dismissed_dialog_titles": titles,
-            },
-            indent=2,
+            {"success": True, "result": result_text, "steps": steps, **report}, indent=2
         )
 
-    if steps:
-        return json.dumps(
-            {
-                "success": False,
-                "error": "script started but did not finish",
-                "last_step_reached": steps[-1],
-                "diagnosis": "The statement AFTER the last step is what crashed or paused the script.",
-                "executor_wedged": True,
-                "recovery": "Altium's script executor is now blocked. Recover by running this "
-                "shell command (sends the debugger Stop process to the running "
-                'Altium): "<altium_exe>" -REditScript:Stop  -- then retry.',
-                "steps": steps,
-                "dialogs_dismissed": len(dialogs),
-                "dismissed_dialog_titles": titles,
-            },
-            indent=2,
-        )
-
-    if any(c == "TForm_RunScriptParameters" for c, _ in dialogs):
+    if any(c == "TForm_RunScriptParameters" for c, _, _ in dialogs):
         return json.dumps(
             {
                 "success": False,
@@ -1606,27 +1726,42 @@ async def _run_sandbox(script: str, timeout_seconds: int) -> str:
                 "Run' instead, so it cannot open that path. The script executor is "
                 "not wedged.",
                 "executor_wedged": False,
-                "dialogs_dismissed": len(dialogs),
-                "dismissed_dialog_titles": titles,
+                **report,
             },
             indent=2,
         )
 
-    return json.dumps(
-        {
+    if steps:
+        failure = {
+            "success": False,
+            "error": "script started but did not finish",
+            "last_step_reached": steps[-1],
+            "diagnosis": "The statement AFTER the last step is what crashed or paused the script.",
+            "steps": steps,
+        }
+    else:
+        failure = {
             "success": False,
             "error": "script never started",
-            "diagnosis": "Usually a COMPILE error in the script, or a previously paused "
-            "script blocking execution.",
-            "executor_wedged": True,
-            "recovery": "A previously paused script may be blocking execution. Recover by "
-            'running this shell command: "<altium_exe>" -REditScript:Stop  '
-            "-- then retry. If it still fails, the script itself has a COMPILE error.",
-            "dialogs_dismissed": len(dialogs),
-            "dismissed_dialog_titles": titles,
-        },
-        indent=2,
-    )
+            "diagnosis": "Usually a COMPILE error in the script (e.g. an undeclared "
+            "variable), or a previously paused script blocking execution.",
+        }
+    failure.update(report)
+    if not recover:
+        failure["executor_wedged"] = True
+        return json.dumps(failure, indent=2)
+    # A paused script blocks every later run: unblock it here rather than
+    # leaving the caller to retry against a wedged executor
+    recovery = await _recover_script_executor()
+    failure["executor_wedged"] = not recovery["recovered"]
+    if recovery["recovered"]:
+        failure["recovery"] = (
+            f"Recovered automatically ({recovery['method']}); the executor is free. "
+            "Fix the script before running it again."
+        )
+    else:
+        failure["recovery"] = recovery["ask_user"]
+    return json.dumps(failure, indent=2)
 
 
 @mcp.tool()
@@ -4043,7 +4178,7 @@ async def get_screenshot(
             is_sch_match = wanted_kind == "SCH" and focused_kind in (
                 "SCH",
                 "HARNESSWIRINGDIAGRAM",
-                "HARNESSLAYOUT",
+                "HARNESSLAYOUTDRAWING",
             )
             is_pcb_match = wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB")
             if wanted_kind and focused_kind and not (is_sch_match or is_pcb_match):

@@ -131,6 +131,69 @@ begin
         Result := Copy(S, FieldStart, Length(S) - FieldStart + 1);
 end;
 
+// A file path in one canonical spelling for comparisons: lower case,
+// backslashes, and doubled separators collapsed (a leading \\ of a UNC path
+// is kept)
+function NormalizedPath(Path: String): String;
+var
+    Lead : String;
+begin
+    Result := LowerCase(StringReplace(Trim(Path), '/', '\', REPLACEALL));
+    Lead := '';
+    if (Copy(Result, 1, 2) = '\\') then
+    begin
+        Lead := '\\';
+        Result := Copy(Result, 3, Length(Result));
+    end;
+    while (Pos('\\', Result) > 0) do
+        Result := StringReplace(Result, '\\', '\', REPLACEALL);
+    Result := Lead + Result;
+end;
+
+// The Client.OpenDocument kind for a schematic-editor document: harness
+// wiring diagrams and layout drawings do not open as 'SCH'
+function SchDocumentKind(Path: String): String;
+begin
+    if (AnsiUpperCase(ExtractFileExt(Path)) = '.WIRDOC') then
+        Result := 'HarnessWiringDiagram'
+    else if (AnsiUpperCase(ExtractFileExt(Path)) = '.LDRDOC') then
+        Result := 'HarnessLayoutDrawing'
+    else
+        Result := 'SCH';
+end;
+
+// True for a schematic-editor document kind other than a plain schematic
+function IsHarnessDocumentKind(Kind: String): Boolean;
+begin
+    Result := (AnsiUpperCase(Kind) = 'HARNESSWIRINGDIAGRAM') or
+              (AnsiUpperCase(Kind) = 'HARNESSLAYOUTDRAWING');
+end;
+
+// The open document for a file, or nil. Paths are compared case-
+// insensitively with separators normalised: Client.IsDocumentOpen misses a
+// path spelled differently, and the file would be opened a second time.
+function FindOpenDocument(Path: String): IServerDocument;
+var
+    i, j   : Integer;
+    Module : IServerModule;
+    Want   : String;
+begin
+    Result := nil;
+    Want := NormalizedPath(Path);
+    for i := 0 to Client.Count - 1 do
+    begin
+        Module := Client.ServerModule[i];
+        if (Module <> nil) then
+            for j := 0 to Module.DocumentCount - 1 do
+                if (NormalizedPath(Module.Documents[j].FileName) = Want) or
+                   (ExtractFileName(NormalizedPath(Module.Documents[j].FileName)) = Want) then
+                begin
+                    Result := Module.Documents[j];
+                    Exit;
+                end;
+    end;
+end;
+
 // Modify the EnsureDocumentFocused function to handle all document types
 // and return more detailed information.
 // ViewTypeHint is only consulted by commands that can target more than one
@@ -266,8 +329,8 @@ begin
         if (Client.CurrentView <> Nil) and (Client.CurrentView.OwnerDocument <> Nil) then
         begin
             if (Client.CurrentView.OwnerDocument.Kind = 'SCH') or 
-               (Client.CurrentView.OwnerDocument.Kind = 'HarnessWiringDiagram') or
-               (AnsiUpperCase(ExtractFileExt(Client.CurrentView.OwnerDocument.FileName)) = '.WIRDOC') then
+               IsHarnessDocumentKind(Client.CurrentView.OwnerDocument.Kind) or
+               (SchDocumentKind(Client.CurrentView.OwnerDocument.FileName) <> 'SCH') then
             begin
                 Result := True;
                 Exit;
@@ -327,12 +390,17 @@ begin
       Begin
         Doc := Project.DM_LogicalDocuments(I);
         If (Doc.DM_DocumentKind = DocumentKind) or 
-           ((DocumentKind = 'SCH') and ((Doc.DM_DocumentKind = 'HarnessWiringDiagram') or 
-                                        (AnsiUpperCase(ExtractFileExt(Doc.DM_FullPath)) = '.WIRDOC'))) Then
+           ((DocumentKind = 'SCH') and (IsHarnessDocumentKind(Doc.DM_DocumentKind) or 
+                                        (SchDocumentKind(Doc.DM_FullPath) <> 'SCH'))) Then
         Begin
             DocFound := True;
-            if AnsiUpperCase(ExtractFileExt(Doc.DM_FullPath)) = '.WIRDOC' then
-                CurrentDoc := Client.OpenDocument('HarnessWiringDiagram', Doc.DM_FullPath)
+            if SchDocumentKind(Doc.DM_FullPath) <> 'SCH' then
+            begin
+                // FindOpenDocument first: re-opening reloads it from disk
+                CurrentDoc := FindOpenDocument(Doc.DM_FullPath);
+                if (CurrentDoc = nil) then
+                    CurrentDoc := Client.OpenDocument(SchDocumentKind(Doc.DM_FullPath), Doc.DM_FullPath);
+            end
             else
                 CurrentDoc := Client.OpenDocument(Doc.DM_DocumentKind, Doc.DM_FullPath);
             if CurrentDoc <> nil then Client.ShowDocument(CurrentDoc)
@@ -405,7 +473,7 @@ begin
                         // Exact extensions: '.SCH' as a substring also
                         // matched .SchLib, '.PCB' matched .PcbLib.
                         if (DocumentKind = 'SCH') and ((AnsiUpperCase(ExtractFileExt(CurrentDoc.FileName)) = '.SCHDOC') or
-                                                       (AnsiUpperCase(ExtractFileExt(CurrentDoc.FileName)) = '.WIRDOC')) then
+                                                       (SchDocumentKind(CurrentDoc.FileName) <> 'SCH')) then
                         begin
                             DocFound := True;
                             Client.ShowDocument(CurrentDoc);
@@ -544,8 +612,8 @@ begin
 
     if (DocType = 'SCH') and (Client <> nil) and (Client.CurrentView <> nil) and (Client.CurrentView.OwnerDocument <> nil) then
     begin
-        if (Pos('.WIR', AnsiUpperCase(Client.CurrentView.OwnerDocument.FileName)) = 0) and
-           (AnsiUpperCase(Client.CurrentView.OwnerDocument.Kind) <> 'HARNESSWIRINGDIAGRAM') then
+        if (SchDocumentKind(Client.CurrentView.OwnerDocument.FileName) = 'SCH') and
+           not IsHarnessDocumentKind(Client.CurrentView.OwnerDocument.Kind) then
         begin
             try
                 ResetParameters;
@@ -948,50 +1016,6 @@ begin
                 Exit;
             end;
         end;
-    end;
-end;
-
-// A file path in one canonical spelling for comparisons: lower case,
-// backslashes, and doubled separators collapsed (a leading \\ of a UNC path
-// is kept)
-function NormalizedPath(Path: String): String;
-var
-    Lead : String;
-begin
-    Result := LowerCase(StringReplace(Trim(Path), '/', '\', REPLACEALL));
-    Lead := '';
-    if (Copy(Result, 1, 2) = '\\') then
-    begin
-        Lead := '\\';
-        Result := Copy(Result, 3, Length(Result));
-    end;
-    while (Pos('\\', Result) > 0) do
-        Result := StringReplace(Result, '\\', '\', REPLACEALL);
-    Result := Lead + Result;
-end;
-
-// The open document for a file, or nil. Paths are compared case-
-// insensitively with separators normalised: Client.IsDocumentOpen misses a
-// path spelled differently, and the file would be opened a second time.
-function FindOpenDocument(Path: String): IServerDocument;
-var
-    i, j   : Integer;
-    Module : IServerModule;
-    Want   : String;
-begin
-    Result := nil;
-    Want := NormalizedPath(Path);
-    for i := 0 to Client.Count - 1 do
-    begin
-        Module := Client.ServerModule[i];
-        if (Module <> nil) then
-            for j := 0 to Module.DocumentCount - 1 do
-                if (NormalizedPath(Module.Documents[j].FileName) = Want) or
-                   (ExtractFileName(NormalizedPath(Module.Documents[j].FileName)) = Want) then
-                begin
-                    Result := Module.Documents[j];
-                    Exit;
-                end;
     end;
 end;
 

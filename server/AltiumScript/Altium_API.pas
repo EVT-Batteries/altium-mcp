@@ -214,10 +214,7 @@ begin
             ServerDoc := FindOpenDocument(DocPath);
             if (ServerDoc = nil) then
             begin
-                if AnsiUpperCase(ExtractFileExt(DocPath)) = '.WIRDOC' then
-                    ServerDoc := Client.OpenDocument('HarnessWiringDiagram', DocPath)
-                else
-                    ServerDoc := Client.OpenDocument('SCH', DocPath);
+                ServerDoc := Client.OpenDocument(SchDocumentKind(DocPath), DocPath);
             end;
             if (ServerDoc <> nil) then
             begin
