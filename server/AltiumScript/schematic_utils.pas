@@ -3656,3 +3656,521 @@ begin
     end;
 end;
 
+// Text of the designator child (ObjectId 25) of a layout object, or ''.
+// Connection points have no Designator property (reading it is a runtime
+// error), so all layout objects are read through the child.
+function ChildDesignatorText(Obj: ISch_GraphicalObject): String;
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+begin
+    Result := '';
+    ChildIter := Obj.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(25));
+    Prim := ChildIter.FirstSchObject;
+    Obj.SchIterator_Destroy(ChildIter);
+    if (Prim <> nil) then Result := Prim.Text;
+end;
+
+// Layout drawing object - connector (81), layout label (84), connection
+// point (85), bundle (86) or covering (104) - from a spec reference: its
+// UniqueId, or 'DES:<designator>' for one created earlier in the same run.
+function FindLayoutObject(Doc: ISch_Document; Ref: String): ISch_GraphicalObject;
+var
+    Iter  : ISch_Iterator;
+    Obj   : ISch_GraphicalObject;
+    ByDes : Boolean;
+    Key   : String;
+begin
+    Result := nil;
+    if (Ref = '') then Exit;
+    ByDes := (Copy(Ref, 1, 4) = 'DES:');
+    if ByDes then
+        Key := AnsiUpperCase(Copy(Ref, 5, Length(Ref) - 4))
+    else
+        Key := Ref;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(81, 84, 85, 86, 104));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if ByDes then
+        begin
+            if (Obj.ObjectId <> 81) and (AnsiUpperCase(ChildDesignatorText(Obj)) = Key) then
+            begin
+                Result := Obj;
+                Break;
+            end;
+        end
+        else if (Obj.UniqueId = Key) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// Move the designator child of Obj to X, Y mils.
+procedure PlaceChildDesignator(Obj: ISch_GraphicalObject; X, Y: Integer);
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+begin
+    ChildIter := Obj.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(25));
+    Prim := ChildIter.FirstSchObject;
+    Obj.SchIterator_Destroy(ChildIter);
+    if (Prim = nil) then Exit;
+    SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    Prim.Location := Point(MilsToCoord(X), MilsToCoord(Y));
+    SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+end;
+
+// Vertices of a bundle from the x|y pairs of Rec from field FirstField on.
+procedure SetBundleVertices(Obj: ISch_GraphicalObject; Rec: String; FirstField: Integer);
+var
+    n, k : Integer;
+begin
+    n := 0;
+    while (SpecField(Rec, FirstField + 2 * n) <> '') do
+        n := n + 1;
+    if (n < 2) then Exit;
+    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, FirstField))),
+                          MilsToCoord(StrToInt(SpecField(Rec, FirstField + 1))));
+    Obj.VerticesCount := n;
+    for k := 1 to n do
+        Obj.Vertex[k] := Point(MilsToCoord(StrToInt(SpecField(Rec, FirstField + 2 * (k - 1)))),
+                               MilsToCoord(StrToInt(SpecField(Rec, FirstField + 2 * (k - 1) + 1))));
+end;
+
+// Create, edit, move and delete harness layout drawing (.LdrDoc) objects:
+// connectors, connection points, bundles, coverings and layout labels.
+// Spec records (built by harness_layout.build_layout_spec; mils, lengths in
+// internal coords, '' = keep; references are UniqueIds or 'DES:<designator>'):
+//   DOCUMENT|path
+//   DELETE|uid
+//   CONNECTOR|uid|x|y|orientation 0-3|mirrored 1/0
+//   CPOINT|uid or ''|designator|x|y|style|show_name|orientation|des_x|des_y
+//   CPASSIGN|cp ref|object uid       CPUNASSIGN|cp uid|object uid
+//   BUNDLE|uid or ''|designator|comment|length or AUTO|break|line_width|x1|y1|...
+//   COVERING|uid or ''|designator|part|library|thickness|start|end|item ref|...
+//   LABEL|uid or ''|designator|text|x|y|orientation|alignment|first_line|part|library
+// Altium connects bundle ends to connection points by position when it loads
+// a drawing, so after geometry changes the saved drawing is closed, opened
+// again and saved.
+function ExecuteEditHarnessLayout(SpecPath: String): String;
+var
+    Spec         : TStringList;
+    Misses       : TStringList;
+    Rec, Kind, F : String;
+    DocPath      : String;
+    DocName      : String;
+    i, fld       : Integer;
+    ServerDoc    : IServerDocument;
+    Doc          : ISch_Document;
+    Obj, Item    : ISch_GraphicalObject;
+    IsNew        : Boolean;
+    Saved        : Boolean;
+    Reloaded     : Boolean;
+    GeoChanged   : Boolean;
+    Deleted      : Integer;
+    ConnMoved    : Integer;
+    CpCreated    : Integer;
+    CpUpdated    : Integer;
+    Assigned     : Integer;
+    BunCreated   : Integer;
+    BunUpdated   : Integer;
+    CovCreated   : Integer;
+    CovUpdated   : Integer;
+    LblCreated   : Integer;
+    LblUpdated   : Integer;
+    InfoStr      : String;
+begin
+    Result := '{"success": false, "error": "layout edit did not run"}';
+    if not FileExists(SpecPath) then
+    begin
+        Result := '{"success": false, "error": "spec file not found: ' + JSONEscapeString(SpecPath) + '"}';
+        Exit;
+    end;
+
+    Spec := TStringList.Create;
+    Misses := TStringList.Create;
+    try
+        Spec.LoadFromFile(SpecPath);
+        DocPath := '';
+        for i := 0 to Spec.Count - 1 do
+            if (SpecField(Spec[i], 0) = 'DOCUMENT') then
+                DocPath := StringReplace(SpecField(Spec[i], 1), '/', '\', REPLACEALL);
+        if (DocPath = '') then
+        begin
+            Result := '{"success": false, "error": "no DOCUMENT given; document_path is required"}';
+            Exit;
+        end;
+
+        // FindOpenDocument first: Client.OpenDocument on an open document
+        // reloads it from disk and discards unsaved changes.
+        ServerDoc := FindOpenDocument(DocPath);
+        if (ServerDoc = nil) then
+            ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
+        Doc := nil;
+        if (ServerDoc <> nil) then
+        begin
+            Client.ShowDocument(ServerDoc);
+            Doc := SchServer.GetSchDocumentByPath(DocPath);
+        end;
+        if (Doc = nil) or (NormalizedPath(Doc.DocumentName) <> NormalizedPath(DocPath)) then
+        begin
+            Result := '{"success": false, "error": "could not open requested document: ' + JSONEscapeString(DocPath) + '"}';
+            Exit;
+        end;
+
+        Deleted := 0;
+        ConnMoved := 0;
+        CpCreated := 0;
+        CpUpdated := 0;
+        Assigned := 0;
+        BunCreated := 0;
+        BunUpdated := 0;
+        CovCreated := 0;
+        CovUpdated := 0;
+        LblCreated := 0;
+        LblUpdated := 0;
+        GeoChanged := False;
+        Reloaded := False;
+
+        SchServer.ProcessControl.PreProcess(Doc, '');
+        for i := 0 to Spec.Count - 1 do
+        begin
+            Rec := Spec[i];
+            Kind := SpecField(Rec, 0);
+            if (Kind = 'DELETE') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId = 81) then
+                    Misses.Add('delete:' + SpecField(Rec, 1))
+                else
+                begin
+                    Obj.GraphicallyInvalidate;
+                    Doc.RemoveSchObject(Obj);
+                    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    Deleted := Deleted + 1;
+                    GeoChanged := True;
+                end;
+            end
+            else if (Kind = 'CONNECTOR') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 81) then
+                    Misses.Add('connector:' + SpecField(Rec, 1))
+                else
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    F := SpecField(Rec, 5);
+                    if (F <> '') and ((F = '1') <> Obj.IsMirrored) then
+                        Obj.Mirror(Obj.Location);
+                    // MoveToXY: the connector's views and texts travel with it
+                    Obj.MoveToXY(MilsToCoord(StrToInt(SpecField(Rec, 2))), MilsToCoord(StrToInt(SpecField(Rec, 3))));
+                    if (SpecField(Rec, 4) <> '') then
+                        Obj.Orientation := StrToInt(SpecField(Rec, 4));
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    Obj.GraphicallyInvalidate;
+                    ConnMoved := ConnMoved + 1;
+                    GeoChanged := True;
+                end;
+            end
+            else if (Kind = 'CPOINT') then
+            begin
+                IsNew := (SpecField(Rec, 1) = '');
+                if IsNew then
+                begin
+                    Obj := SchServer.SchObjectFactory(85, eCreate_Default);
+                    if (Obj <> nil) then
+                    begin
+                        Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 3))), MilsToCoord(StrToInt(SpecField(Rec, 4))));
+                        Doc.RegisterSchObjectInContainer(Obj);
+                        SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    end;
+                end
+                else
+                    Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 85) then
+                    Misses.Add('connection_point:' + SpecField(Rec, 1) + SpecField(Rec, 2))
+                else
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    // MoveToXY, not Location: the designator travels with it
+                    if (not IsNew) and (SpecField(Rec, 3) <> '') then
+                    begin
+                        Obj.MoveToXY(MilsToCoord(StrToInt(SpecField(Rec, 3))), MilsToCoord(StrToInt(SpecField(Rec, 4))));
+                        GeoChanged := True;
+                    end;
+                    if (SpecField(Rec, 5) <> '') then
+                        Obj.SetState_Style(StrToInt(SpecField(Rec, 5)));
+                    if (SpecField(Rec, 6) <> '') then
+                        Obj.SetState_ShowName(SpecField(Rec, 6) = '1');
+                    if (SpecField(Rec, 7) <> '') then
+                        Obj.SetState_Orientation(StrToInt(SpecField(Rec, 7)));
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    if (SpecField(Rec, 2) <> '') then
+                        if not SetChildDesignator(Obj, SpecField(Rec, 2)) then
+                            Misses.Add('connection_point_designator:' + SpecField(Rec, 2));
+                    if (SpecField(Rec, 8) <> '') then
+                        PlaceChildDesignator(Obj, StrToInt(SpecField(Rec, 8)), StrToInt(SpecField(Rec, 9)));
+                    Obj.GraphicallyInvalidate;
+                    if IsNew then
+                    begin
+                        CpCreated := CpCreated + 1;
+                        GeoChanged := True;
+                    end
+                    else
+                        CpUpdated := CpUpdated + 1;
+                end;
+            end
+            else if (Kind = 'CPASSIGN') or (Kind = 'CPUNASSIGN') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 85) then
+                    Misses.Add(LowerCase(Kind) + ':' + SpecField(Rec, 1))
+                else
+                begin
+                    if (Kind = 'CPASSIGN') then
+                        Obj.AddConnector(SpecField(Rec, 2))
+                    else
+                        Obj.RemoveConnector(SpecField(Rec, 2));
+                    Assigned := Assigned + 1;
+                    GeoChanged := True;
+                end;
+            end
+            else if (Kind = 'BUNDLE') then
+            begin
+                IsNew := (SpecField(Rec, 1) = '');
+                if IsNew then
+                begin
+                    Obj := SchServer.SchObjectFactory(86, eCreate_Default);
+                    if (Obj <> nil) then
+                    begin
+                        SetBundleVertices(Obj, Rec, 7);
+                        Doc.RegisterSchObjectInContainer(Obj);
+                        SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    end;
+                end
+                else
+                    Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 86) then
+                    Misses.Add('bundle:' + SpecField(Rec, 1) + SpecField(Rec, 2))
+                else
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    if (not IsNew) and (SpecField(Rec, 7) <> '') then
+                        SetBundleVertices(Obj, Rec, 7);
+                    F := SpecField(Rec, 4);
+                    if (F = 'AUTO') then
+                        Obj.SetState_IsLengthSetManually(False)
+                    else if (F <> '') then
+                    begin
+                        Obj.SetState_IsLengthSetManually(True);
+                        Obj.SetState_Length(StrToInt(F));
+                    end;
+                    if (SpecField(Rec, 5) <> '') then
+                        Obj.SetState_ShowBreakSymbol(SpecField(Rec, 5) = '1');
+                    if (SpecField(Rec, 6) <> '') then
+                        Obj.LineWidth := StrToInt(SpecField(Rec, 6));
+                    if (SpecField(Rec, 3) <> '') and (Obj.Comment <> nil) then
+                        Obj.Comment.Text := SpecField(Rec, 3);
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    // Designator after registering: set before, the bundle
+                    // has been saved unconnected
+                    if (SpecField(Rec, 2) <> '') then
+                        if not SetChildDesignator(Obj, SpecField(Rec, 2)) then
+                            Misses.Add('bundle_designator:' + SpecField(Rec, 2));
+                    Obj.GraphicallyInvalidate;
+                    if IsNew then
+                        BunCreated := BunCreated + 1
+                    else
+                        BunUpdated := BunUpdated + 1;
+                    if IsNew or (SpecField(Rec, 7) <> '') or (F <> '') then
+                        GeoChanged := True;
+                end;
+            end
+            else if (Kind = 'COVERING') then
+            begin
+                IsNew := (SpecField(Rec, 1) = '');
+                if IsNew then
+                    Obj := SchServer.SchObjectFactory(104, eCreate_Default)
+                else
+                    Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or ((not IsNew) and (Obj.ObjectId <> 104)) then
+                    Misses.Add('covering:' + SpecField(Rec, 1) + SpecField(Rec, 2))
+                else
+                begin
+                    if (SpecField(Rec, 8) <> '') then
+                    begin
+                        if not IsNew then
+                            Obj.RemoveAllItems;
+                        fld := 8;
+                        while (SpecField(Rec, fld) <> '') do
+                        begin
+                            Item := FindLayoutObject(Doc, SpecField(Rec, fld));
+                            if (Item = nil) then
+                                Misses.Add('covering_item:' + SpecField(Rec, fld))
+                            else if (Item.ObjectId = 86) then
+                                Obj.AddBundleItem(Item)
+                            else if (Item.ObjectId = 85) then
+                                Obj.AddConnectionPointItem(Item)
+                            else
+                                Misses.Add('covering_item:' + SpecField(Rec, fld));
+                            fld := fld + 1;
+                        end;
+                    end;
+                    if IsNew then
+                    begin
+                        Doc.RegisterSchObjectInContainer(Obj);
+                        SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    end;
+                    Obj.BeginUpdate;
+                    if (SpecField(Rec, 6) <> '') then
+                        Obj.SetState_PhysicalStartPointDistance(StrToInt(SpecField(Rec, 6)));
+                    if (SpecField(Rec, 7) <> '') then
+                        Obj.SetState_PhysicalEndPointDistance(StrToInt(SpecField(Rec, 7)));
+                    if (SpecField(Rec, 5) <> '') then
+                        Obj.SetState_Thickness(StrToInt(SpecField(Rec, 5)));
+                    Obj.EndUpdate;
+                    if (SpecField(Rec, 3) <> '') then
+                        Obj.DesignItemId := SpecField(Rec, 3);
+                    if (SpecField(Rec, 4) <> '') then
+                        Obj.SourceLibraryName := SpecField(Rec, 4);
+                    if (SpecField(Rec, 2) <> '') then
+                        if not SetChildDesignator(Obj, SpecField(Rec, 2)) then
+                            Misses.Add('covering_designator:' + SpecField(Rec, 2));
+                    Obj.GraphicallyInvalidate;
+                    if IsNew then
+                        CovCreated := CovCreated + 1
+                    else
+                        CovUpdated := CovUpdated + 1;
+                end;
+            end
+            else if (Kind = 'LABEL') then
+            begin
+                IsNew := (SpecField(Rec, 1) = '');
+                if IsNew then
+                begin
+                    Obj := SchServer.SchObjectFactory(84, eCreate_Default);
+                    if (Obj <> nil) then
+                    begin
+                        Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 4))), MilsToCoord(StrToInt(SpecField(Rec, 5))));
+                        Obj.Text := SpecField(Rec, 3);
+                        Doc.RegisterSchObjectInContainer(Obj);
+                        SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                            SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    end;
+                end
+                else
+                    Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 84) then
+                    Misses.Add('layout_label:' + SpecField(Rec, 1) + SpecField(Rec, 2))
+                else
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    if (not IsNew) then
+                    begin
+                        if (SpecField(Rec, 4) <> '') then
+                            Obj.MoveToXY(MilsToCoord(StrToInt(SpecField(Rec, 4))), MilsToCoord(StrToInt(SpecField(Rec, 5))));
+                        if (SpecField(Rec, 3) <> '') then
+                            Obj.Text := SpecField(Rec, 3);
+                    end;
+                    if (SpecField(Rec, 6) <> '') then
+                        Obj.SetState_Orientation(StrToInt(SpecField(Rec, 6)));
+                    if (SpecField(Rec, 7) <> '') then
+                        Obj.SetState_Alignment(StrToInt(SpecField(Rec, 7)));
+                    if (SpecField(Rec, 8) <> '') then
+                        Obj.SetState_ShowOnlyFirstLine(SpecField(Rec, 8) = '1');
+                    if (SpecField(Rec, 9) <> '') then
+                        Obj.DesignItemId := SpecField(Rec, 9);
+                    if (SpecField(Rec, 10) <> '') then
+                        Obj.SourceLibraryName := SpecField(Rec, 10);
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    if (SpecField(Rec, 2) <> '') then
+                        if not SetChildDesignator(Obj, SpecField(Rec, 2)) then
+                            Misses.Add('layout_label_designator:' + SpecField(Rec, 2));
+                    Obj.GraphicallyInvalidate;
+                    if IsNew then
+                        LblCreated := LblCreated + 1
+                    else
+                        LblUpdated := LblUpdated + 1;
+                end;
+            end;
+        end;
+        SchServer.ProcessControl.PostProcess(Doc, '');
+        Doc.GraphicallyInvalidate;
+
+        ServerDoc.Modified := True;
+        try
+            ServerDoc.DoFileSave('');
+        except
+        end;
+        Saved := not ServerDoc.Modified;
+        DocName := Doc.DocumentName;
+
+        // Bundle ends connect to the connection points under them only when
+        // Altium loads the drawing: close it, open it again, save the links.
+        if Saved and GeoChanged then
+        begin
+            ResetParameters;
+            AddStringParameter('Action', 'Close');
+            AddStringParameter('FileName', DocPath);
+            AddStringParameter('PromptToSave', 'False');
+            RunProcess('WorkspaceManager:CloseObject');
+            ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
+            if (ServerDoc <> nil) then
+            begin
+                Client.ShowDocument(ServerDoc);
+                ServerDoc.Modified := True;
+                try
+                    ServerDoc.DoFileSave('');
+                except
+                end;
+                Reloaded := not ServerDoc.Modified;
+            end;
+            Saved := Reloaded;
+        end;
+
+        InfoStr := '';
+        for i := 0 to Misses.Count - 1 do
+        begin
+            if (i > 0) then InfoStr := InfoStr + ', ';
+            InfoStr := InfoStr + '"' + JSONEscapeString(Misses[i]) + '"';
+        end;
+        if (Misses.Count = 0) and Saved then
+            Result := '{"success": true'
+        else
+            Result := '{"success": false';
+        if Saved then
+            Result := Result + ', "saved": true'
+        else
+            Result := Result + ', "saved": false, "error": "document was not saved"';
+        Result := Result + ', "document": "' + JSONEscapeString(DocName) +
+                  '", "deleted": ' + IntToStr(Deleted) +
+                  ', "connectors_moved": ' + IntToStr(ConnMoved) +
+                  ', "connection_points_created": ' + IntToStr(CpCreated) +
+                  ', "connection_points_updated": ' + IntToStr(CpUpdated) +
+                  ', "assignments": ' + IntToStr(Assigned) +
+                  ', "bundles_created": ' + IntToStr(BunCreated) +
+                  ', "bundles_updated": ' + IntToStr(BunUpdated) +
+                  ', "coverings_created": ' + IntToStr(CovCreated) +
+                  ', "coverings_updated": ' + IntToStr(CovUpdated) +
+                  ', "layout_labels_created": ' + IntToStr(LblCreated) +
+                  ', "layout_labels_updated": ' + IntToStr(LblUpdated) +
+                  ', "reloaded": ' + LowerCase(BoolToStr(Reloaded, True)) +
+                  ', "not_found": [' + InfoStr + ']}';
+    finally
+        Misses.Free;
+        Spec.Free;
+    end;
+end;
+

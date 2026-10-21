@@ -84,6 +84,65 @@ Other TObjectId values: 84 layout label, 85 layout connection point, 86 bundle, 
 (RECORD 112 in multiboard-imported sheets), 89 wire label, 101 associated parts, 104 covering,
 107 associated objects (cavity container).
 
+## Layout drawings (.LdrDoc) (verified on Altium 26.7, 2026-10-21)
+
+Read with `harness_layout.parse_ldrdoc`; written by `edit_harness_layout`
+(`ExecuteEditHarnessLayout` in `schematic_utils.pas`). Open kind `HarnessLayoutDrawing`; open the
+harness project first so the drawing has its wiring diagram. Document ObjectId 80.
+
+| RECORD | ObjectId | Object | Key fields |
+|---|---|---|---|
+| 106 (top-level) | 81 | connector | `Location`, `Orientation` (0-3), `IsMirrored`, `WiringDiagramOriginUniqueId`; child 41 `LayoutDrawingSymbolModel<n>` (`IsImageParameter=T`, `Text` = `ViewName=..\|ViewType=ePhysicalView\|ViewSide\|Rotation\|Zoom\|MainModel=True..`) + child 30 image |
+| 113 | - | pin | `WiringDiagramOriginUniqueId`, `ConnectedWireUniqueId<n>` |
+| 110 | 85 | connection point | `Location`, `Orientation`, `Style` (0 circle, 1 square, 2 insulator), `ShowName`, `ConnectedBundleUniqueId<n>`; designator = child 34 |
+| 111 | 86 | bundle | `LocationCount`, `X<i>`/`Y<i>`, `LineWidth`, `LengthLong`, `DrawnLength`, `IsLengthSetManually`, `ShowBreakSymbol`, `EndVertex1/2ConnectedObjectUniqueID` (CP uids); children 34 designator, 41 Comment |
+| 128 | 104 | covering | `Thickness`, `PhysicalStartDistance`, `PhysicalEndDistance`, `PhysicalLength`, `CoveredItemsCount`, `CoveredItemId<i>` (0-based), `DesignItemId`, `SourceLibraryName`; child 34 |
+| 109 | 84 | layout label | `Location`, `Text`, `Alignment`, `Orientation`, `ShowOnlyFirstLine`, `DesignItemId`; child 34 |
+| 115 | - | wire (no geometry) | `Name`, `Comment`, `EndVertex1/2ConnectedObjectUniqueID` (layout pin / splice uids) |
+| 116 / 120 / 122 | - | splice / no-connect / twist | `Designator`, `WiringDiagramOriginUniqueId`, `ConnectedWireUniqueId<n>` (no location) |
+
+Lengths (`LengthLong`, `Physical*`) are internal coords: mm = coord / 10000 x 0.0254. Which objects
+a connection point holds is in the zlib-compressed `HarnessConnectionPointConnector` stream
+(`read_connection_point_streams`). A wire runs through the bundles on the path between the
+connection points of its two ends; the reader computes the shortest one (Altium's default) and
+cannot see paths re-assigned by hand.
+
+Script interfaces are `Rt_Schematic.ISch_Harness*` in `System/Altium.Edp.Interfaces.dll`.
+What works: connection point factory(85) + `Location`, `MoveToXY`, `SetState_Style`,
+`SetState_ShowName`, `SetState_Orientation`, `AddConnector(uid)` / `RemoveConnector(uid)`
+(connector or splice uid, persisted in the stream); bundle factory(86), `VerticesCount`,
+`Vertex[i]` (1-based), `SetState_Length(coord)`, `SetState_IsLengthSetManually`,
+`SetState_ShowBreakSymbol`, `LineWidth`, `Comment.Text`; covering factory(104),
+`AddBundleItem` / `AddConnectionPointItem` / `RemoveAllItems`, then inside `BeginUpdate` /
+`EndUpdate` `SetState_PhysicalStartPointDistance` / `...EndPointDistance` / `SetState_Thickness`,
+`DesignItemId`, `SourceLibraryName`; label factory(84), `Text`, `SetState_Orientation`,
+`SetState_Alignment`, `SetState_ShowOnlyFirstLine`; connector `MoveToXY`, `Orientation`,
+`Mirror(Location)`; `RemoveSchObject` for deletes. Designators of all of them via the child
+designator (ObjectId 25).
+
+Gotchas found:
+- **Bundle ends connect to connection points by position, and only when Altium loads the
+  drawing.** A bundle registered by script, or one whose connection point moved, keeps (or lacks)
+  its link until the document is reopened; then an end that is not exactly on a connection point
+  is disconnected. Moving a connection point does not move bundle vertices. So the tool moves the
+  bundle ends itself, saves, closes, reopens and saves (`reloaded`), and reads the links back.
+- Set a bundle's designator after registering it: set before, a bundle has been saved
+  unconnected with length 0.
+- Covering offsets: `PhysicalLength = covered length + start + end`, so a negative offset insets
+  the covering from that end and a positive one extends it past the end.
+- Moving a connector moves its views and texts but puts its connection point somewhere
+  unrelated (joined by a dashed line); the tool places the connection point explicitly (same
+  offset, turned with the connector). `Location :=` on a connection point leaves its designator
+  behind; `MoveToXY` moves it along. A new connection point's designator starts near the sheet
+  origin.
+- Splices are held by no connection point after an import: their wires stay unrouted until one
+  is assigned.
+- `Doc.GetBundleContent` (runtime error / crash), covering `SetState_StartPointDistance`,
+  `SetStartPoint`, `VerticesCount`, and `CP.Designator` are not usable. Interfaces stored with
+  `TStringList.AddObject` cannot be read back (`Objects[i]` pauses the script).
+- Not reachable from scripts: wire length offsets (`ISch_HarnessWireData` via bundle content)
+  and connector view settings (only in the `LayoutDrawingSymbolModel` parameter text).
+
 Gotchas found:
 - **Links to twists/shields/cables/wire breaks are computed only when Altium loads the
   document** (2026-10-21). Objects registered by script - and wires added under existing ones -

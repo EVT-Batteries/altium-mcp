@@ -20,6 +20,7 @@ import win32process
 import win32ui
 from altium_files import read_altium_text, write_altium_text
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
+from harness_layout import build_layout_spec, check_layout, parse_ldrdoc
 from harness_parser import (
     get_harness_component_data,
     get_harness_component_pins,
@@ -2726,6 +2727,166 @@ def _check_harness_links(
         result["success"] = False
 
 
+HARNESS_LAYOUT_SPEC_FILE = EXCHANGE_DIR / "harness_layout_spec.txt"
+
+
+@mcp.tool()
+async def edit_harness_layout(
+    ctx: Context,
+    document_path: str = "",
+    connectors: list | None = None,
+    connection_points: list | None = None,
+    bundles: list | None = None,
+    coverings: list | None = None,
+    layout_labels: list | None = None,
+    delete: list | None = None,
+    dry_run: bool = False,
+) -> str:
+    """
+    Create, move, edit and delete objects on a Harness Layout Drawing (.LdrDoc): connectors,
+    connection points, bundles, coverings and layout labels.
+
+    Objects are named by designator (unnamed ones by the unique_id get_harness_data reports)
+    and edited in place, so their links to the wiring diagram survive. Coordinates are true
+    mils (get_harness_data reports DXP units: x 10), lengths mm, orientations degrees
+    (0, 90, 180, 270). Omitted fields keep their value.
+
+    Altium connects bundle ends to the connection points under them when it loads a drawing,
+    so after a geometry change the tool saves, closes, reopens and saves the drawing again
+    ("reloaded": true; the undo history is lost), then reads it back: "bundles" lists each
+    bundle the call drew or moved with its ends and lengths, "problems" what did not connect
+    or lost a connection (success is false then), "unrouted_wires" the wires with no bundle
+    path between the connection points of their two ends ("newly_unrouted_wires": those
+    this call left without one).
+
+    Args:
+        document_path (str): Target .LdrDoc. Required.
+        connectors (list): Move / turn / mirror connectors, e.g.
+            [{"designator": "P5", "x": 22900, "y": 8900, "orientation": 270, "mirrored": True}].
+            The connector's own connection point (CP_P5) follows with the same offset, turned
+            with the connector, unless it is given a position in connection_points or here as
+            "connection_point": {"x": ..., "y": ...}; bundles on it follow too.
+        connection_points (list): New or existing connection points, e.g.
+            [{"designator": "CP1", "x": 12000, "y": 12000, "style": "circle",
+              "show_name": True, "orientation": 0, "objects": ["SP1"],
+              "designator_pos": [12200, 12400]}].
+            style is "circle", "square" or "insulator". "objects" are connectors or splices
+            to hold here (taken from the connection point holding them); "release" removes
+            held ones; "new_designator" renames. A wire is routed through the bundles between
+            the connection points holding its two ends, so every splice needs one. Moving a
+            connection point moves the ends of its bundles (a straight end segment stays
+            straight).
+        bundles (list): New or existing bundles, e.g.
+            [{"designator": "B1", "from": "CP_J1", "to": "CP1", "via": [[12000, 17300]],
+              "length_mm": 254, "show_break_symbol": True, "line_width": 2, "comment": ""}].
+            from/to are connection points (or connectors, meaning their own connection
+            point); via are the bend points between them. Instead of from/to/via, "points"
+            [x1, y1, x2, y2, ...] with both ends exactly on connection points. "length_mm":
+            a number sets the physical length manually, None returns it to the drawn length.
+            New bundles without a designator are named B<n>. Drawing a bundle across a
+            connection point does not split it: give one bundle per span.
+        coverings (list): New or existing coverings (sleeves, tape, tubes) on bundles, e.g.
+            [{"designator": "COV1", "bundles": ["B1", "B2"], "part_number": "...",
+              "source_library": "evt-components.DbLib", "thickness": 3,
+              "start_offset_mm": -10, "end_offset_mm": 0}].
+            Offsets are from the ends of the covered bundles: negative insets the covering,
+            positive extends it past the end. "bundles" replaces the covered bundles.
+        layout_labels (list): New or existing layout labels, e.g.
+            [{"designator": "L1", "text": "LABEL", "x": 10000, "y": 17300,
+              "orientation": 0, "alignment": 1, "show_only_first_line": False,
+              "part_number": "...", "source_library": "..."}].
+        delete (list): Designators / unique ids of bundles, coverings, layout labels or
+            connection points (which must hold nothing) to remove.
+        dry_run (bool): Only validate and return the spec records.
+
+    Not supported: connector views (physical / symbol, set in Altium) and wire length
+    offsets. Wires re-assigned to other bundles by hand in Altium are not detected: routes
+    are computed as Altium's default, the shortest bundle path.
+
+    Returns:
+        str: JSON with success, saved, reloaded, counts, not_found, warnings, bundles,
+             problems and unrouted_wires.
+    """
+    if not document_path:
+        return json.dumps({"success": False, "error": "document_path is required"})
+    doc_path = Path(document_path).resolve()
+    if doc_path.suffix.lower() != ".ldrdoc" or not doc_path.exists():
+        return json.dumps(
+            {"success": False, "error": f"not an existing .LdrDoc: {doc_path}"}
+        )
+    try:
+        layout = parse_ldrdoc(doc_path)
+        spec = build_layout_spec(
+            layout,
+            connectors=connectors,
+            connection_points=connection_points,
+            bundles=bundles,
+            coverings=coverings,
+            layout_labels=layout_labels,
+            delete=delete,
+        )
+    except (KeyError, TypeError, ValueError, IndexError) as e:
+        return json.dumps({"success": False, "error": f"invalid request: {e!r}"})
+    if spec["errors"]:
+        return json.dumps(
+            {"success": False, "errors": spec["errors"], "warnings": spec["warnings"]},
+            indent=2,
+        )
+    if not spec["records"]:
+        return json.dumps({"success": False, "error": "nothing to change"})
+    lines = [_spec_line("DOCUMENT", str(doc_path))]
+    lines += [_spec_line(*rec) for rec in spec["records"]]
+    if dry_run:
+        return json.dumps(
+            {
+                "success": True,
+                "dry_run": True,
+                "records": lines,
+                "warnings": spec["warnings"],
+                "expect": spec["expect"],
+            },
+            indent=2,
+        )
+
+    try:
+        async with altium_bridge.exclusive():
+            HARNESS_LAYOUT_SPEC_FILE.parent.mkdir(parents=True, exist_ok=True)
+            write_altium_text(HARNESS_LAYOUT_SPEC_FILE, "\n".join(lines) + "\n")
+            response = await altium_bridge._execute_command_locked(
+                "edit_harness_layout", {}
+            )
+    except TimeoutError as e:
+        response = {"success": False, "error": str(e)}
+    if not response.get("success", False):
+        return json.dumps(
+            {"success": False, "error": response.get("error", "unknown error")}
+        )
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return result
+    if spec["warnings"]:
+        result["warnings"] = spec["warnings"]
+    if result.get("saved"):
+        try:
+            after = parse_ldrdoc(doc_path)
+        except Exception as e:  # noqa: BLE001 - report, never fail the write
+            result.setdefault("warnings", []).append(f"not verified: {e}")
+        else:
+            problems, found = check_layout(after, spec["expect"], before=layout)
+            result["bundles"] = found
+            result["unrouted_wires"] = after["unrouted_wires"]
+            result["newly_unrouted_wires"] = sorted(
+                set(after["unrouted_wires"]) - set(layout["unrouted_wires"])
+            )
+            if problems:
+                result["problems"] = problems
+                result["success"] = False
+    return json.dumps(result, indent=2)
+
+
 @mcp.tool()
 async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> str:
     """Convert all net labels (eNetLabel, RECORD=25) in a Harness Wiring Diagram (.WirDoc)
@@ -4818,6 +4979,13 @@ async def get_harness_data(
     (style 1) also gives its pin and drain_wires. Wire breaks give the wire they sit on;
     wires with the same designator on other sheets of the project are one connection.
 
+    A layout drawing (.LdrDoc) gives connectors (location, orientation, views, connection
+    point), connection_points (objects held, bundles), bundles (points, length and drawn
+    length in mils and mm, end connection points, wires), coverings, layout_labels, wires
+    (ends as "P3.12" / "SP1", route = bundles on the shortest path between the connection
+    points of the two ends, routed_length), unrouted_wires, splices, twists and
+    no_connects. Edit it with edit_harness_layout.
+
     A full wiring diagram can be very large; use summary_only or designators to keep
     the answer small.
 
@@ -4854,7 +5022,31 @@ async def get_harness_data(
 
         if p.suffix.lower() == ".prjhar":
             data = parse_prjhar(p)
-        elif p.suffix.lower() in [".wirdoc", ".ldrdoc"]:
+        elif p.suffix.lower() == ".ldrdoc":
+            data = parse_ldrdoc(p)
+            if designators:
+                wanted = set(designators)
+                data["connectors"] = [
+                    c for c in data["connectors"] if c["designator"] in wanted
+                ]
+                data["wires"] = [
+                    w
+                    for w in data["wires"]
+                    if {w["end1"].split(".")[0], w["end2"].split(".")[0]} & wanted
+                ]
+            if summary_only:
+                for c in data["connectors"]:
+                    c.pop("views", None)
+                data["wires"] = [
+                    {
+                        "designator": w["designator"],
+                        "end1": w["end1"],
+                        "end2": w["end2"],
+                        "routed_length": w["routed_length"],
+                    }
+                    for w in data["wires"]
+                ]
+        elif p.suffix.lower() == ".wirdoc":
             data = parse_wirdoc(p)
             if designators:
                 wanted = set(designators)

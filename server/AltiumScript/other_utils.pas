@@ -220,6 +220,7 @@ begin
     if (CommandName = 'search_library_symbol') or
        (CommandName = 'build_circuit') or
        (CommandName = 'add_harness_wiring') or
+       (CommandName = 'edit_harness_layout') or
        (CommandName = 'get_active_document') or
        (CommandName = 'convert_netlabels_to_text') or
        (CommandName = 'get_sheet_style') or

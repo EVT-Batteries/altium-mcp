@@ -1262,6 +1262,8 @@ begin
             Result := ExecuteAddHarnessWiring(ROOT_DIR, ROOT_DIR + 'harness_wiring_spec.txt');
         'convert_netlabels_to_text':
             Result := ExecuteConvertNetlabelsToTextCommand(RequestData);
+        'edit_harness_layout':
+            Result := ExecuteEditHarnessLayout(ROOT_DIR + 'harness_layout_spec.txt');
         'get_sheet_style':
             Result := ExecuteGetSheetStyleCommand(RequestData);
         'get_active_document':
