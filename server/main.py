@@ -1985,6 +1985,16 @@ SHEET_STYLES = {
     "A": 5, "B": 6, "C": 7, "D": 8, "E": 9,
     "LETTER": 10, "LEGAL": 11, "TABLOID": 12,
 }
+# ...and the names get_sheet_style reports for them (OrCAD sizes are read-only)
+SHEET_STYLE_NAMES = {v: k for k, v in SHEET_STYLES.items()} | {
+    13: "ORCAD_A",
+    14: "ORCAD_B",
+    15: "ORCAD_C",
+    16: "ORCAD_D",
+    17: "ORCAD_E",
+}
+# TSheetOrientation ordinals (ISch_Document.WorkspaceOrientation)
+SHEET_ORIENTATIONS = {0: "landscape", 1: "portrait"}
 
 
 def _spec_line(*fields: Any) -> str:
@@ -2374,6 +2384,79 @@ async def convert_netlabels_to_text(ctx: Context, document_path: str = "") -> st
         except ValueError:
             return result
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def get_sheet_style(ctx: Context, document_path: str = "") -> str:
+    """Report the sheet size (A4, A3, ..., A-E, LETTER, ...) of a Harness Wiring Diagram
+    (.WirDoc) or Schematic (.SchDoc), as Altium currently holds it (unsaved edits included).
+
+    Read-only: the document is opened in Altium only if it is not open yet, and is never
+    modified or saved.
+
+    Args:
+        document_path (str): Path to the target .WirDoc or .SchDoc. Required.
+
+    Returns:
+        str: JSON with "sheet_style" (a name add_harness_wiring's sheet_style accepts, an
+        ORCAD_* size, or "CUSTOM" when a custom sheet size is in use), "standard_style"
+        (the standard size selected underneath), "sheet_style_index" (TSheetStyle ordinal),
+        "use_custom_sheet", "orientation", "sheet_size_mils" [x, y], "document" and
+        "opened" (True when this call had to open the document).
+    """
+    if not document_path:
+        return json.dumps({"success": False, "error": "document_path is required"})
+    doc = Path(document_path).resolve()
+    if doc.suffix.lower() not in (".wirdoc", ".schdoc"):
+        return json.dumps(
+            {"success": False, "error": f"not a .WirDoc or .SchDoc: {str(doc)!r}"}
+        )
+    if not doc.exists():
+        return json.dumps({"success": False, "error": f"no such file: {str(doc)!r}"})
+
+    response = await altium_bridge.execute_command(
+        "get_sheet_style", {"document_path": str(doc)}
+    )
+    if not response.get("success", False):
+        return json.dumps(
+            {"success": False, "error": response.get("error", "unknown error")}
+        )
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"unexpected Altium reply: {result[:200]!r}",
+                }
+            )
+    if not result.get("success", False):
+        return json.dumps(
+            {"success": False, "error": result.get("error", "unknown error")}
+        )
+
+    index = int(result.get("sheet_style_index", -1))
+    standard = SHEET_STYLE_NAMES.get(index)
+    custom = bool(result.get("use_custom_sheet", False))
+    out: dict[str, Any] = {
+        "success": True,
+        "document": result.get("document", str(doc)),
+        "sheet_style": "CUSTOM" if custom else standard,
+        "standard_style": standard,
+        "sheet_style_index": index,
+        "use_custom_sheet": custom,
+        "orientation": SHEET_ORIENTATIONS.get(int(result.get("orientation_index", -1))),
+        "sheet_size_mils": [
+            result.get("sheet_size_x_mils"),
+            result.get("sheet_size_y_mils"),
+        ],
+        "opened": bool(result.get("opened", False)),
+    }
+    if standard is None:
+        out["warning"] = f"unknown TSheetStyle ordinal {index}"
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool()

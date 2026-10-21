@@ -212,6 +212,10 @@
     {
       "name": "convert_netlabels_to_text",
       "description": "Convert net labels on a .WirDoc or schematic to plain text strings"
+    },
+    {
+      "name": "get_sheet_style",
+      "description": "Read the sheet size (A4, D, custom, ...) and orientation of a .WirDoc or .SchDoc from Altium (read-only)"
     }
   ],
   "compatibility": {

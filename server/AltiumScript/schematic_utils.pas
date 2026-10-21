@@ -3101,3 +3101,69 @@ begin
     end;
 end;
 
+// get_sheet_style: read-only report of a .WirDoc / .SchDoc sheet size.
+// Returns the TSheetStyle ordinal (the server turns it into a name), the
+// custom-sheet flag, orientation and the sheet extent in mils. The target is
+// found by full path; it is opened only when it is not open yet (re-opening
+// an open document reloads it and drops unsaved edits) and is never saved.
+function ExecuteGetSheetStyle(TargetDocPath: String): String;
+var
+    TargetDoc : ISch_Document;
+    ServerDoc : IServerDocument;
+    OpenKind  : String;
+    Opened    : String;
+    UseCustom : String;
+begin
+    Result := '';
+    Opened := 'false';
+    try
+        if (TargetDocPath = '') then
+        begin
+            Result := '{"success": false, "error": "document_path is required"}';
+            Exit;
+        end;
+        TargetDocPath := StringReplace(TargetDocPath, '/', '\', REPLACEALL);
+        if (LowerCase(ExtractFileExt(TargetDocPath)) = '.wirdoc') then
+            OpenKind := 'HarnessWiringDiagram'
+        else
+            OpenKind := 'SCH';
+
+        TargetDoc := nil;
+        ServerDoc := FindOpenDocument(TargetDocPath);
+        if (ServerDoc = nil) then
+        begin
+            ServerDoc := Client.OpenDocument(OpenKind, TargetDocPath);
+            if (ServerDoc <> nil) then
+                Opened := 'true';
+        end;
+        if (ServerDoc <> nil) then
+        begin
+            Client.ShowDocument(ServerDoc);
+            TargetDoc := SchServer.GetSchDocumentByPath(TargetDocPath);
+        end;
+
+        if (TargetDoc = nil) or (NormalizedPath(TargetDoc.DocumentName) <> NormalizedPath(TargetDocPath)) then
+        begin
+            Result := '{"success": false, "error": "could not open requested document: ' + JSONEscapeString(TargetDocPath) + '"}';
+            Exit;
+        end;
+
+        if TargetDoc.UseCustomSheet then
+            UseCustom := 'true'
+        else
+            UseCustom := 'false';
+
+        Result := '{"success": true' +
+                  ', "document": "' + JSONEscapeString(TargetDoc.DocumentName) + '"' +
+                  ', "sheet_style_index": ' + IntToStr(TargetDoc.SheetStyle) +
+                  ', "use_custom_sheet": ' + UseCustom +
+                  ', "orientation_index": ' + IntToStr(TargetDoc.WorkspaceOrientation) +
+                  ', "sheet_size_x_mils": ' + IntToStr(Round(CoordToMils(TargetDoc.SheetSizeX))) +
+                  ', "sheet_size_y_mils": ' + IntToStr(Round(CoordToMils(TargetDoc.SheetSizeY))) +
+                  ', "opened": ' + Opened + '}';
+    except
+        Result := '{"success": false, "error": "Exception occurred while reading the sheet style"}';
+        LogScriptError('Error in ExecuteGetSheetStyle');
+    end;
+end;
+

@@ -1137,6 +1137,24 @@ begin
     Result := ExecuteConvertNetlabelsToText(ROOT_DIR, DocPath);
 end;
 
+// get_sheet_style: "document_path" (required, full path to a .WirDoc/.SchDoc)
+function ExecuteGetSheetStyleCommand(RequestData: TStringList): String;
+var
+    i: Integer;
+    DocPath: String;
+begin
+    DocPath := '';
+    if (RequestData <> nil) then
+    begin
+        for i := 0 to RequestData.Count - 1 do
+        begin
+            if (Pos('"document_path"', RequestData[i]) > 0) then
+                DocPath := JSONLineValue(RequestData[i]);
+        end;
+    end;
+    Result := ExecuteGetSheetStyle(DocPath);
+end;
+
 // Function to execute a command with parameters
 function ExecuteCommand(CommandName: String): String;
 var
@@ -1247,6 +1265,8 @@ begin
             Result := ExecuteAddHarnessWiring(ROOT_DIR, ROOT_DIR + 'harness_wiring_spec.txt');
         'convert_netlabels_to_text':
             Result := ExecuteConvertNetlabelsToTextCommand(RequestData);
+        'get_sheet_style':
+            Result := ExecuteGetSheetStyleCommand(RequestData);
         'get_active_document':
             Result := GetActiveDocument(ROOT_DIR);
     else

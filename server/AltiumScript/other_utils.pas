@@ -159,6 +159,7 @@ begin
        (CommandName = 'add_harness_wiring') or
        (CommandName = 'get_active_document') or
        (CommandName = 'convert_netlabels_to_text') or
+       (CommandName = 'get_sheet_style') or
        (CommandName = 'take_view_screenshot') or
        (CommandName = 'get_symbol_primitives') or
        (CommandName = 'create_symbols_batch') or
