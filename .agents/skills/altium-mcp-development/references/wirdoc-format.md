@@ -58,3 +58,33 @@ the API. Read this before treating something odd in a file as a bug.
   UniqueID; deleting and recreating a wire changes the UniqueID and breaks `.LdrDoc` links.
 - A new harness wire comes with Altium's own default parameters; adding a parameter by name
   without looking for an existing one creates a duplicate with possibly conflicting value.
+
+## Harness objects beyond wires (verified on Altium 26.7, 2026-10-21)
+
+ObjectIds come from `SCH.TObjectId` in `System/Altium.SDK.Interfaces.dll` (readable with
+`System.Reflection.Metadata`; no decompiler needed). Interfaces and parameter names come from the
+same assembly (`SCH.ISch_Harness*`). All of the below was exercised live on scratch copies.
+
+| Feature | ObjectId | File RECORD | How to create from DelphiScript |
+|---|---|---|---|
+| Cavity seal / plug / other | 81 (part) in a 107 container | 106 in a 131 with `AssociatedObjectType=1/2/3` (crimp = 0, field omitted) | `Pin.AddItem(type, Part)` with `Part := SchObjectFactory(81, 0)`, `Part.DesignItemId := PN`; `Pin.GetCount(type)`. One crimp/seal/plug per pin, any number of "other". Set a `Comment` parameter to the PN (Altium leaves `*`). |
+| Associated part (boot, backshell, wedgelock, heatshrink...) | 81 | under the connector | `Connector.AddAssociatedPart(Part)`, `GetAssociatedPartsCount`, `RemoveAssociatedPart(i)`; also on splices |
+| Twist | 93 | 118 | factory(93), set `Location`/`Corner` to a rectangle crossing the wires, register: Altium links every wire the rectangle crosses (`GetState_ConnectedWiresUniqueIdsCount`) |
+| Shield | 92 | 117 | same as twist; `SetState_Style(1)` = "Shield with Connection" (stored `Style=1`) |
+| Cable | 98 | 123 | same as twist; `Designator.Text`, `Comment.Text`, parameters (MPN, ...) like a component |
+| Wire break | 106 | 130 (`Text` = wire designator, `IsCrossSheetConnector=T`, `ConnectedObjectUniqueId`) | factory(106), `Location` exactly on a free wire end, register; it takes the wire's designator. Wires with the same designator on different sheets of one project become one connection (compiler checks them: "Mismatched parameters in connected wire segments") |
+
+Other TObjectId values: 84 layout label, 85 layout connection point, 86 bundle, 87 logical signal
+(RECORD 112 in multiboard-imported sheets), 89 wire label, 101 associated parts, 104 covering,
+107 associated objects (cavity container).
+
+Gotchas found:
+- Links to twists/shields/cables/wire breaks are computed geometrically; there are no setters.
+  Read them after `PostProcess`.
+- `Internal_GetState_*` methods and `ShieldPinLocation` are not callable from DelphiScript
+  (runtime error); use the property form (`Style`) or `GetState_*` methods.
+- The sandbox's provided `List1` breaks scripts here; create your own `TStringList`.
+- **Altium drops a `Description` parameter on cavity parts at every save** (plain open + save
+  removes them). Store the text in the part's component description instead of a parameter.
+- Not solved yet: where the shield-with-connection pin sits (needed to attach a drain wire);
+  candidate points around the rectangle did not connect.
