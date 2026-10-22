@@ -5,9 +5,11 @@ description: >-
   the harness parser/router/DbLib modules, and the DelphiScript bridge in server/AltiumScript/)
   without damaging real Altium documents. Use it whenever you modify or add an altium-mcp tool or
   bridge command, investigate why a tool misbehaves or reports success without effect, test a
-  change against Altium, verify what a tool really wrote into a .WirDoc/.SchDoc, recover a wedged
-  Altium script executor, or puzzle over odd characters or duplicated records in Altium files -
-  even if the user only says "fix the MCP", "the harness tool broke" or "check what it did".
+  change against Altium, verify what a tool really wrote into a .WirDoc/.SchDoc/.LdrDoc, recover
+  a wedged Altium script executor, find out how Altium works by decompiling it, trace an Altium
+  .NET "Object reference not set" error dialog to its method, or puzzle over odd characters or
+  duplicated records in Altium files - even if the user only says "fix the MCP", "the harness
+  tool broke" or "check what it did".
 ---
 
 # altium-mcp Development & Verification
@@ -50,7 +52,10 @@ MCP tool (server/main.py)
 2. **Never test a write on a real document.** Copy it to a scratch folder under a *different file
    name* (`MCP_Test_<what>.WirDoc`) and keep an untouched `.orig` copy for diffing. A different
    name matters: Altium and older code match documents by file name, so a same-named copy can
-   make a "test" land in the real document.
+   make a "test" land in the real document. For a `.LdrDoc`, copy the **whole harness project**
+   under the new name (rename every file; in the `.PrjHar`, replace the old base name) and open
+   that project first: a layout drawing needs its wiring diagram, and physical views need a
+   project reload.
 3. **Check the real file is untouched** afterwards (`git status`, file mtime), and close scratch
    documents in Altium when done (see §5).
 4. **Tool results are claims, not evidence.** Results now carry `saved`, `not_found` and counts;
@@ -107,6 +112,14 @@ parameters appear twice; text with non-ASCII exists in a plain and a `%UTF8%` fi
 Finally, for anything visual (routing, labels, graphics) take a screenshot of the scratch document
 (`get_screenshot(view_type="sch", document_path=...)`) and look at it.
 
+Layout drawings (`.LdrDoc`): read them back with `harness_layout.parse_ldrdoc` (bundle ends,
+`unrouted_wires`, connectors' `unassigned_pins`, wire `length`). The parser mirrors Altium's
+routing, but confirm a routing change against Altium itself once with a read-only sandbox probe:
+`Doc.GetBundleContent(Bundle).GetSubLinesContentCount` per bundle (wires it carries), then wire
+data (ObjectId 90) `GetState_TotalLength` (filled only after the content was asked for). Both
+must match the parser. The tool's result alone has been wrong before: the parser once routed by
+connector while Altium routes by pin, so it reported every wire routed while Altium routed none.
+
 ## 5. DelphiScript survival
 
 - `try/except` does **not** catch runtime errors (bad property, nil object, bad conversion). The
@@ -151,7 +164,38 @@ Finally, for anything visual (routing, labels, graphics) take a screenshot of th
   RunProcess('WorkspaceManager:CloseObject');
   ```
 
-## 6. Unit tests
+## 6. Finding out how Altium works
+
+Altium's documentation of its script API and file formats is thin. Read its code instead of
+guessing:
+
+- **Decompile** the .NET assemblies with ILSpy's command line (NuGet package `ilspycmd`, e.g.
+  9.0.0.7889; unzip the `.nupkg` and run it with the installed .NET 8 runtime, no SDK needed):
+  `dotnet <pkg>/tools/net8.0/any/ilspycmd.dll -p -o <out dir> <dll>`, then grep the C#. Useful
+  assemblies in `C:\Program Files\Altium\ADAgile\System\`: `Altium.Sch.DataModel` (engine
+  objects, file import/export, physical models), `Altium.Har.Core` (wiring -> layout sync, bundle
+  content, BOM bridges), `Altium.Har.LayoutDrawing`, `InteractiveProperties.Providers.Harness.*`
+  (what the Properties panel does: the GUI's own way to change something), and
+  `Altium.Edp.Interfaces`. Draftsman (fabrication drawings) is an extension:
+  `C:\ProgramData\Altium\Altium Designer <...>\Extensions\Draftsman\Altium.Designer.PcbDrawing.dll`.
+- **Only `Rt_Schematic.ISch_*` members are callable from DelphiScript.** The objects also
+  implement `SCHInterfaces.*`, but calling those members is a runtime error. Check a member exists
+  in `Altium.Edp.Interfaces/Rt_Schematic/<interface>.cs` before probing it.
+- **Map a .NET error dialog to its method.** The dialog says "Object reference not set to an
+  instance of an object at <address>. <dll>, Base Address: <base>". The assemblies are
+  ReadyToRun (precompiled), so `<address> - <base>` names a method:
+  `uv run .agents/skills/altium-mcp-development/scripts/r2r_method_at.py <dll> <offset hex>`.
+  Then read that method in the decompiled code. That is how the layout render crash was found
+  (`SchHarnessComponent.GetState_OwnBoundingRectangle`, see `references/wirdoc-format.md`).
+- **Probe read-only first, one question per sandbox run**, on the scratch project. Altium
+  reacts to some changes after the script returns: a sequence that works as separate runs (edit
+  + save, project reload, library update) can fail inside one run. When a multi-step write fails
+  but each step works alone, split it into several bridge runs from Python (see
+  `edit_harness_layout`'s `RELOADPROJECT` / `RENDER` runs).
+- Write probe and patch scripts with the Write tool, not shell heredocs: the shell has eaten
+  backslashes (`'\'` in Pascal, `\b` in paths) and silently broken anchors or text.
+
+## 7. Unit tests
 
 ```
 uv run --with pytest python -m pytest server/tests -q      # from the altium-mcp root
@@ -162,7 +206,10 @@ Tests must never reach the live bridge. Follow the existing fixtures in
 
 - mock `main.altium_bridge._execute_command_locked` (what both `execute_command` and
   `add_harness_wiring` call), not `execute_command`;
-- patch `main.HARNESS_SPEC_FILE` and `main.BRIDGE_LOCK_FILE` into a temp folder;
+- patch `main.HARNESS_SPEC_FILE` (layout tool: `main.HARNESS_LAYOUT_SPEC_FILE`) and
+  `main.BRIDGE_LOCK_FILE` into a temp folder; for the layout tool also patch
+  `main.parse_ldrdoc` with synthetic layouts (`tests/test_harness_layout.py`), and give the
+  bridge mock a `side_effect` when one call makes several bridge runs;
 - patch `main._get_active_harness_path` when a fallback needs an "active" harness;
 - prefer synthetic records with `harness_parser.parse_wirdoc_records(records, path)` over sample
   design files, so tests run in any checkout and publish no company data.
@@ -170,7 +217,7 @@ Tests must never reach the live bridge. Follow the existing fixtures in
 The live-Altium suite (`test_altium_script.py`) only runs with `ALTIUM_INTEGRATION=1`.
 Lint new modules with `uvx ruff check --extend-select I <files>`.
 
-## 7. Before you call it done
+## 8. Before you call it done
 
 - Unit tests pass; new behaviour has a test (including the failure/`not_found` path).
 - The change was exercised live on a scratch copy and diffed (§4); visuals screenshotted.
