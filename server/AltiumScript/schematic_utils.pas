@@ -3690,13 +3690,14 @@ begin
     else
         Key := Ref;
     Iter := Doc.SchIterator_Create;
-    Iter.AddFilter_ObjectSet(MkSet(81, 84, 85, 86, 104));
+    Iter.AddFilter_ObjectSet(MkSet(81, 84, 85, 86, 90, 104));
     Obj := Iter.FirstSchObject;
     while (Obj <> nil) do
     begin
         if ByDes then
         begin
-            if (Obj.ObjectId <> 81) and (AnsiUpperCase(ChildDesignatorText(Obj)) = Key) then
+            if (Obj.ObjectId <> 81) and (Obj.ObjectId <> 90) and
+               (AnsiUpperCase(ChildDesignatorText(Obj)) = Key) then
             begin
                 Result := Obj;
                 Break;
@@ -3745,6 +3746,70 @@ begin
                                MilsToCoord(StrToInt(SpecField(Rec, FirstField + 2 * (k - 1) + 1))));
 end;
 
+// Full path of the open project holding DocPath, or ''.
+function ProjectPathOfDocument(DocPath: String): String;
+var
+    p, i    : Integer;
+    Project : IProject;
+begin
+    Result := '';
+    for p := 0 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        Project := GetWorkspace.DM_Projects(p);
+        for i := 0 to Project.DM_LogicalDocumentCount - 1 do
+            if (NormalizedPath(Project.DM_LogicalDocuments(i).DM_FullPath) = NormalizedPath(DocPath)) then
+            begin
+                Result := Project.DM_ProjectFullPath;
+                Exit;
+            end;
+    end;
+end;
+
+// File names of the documents of project PrjPath with unsaved changes,
+// comma separated ('' when none).
+function UnsavedProjectDocuments(PrjPath: String): String;
+var
+    p, i    : Integer;
+    Project : IProject;
+    SD      : IServerDocument;
+begin
+    Result := '';
+    for p := 0 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        Project := GetWorkspace.DM_Projects(p);
+        if (NormalizedPath(Project.DM_ProjectFullPath) = NormalizedPath(PrjPath)) then
+            for i := 0 to Project.DM_LogicalDocumentCount - 1 do
+            begin
+                SD := Client.GetDocumentByPath(Project.DM_LogicalDocuments(i).DM_FullPath);
+                if (SD <> nil) and SD.Modified then
+                begin
+                    if (Result <> '') then Result := Result + ', ';
+                    Result := Result + ExtractFileName(Project.DM_LogicalDocuments(i).DM_FullPath);
+                end;
+            end;
+    end;
+end;
+
+// Update a harness connector from its library, the way changing its part
+// does: Altium then renders its physical views from the footprint's 3D
+// model. False (part number kept) if the library has no such part.
+function RefreshFromLibrary(Obj: ISch_GraphicalObject): Boolean;
+var
+    PN : String;
+begin
+    PN := Obj.DesignItemId;
+    // PostProcess_Import_FromUser updates from the library only when the
+    // part number changed since PreProcess_Import_FromUser
+    Obj.DesignItemId := 'MCP_TMP_REFRESH';
+    Obj.PreProcess_Import_FromUser;
+    Obj.DesignItemId := PN;
+    Obj.PostProcess_Import_FromUser;
+    Result := (Obj.DesignItemId = PN);
+    // A failed update leaves the placeholder part number behind
+    if not Result then
+        Obj.DesignItemId := PN;
+end;
+
 // Create, edit, move and delete harness layout drawing (.LdrDoc) objects:
 // connectors, connection points, bundles, coverings and layout labels.
 // Spec records (built by harness_layout.build_layout_spec; mils, lengths in
@@ -3757,9 +3822,16 @@ end;
 //   BUNDLE|uid or ''|designator|comment|length or AUTO|break|line_width|x1|y1|...
 //   COVERING|uid or ''|designator|part|library|thickness|start|end|item ref|...
 //   LABEL|uid or ''|designator|text|x|y|orientation|alignment|first_line|part|library
+//   VIEW|connector uid|physical or symbol|render 1/0
+//   WIRELEN|wire data uid|length (0 = calculated from the bundles)
 // Altium connects bundle ends to connection points by position when it loads
 // a drawing, so after geometry changes the saved drawing is closed, opened
-// again and saved.
+// again and saved. A connector shows its symbol when its views are hidden.
+// A new physical view is an image parameter that becomes the main model only
+// when the project is loaded from disk and is rendered by a library update:
+// so for a view to render the whole project is closed and opened again
+// (refused while one of its documents has unsaved changes), the connectors
+// are updated from the library and the drawing is saved once more.
 function ExecuteEditHarnessLayout(SpecPath: String): String;
 var
     Spec         : TStringList;
@@ -3786,6 +3858,15 @@ var
     CovUpdated   : Integer;
     LblCreated   : Integer;
     LblUpdated   : Integer;
+    ViewsChanged : Integer;
+    WireLengths  : Integer;
+    ViewUids     : TStringList;
+    Physical     : Boolean;
+    n            : Integer;
+    ChildIter    : ISch_Iterator;
+    PrjPath      : String;
+    Unsaved      : String;
+    j            : Integer;
     InfoStr      : String;
 begin
     Result := '{"success": false, "error": "layout edit did not run"}';
@@ -3797,6 +3878,7 @@ begin
 
     Spec := TStringList.Create;
     Misses := TStringList.Create;
+    ViewUids := TStringList.Create;
     try
         Spec.LoadFromFile(SpecPath);
         DocPath := '';
@@ -3837,6 +3919,9 @@ begin
         CovUpdated := 0;
         LblCreated := 0;
         LblUpdated := 0;
+        ViewsChanged := 0;
+        WireLengths := 0;
+        Unsaved := '';
         GeoChanged := False;
         Reloaded := False;
 
@@ -4104,6 +4189,69 @@ begin
                     else
                         LblUpdated := LblUpdated + 1;
                 end;
+            end
+            else if (Kind = 'VIEW') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 81) then
+                    Misses.Add('connector_view:' + SpecField(Rec, 1))
+                else
+                begin
+                    // As the Properties panel does: the symbol view hides
+                    // the image parameters (views), the physical view shows
+                    // them again. Never remove one: the connector caches its
+                    // main view and only Altium's own removal resets that
+                    // cache; a stale one raises a .NET error later.
+                    Physical := (SpecField(Rec, 2) = 'physical');
+                    n := 0;
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    ChildIter := Obj.SchIterator_Create;
+                    ChildIter.AddFilter_ObjectSet(MkSet(100));
+                    Item := ChildIter.FirstSchObject;
+                    while (Item <> nil) do
+                    begin
+                        Item.IsHidden := not Physical;
+                        n := n + 1;
+                        Item := ChildIter.NextSchObject;
+                    end;
+                    Obj.SchIterator_Destroy(ChildIter);
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    // Field 3 = 1: no rendered view yet, Altium renders it
+                    if Physical and (n > 0) and (SpecField(Rec, 3) = '1') then
+                        ViewUids.Add(SpecField(Rec, 1))
+                    else if Physical and (n = 0) then
+                    begin
+                        // An image parameter (100) that the reload makes the
+                        // main model and the library update renders (below)
+                        Item := SchServer.SchObjectFactory(100, eCreate_Default);
+                        if (Item = nil) then
+                            Misses.Add('connector_view:' + SpecField(Rec, 1))
+                        else
+                        begin
+                            Item.Name := 'LayoutDrawingSymbolModel1';
+                            Item.IsHidden := False;
+                            Obj.AddSchObject(Item);
+                            SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast,
+                                SCHM_PrimitiveRegistration, Item.I_ObjectAddress);
+                            ViewUids.Add(SpecField(Rec, 1));
+                        end;
+                    end;
+                    Obj.GraphicallyInvalidate;
+                    ViewsChanged := ViewsChanged + 1;
+                end;
+            end
+            else if (Kind = 'WIRELEN') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 90) then
+                    Misses.Add('wire:' + SpecField(Rec, 1))
+                else
+                begin
+                    // A length fixes the wire's total length (length type
+                    // "MCAD CoDesigner"); 0 returns it to the routed length
+                    Obj.SetState_Length(StrToInt(SpecField(Rec, 2)));
+                    WireLengths := WireLengths + 1;
+                end;
             end;
         end;
         SchServer.ProcessControl.PostProcess(Doc, '');
@@ -4116,6 +4264,69 @@ begin
         end;
         Saved := not ServerDoc.Modified;
         DocName := Doc.DocumentName;
+
+        // New physical views: reload the whole project from disk (closing a
+        // document alone does not reload it), then render the views
+        if Saved and (ViewUids.Count > 0) then
+        begin
+            PrjPath := ProjectPathOfDocument(DocPath);
+            if (PrjPath <> '') then
+                Unsaved := UnsavedProjectDocuments(PrjPath);
+            if (PrjPath = '') then
+                Misses.Add('physical_view_not_rendered:document is in no open project')
+            else if (Unsaved <> '') then
+                Misses.Add('physical_view_not_rendered:save or close first: ' + Unsaved)
+            else
+            begin
+                // Hold nothing of the project while Altium frees it
+                Obj := nil;
+                Item := nil;
+                Doc := nil;
+                ServerDoc := nil;
+                ResetParameters;
+                AddStringParameter('Action', 'Close');
+                AddStringParameter('ObjectKind', 'Project');
+                AddStringParameter('FileName', PrjPath);
+                AddStringParameter('PromptToSave', 'False');
+                RunProcess('WorkspaceManager:CloseObject');
+                ResetParameters;
+                AddStringParameter('ObjectKind', 'Project');
+                AddStringParameter('FileName', PrjPath);
+                RunProcess('WorkspaceManager:OpenObject');
+                ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
+                Doc := nil;
+                if (ServerDoc <> nil) then
+                begin
+                    Client.ShowDocument(ServerDoc);
+                    Doc := SchServer.GetSchDocumentByPath(DocPath);
+                end;
+                if (Doc = nil) then
+                    Saved := False
+                else
+                begin
+                    SchServer.ProcessControl.PreProcess(Doc, '');
+                    for j := 0 to ViewUids.Count - 1 do
+                    begin
+                        Obj := FindLayoutObject(Doc, ViewUids[j]);
+                        if (Obj = nil) then
+                            Misses.Add('physical_view_not_rendered:' + ViewUids[j])
+                        else if not RefreshFromLibrary(Obj) then
+                            Misses.Add('physical_view_not_rendered:' + Obj.DesignItemId + ' not found in its library');
+                    end;
+                    SchServer.ProcessControl.PostProcess(Doc, '');
+                    Doc.GraphicallyInvalidate;
+                    ServerDoc.Modified := True;
+                    try
+                        ServerDoc.DoFileSave('');
+                    except
+                    end;
+                    Reloaded := not ServerDoc.Modified;
+                    Saved := Reloaded;
+                end;
+                // The project reload linked the bundles too
+                GeoChanged := False;
+            end;
+        end;
 
         // Bundle ends connect to the connection points under them only when
         // Altium loads the drawing: close it, open it again, save the links.
@@ -4166,9 +4377,12 @@ begin
                   ', "coverings_updated": ' + IntToStr(CovUpdated) +
                   ', "layout_labels_created": ' + IntToStr(LblCreated) +
                   ', "layout_labels_updated": ' + IntToStr(LblUpdated) +
+                  ', "views_changed": ' + IntToStr(ViewsChanged) +
+                  ', "wire_lengths_set": ' + IntToStr(WireLengths) +
                   ', "reloaded": ' + LowerCase(BoolToStr(Reloaded, True)) +
                   ', "not_found": [' + InfoStr + ']}';
     finally
+        ViewUids.Free;
         Misses.Free;
         Spec.Free;
     end;

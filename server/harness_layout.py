@@ -32,6 +32,9 @@ COORD_PER_MIL = 10000
 MM_PER_MIL = 0.0254
 
 CP_STYLES = {0: "circle", 1: "square", 2: "insulator"}
+# THarnessWireLengthType: calculated = routed length + LengthOffset, user =
+# UserLength, mcad = LengthLong (what a script's SetState_Length sets)
+WIRE_LENGTH_TYPES = {0: "calculated", 1: "user", 2: "mcad"}
 # Copies of wiring-diagram objects: RECORD -> output key
 SYNCED_OBJECTS = {
     "116": "splices",
@@ -115,6 +118,20 @@ def _length(props: dict[str, str], key: str) -> dict[str, float]:
     return {"mils": value / COORD_PER_MIL, "mm": coord_to_mm(value)}
 
 
+def _wire_length(wire: dict[str, Any], routed: int | None) -> dict[str, float] | None:
+    """A wire's total length as Altium computes it for its length type
+    (routed in internal coords, None when the wire has no route)."""
+    kind = wire["length_type"]
+    if kind == "user":
+        return wire["user_length"]
+    if kind == "mcad":
+        return wire["fixed_length"]
+    if routed is None:
+        return None
+    value = routed + round(wire["length_offset"]["mils"] * COORD_PER_MIL)
+    return {"mils": value / COORD_PER_MIL, "mm": coord_to_mm(value)}
+
+
 def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     """Layout drawing objects of a saved .LdrDoc.
 
@@ -135,6 +152,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     coverings: dict[int, dict[str, Any]] = {}
     wires: dict[int, dict[str, Any]] = {}
     synced: dict[int, dict[str, Any]] = {}
+    image_views: dict[int, dict[str, Any]] = {}  # image parameter index -> view
 
     for idx, props in enumerate(records):
         rtype = props.get("RECORD")
@@ -238,6 +256,17 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "twist_uids": _uid_list(
                     props, "ConnectedTwistsUniqueIdsCount", "ConnectedTwistUniqueId"
                 ),
+                "length_type": WIRE_LENGTH_TYPES.get(
+                    int(props.get("LengthType", 0) or 0), "calculated"
+                ),
+                "fixed_length": _length(props, "LengthLong"),
+                "user_length": _length(props, "UserLength"),
+                "length_offset": _length(props, "LengthOffset"),
+                "via_bundle_uids": _uid_list(
+                    props,
+                    "BundlesToGoThroughUniqueIdsCount",
+                    "BundleToGoThroughUniqueId",
+                ),
             }
         elif rtype in SYNCED_OBJECTS and not owned:
             synced[idx] = {
@@ -248,6 +277,13 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "wire_uids": _uid_list(
                     props, "ConnectedWiresUniqueIdsCount", "ConnectedWireUniqueId"
                 ),
+            }
+        elif rtype == "30" and owned and int(props["OwnerIndex"]) in image_views:
+            image_views[int(props["OwnerIndex"])]["image"] = {
+                "x1": _coord(props, "Location.X"),
+                "y1": _coord(props, "Location.Y"),
+                "x2": _coord(props, "Corner.X"),
+                "y2": _coord(props, "Corner.Y"),
             }
         elif rtype in ("34", "41") and owned:
             owner = int(props["OwnerIndex"])
@@ -262,20 +298,20 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                     view = dict(
                         part.split("=", 1) for part in val.split("|") if "=" in part
                     )
-                    connectors[owner]["views"].append(
-                        {
-                            "name": view.get("ViewName", ""),
-                            "type": view.get("ViewType", ""),
-                            "side": view.get("ViewSide", ""),
-                            "rotation": view.get("Rotation", ""),
-                            "zoom": view.get("Zoom", ""),
-                            "main": view.get("MainModel") == "True",
-                            "location": {
-                                "x": _coord(props, "Location.X"),
-                                "y": _coord(props, "Location.Y"),
-                            },
-                        }
-                    )
+                    image_views[idx] = {
+                        "name": view.get("ViewName", ""),
+                        "type": view.get("ViewType", ""),
+                        "side": view.get("ViewSide", ""),
+                        "rotation": view.get("Rotation", ""),
+                        "zoom": view.get("Zoom", ""),
+                        "main": view.get("MainModel") == "True",
+                        # hidden views = the connector shows its symbol
+                        "hidden": props.get("IsHidden") == "T",
+                        # the rendered picture (child image), None until
+                        # Altium has rendered the view
+                        "image": None,
+                    }
+                    connectors[owner]["views"].append(image_views[idx])
             else:
                 target = (
                     cps.get(owner)
@@ -347,15 +383,21 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     for w in wires.values():
         (end1, cp1), (end2, cp2) = end_of(w["end1_uid"]), end_of(w["end2_uid"])
         w["end1"], w["end2"] = end1, end2
+        w["via_bundles"] = [
+            (bundle_by_uid[u]["designator"] or u) if u in bundle_by_uid else u
+            for u in w.pop("via_bundle_uids")
+        ]
         route = _shortest_route(graph, cp1, cp2)
         if route is None:
             w["route"] = None
             w["routed_length"] = None
+            w["length"] = _wire_length(w, None)
             unrouted.append(w["designator"])
             continue
         w["route"] = [b["designator"] or b["unique_id"] for b in route]
         total = sum(int(b["length"]["mils"] * COORD_PER_MIL) for b in route)
         w["routed_length"] = {"mils": total / COORD_PER_MIL, "mm": coord_to_mm(total)}
+        w["length"] = _wire_length(w, total)
         for b in route:
             b["wires"].append(w["designator"])
 
@@ -415,6 +457,9 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
 # same run are 'DES:<designator>', all others UniqueIDs.
 
 CP_STYLE_IDS = {name: idx for idx, name in CP_STYLES.items()}
+# Connector views: "physical" = picture of the footprint's 3D model (Altium
+# renders it), "symbol" = the schematic symbol
+CONNECTOR_VIEWS = ("physical", "symbol")
 # Designator of a new connection point, from the point (mils); Altium puts
 # it near the sheet origin. About where imported connection points have it.
 CP_DESIGNATOR_OFFSET = (200, 400)
@@ -440,6 +485,24 @@ def _rotate(dx: int, dy: int, quarter_turns: int) -> tuple[int, int]:
     for _ in range(quarter_turns % 4):
         dx, dy = -dy, dx
     return dx, dy
+
+
+def _rendered_main_view(views: list[dict[str, Any]]) -> bool:
+    """True when a connector has a rendered main physical view (shown or not)."""
+    return any(
+        v["type"] == "ePhysicalView" and v["main"] and v.get("image") for v in views
+    )
+
+
+def _shows_physical(views: list[dict[str, Any]]) -> bool:
+    """True when a connector is drawn as its physical view, not its symbol."""
+    return any(
+        v["type"] == "ePhysicalView"
+        and v["main"]
+        and v.get("image")
+        and not v.get("hidden")
+        for v in views
+    )
 
 
 def _flag(value: Any) -> str:
@@ -474,17 +537,21 @@ def build_layout_spec(
     coverings: list[dict[str, Any]] | None = None,
     layout_labels: list[dict[str, Any]] | None = None,
     delete: list[str] | None = None,
+    wires: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Spec records for edit_harness_layout from the parse_ldrdoc() output of
     the saved drawing and the requested changes.
 
     Returns {"records": [[field, ...], ...], "errors": [...], "warnings": [...],
-    "expect": {"bundles": {designator: [from_cp, to_cp]}}}. Records are only
-    usable when errors is empty. Objects are named by designator (or by
-    unique_id when they have none); coordinates are mils, lengths mm.
+    "expect": {"bundles": {designator: [from_cp, to_cp]}, "views": {connector:
+    view}, "wire_lengths": {wire: mm or None}}}. Records are only usable when
+    errors is empty. Objects are named by designator (or by unique_id when they
+    have none); coordinates are mils, lengths mm.
     """
     errors: list[str] = []
     warnings: list[str] = []
+    view_records: list[list[Any]] = []
+    expect_views: dict[str, str] = {}
 
     conns = {c["designator"]: c for c in layout["connectors"]}
     cps_by_uid = {cp["unique_id"]: cp for cp in layout["connection_points"]}
@@ -586,6 +653,21 @@ def build_layout_spec(
             errors.append(f"connector '{des}': {e}")
             continue
         mirror = item.get("mirrored")
+        view = item.get("view")
+        if view is not None:
+            view = str(view).lower()
+            if view not in CONNECTOR_VIEWS:
+                errors.append(
+                    f"connector '{des}': view must be one of {sorted(CONNECTOR_VIEWS)}"
+                )
+                continue
+            if (view == "physical") != _shows_physical(conn["views"]):
+                # render: no view to show yet, Altium must render one
+                render = view == "physical" and not _rendered_main_view(conn["views"])
+                view_records.append(["VIEW", conn["unique_id"], view, _flag(render)])
+            expect_views[des] = view
+        if not {"x", "y", "orientation", "mirrored"} & item.keys():
+            continue
         connector_records.append(
             ["CONNECTOR", conn["unique_id"], x, y, ori, _flag(mirror)]
         )
@@ -932,22 +1014,51 @@ def build_layout_spec(
             ]
         )
 
+    wire_records: list[list[Any]] = []
+    expect_lengths: dict[str, float | None] = {}
+    wires_by_des = {w["designator"]: w for w in layout.get("wires", [])}
+    for item in wires or []:
+        des = item_key(item)
+        wire = wires_by_des.get(des)
+        if wire is None:
+            errors.append(f"wire '{des}' not found in the layout drawing")
+            continue
+        if "length_mm" not in item:
+            errors.append(f"wire '{des}': give length_mm (a number, or None)")
+            continue
+        if item["length_mm"] is None:
+            coord = 0
+        else:
+            coord = mm_to_coord(float(item["length_mm"]))
+            if not 0 < coord < 2**31:
+                errors.append(
+                    f"wire '{des}': length_mm must be between 0 and "
+                    f"{coord_to_mm(2**31 - 1):.0f}"
+                )
+                continue
+        wire_records.append(["WIRELEN", wire["unique_id"], coord])
+        expect_lengths[des] = None if coord == 0 else coord_to_mm(coord)
+
     return {
         "records": [
             *delete_records,
             *connector_records,
+            *view_records,
             *cp_records,
             *assign_records,
             *bundle_records,
             *covering_records,
             *label_records,
+            *wire_records,
         ],
         "errors": errors,
         "warnings": warnings,
         "expect": {
             "bundles": {
                 name: [renamed.get(e, e) for e in ends] for name, ends in expect.items()
-            }
+            },
+            "views": expect_views,
+            "wire_lengths": expect_lengths,
         },
     }
 
@@ -999,6 +1110,22 @@ def check_layout(
                 "wires": len(b["wires"]),
             }
         )
+    conns = {c["designator"]: c for c in layout["connectors"]}
+    for des, view in expect.get("views", {}).items():
+        views = conns[des]["views"] if des in conns else []
+        if (view == "physical") != _shows_physical(views):
+            problems.append(f"connector {des}: view is not {view} in the saved drawing")
+    wires = {w["designator"]: w for w in layout.get("wires", [])}
+    for des, mm in expect.get("wire_lengths", {}).items():
+        w = wires.get(des)
+        if w is None:
+            problems.append(f"wire {des}: not in the saved drawing")
+        elif mm is None and w["length_type"] != "calculated":
+            problems.append(f"wire {des}: length is still {w['length_type']}")
+        elif mm is not None and (
+            w["length_type"] != "mcad" or abs(w["fixed_length"]["mm"] - mm) > 0.01
+        ):
+            problems.append(f"wire {des}: length not set to {mm} mm")
     return problems, found
 
 

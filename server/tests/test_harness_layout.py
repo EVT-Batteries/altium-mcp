@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from harness_layout import (
     _follow_end,
+    _wire_length,
     build_layout_spec,
     check_layout,
     coord_to_mm,
@@ -58,6 +59,35 @@ def _bundle(des, uid, points, end1, end2, cp1, cp2):
     }
 
 
+def _view(main=True, hidden=False, rendered=True):
+    """A connector view (image parameter) as parse_ldrdoc reports it."""
+    return {
+        "name": "Top",
+        "type": "ePhysicalView",
+        "side": "eTopView",
+        "rotation": "eRotate0",
+        "zoom": "1",
+        "main": main,
+        "hidden": hidden,
+        "image": {"x1": 0, "y1": 0, "x2": 100, "y2": 100} if rendered else None,
+    }
+
+
+def _len(mm):
+    return {"mils": mm / 0.0254, "mm": mm}
+
+
+def _wire(des, uid, length_type="calculated", fixed_mm=0, user_mm=0, offset_mm=0):
+    return {
+        "designator": des,
+        "unique_id": uid,
+        "length_type": length_type,
+        "fixed_length": _len(fixed_mm),
+        "user_length": _len(user_mm),
+        "length_offset": _len(offset_mm),
+    }
+
+
 def make_layout():
     """J1 (CP_J1 at 1000,1000) -- B1 -- CP1 (1200,1200, holds SP1) ; P1 and
     its CP_P1 at 2000,1200 with no bundle; COV1 on B1; label L1; SP2 free."""
@@ -70,6 +100,7 @@ def make_layout():
                 "mirrored": False,
                 "unique_id": "UJ1",
                 "connection_point": "CP_J1",
+                "views": [],
             },
             {
                 "designator": "P1",
@@ -78,6 +109,7 @@ def make_layout():
                 "mirrored": False,
                 "unique_id": "UP1",
                 "connection_point": "CP_P1",
+                "views": [_view()],
             },
         ],
         "connection_points": [
@@ -115,7 +147,10 @@ def make_layout():
             {"designator": "SP1", "unique_id": "USP1"},
             {"designator": "SP2", "unique_id": "USP2"},
         ],
-        "wires": [],
+        "wires": [
+            _wire("W1", "UW1"),
+            _wire("W2", "UW2", "mcad", fixed_mm=700),
+        ],
         "unrouted_wires": [],
     }
 
@@ -329,6 +364,123 @@ class TestBuildLayoutSpec(unittest.TestCase):
             self.layout, connectors=[{"designator": "P1", "orientation": 45}]
         )
         self.assertIn("multiple of 90", spec["errors"][0])
+
+
+class TestViewsAndWireLengths(unittest.TestCase):
+    def setUp(self):
+        self.layout = make_layout()
+
+    def test_view_records_only_when_the_view_changes(self):
+        spec = build_layout_spec(
+            self.layout,
+            connectors=[
+                {"designator": "J1", "view": "Physical"},
+                {"designator": "P1", "view": "physical"},
+            ],
+        )
+        self.assertEqual(spec["errors"], [])
+        # J1 has no view: Altium renders one; P1 already shows its own
+        self.assertEqual(records_of(spec, "VIEW"), [["VIEW", "UJ1", "physical", "1"]])
+        # a view alone moves nothing
+        self.assertEqual(records_of(spec, "CONNECTOR"), [])
+        self.assertEqual(spec["expect"]["views"], {"J1": "physical", "P1": "physical"})
+
+    def test_symbol_hides_and_physical_shows_a_rendered_view(self):
+        spec = build_layout_spec(
+            self.layout, connectors=[{"designator": "P1", "view": "symbol"}]
+        )
+        self.assertEqual(records_of(spec, "VIEW"), [["VIEW", "UP1", "symbol", "0"]])
+        self.layout["connectors"][1]["views"] = [_view(hidden=True)]
+        spec = build_layout_spec(
+            self.layout, connectors=[{"designator": "P1", "view": "physical"}]
+        )
+        # hidden but rendered: shown again without rendering
+        self.assertEqual(records_of(spec, "VIEW"), [["VIEW", "UP1", "physical", "0"]])
+        self.layout["connectors"][1]["views"] = [_view(main=False, rendered=False)]
+        spec = build_layout_spec(
+            self.layout, connectors=[{"designator": "P1", "view": "physical"}]
+        )
+        self.assertEqual(records_of(spec, "VIEW"), [["VIEW", "UP1", "physical", "1"]])
+
+    def test_view_with_a_move_and_a_bad_view(self):
+        spec = build_layout_spec(
+            self.layout,
+            connectors=[{"designator": "J1", "x": 9000, "y": 10000, "view": "symbol"}],
+        )
+        self.assertEqual(records_of(spec, "VIEW"), [])
+        self.assertEqual(
+            records_of(spec, "CONNECTOR")[0][:4], ["CONNECTOR", "UJ1", 9000, 10000]
+        )
+        spec = build_layout_spec(
+            self.layout, connectors=[{"designator": "J1", "view": "3d"}]
+        )
+        self.assertIn("view must be one of", spec["errors"][0])
+
+    def test_wire_length_records(self):
+        spec = build_layout_spec(
+            self.layout,
+            wires=[
+                {"designator": "W1", "length_mm": 520},
+                {"designator": "W2", "length_mm": None},
+            ],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(
+            records_of(spec, "WIRELEN"),
+            [["WIRELEN", "UW1", mm_to_coord(520)], ["WIRELEN", "UW2", 0]],
+        )
+        self.assertEqual(spec["expect"]["wire_lengths"], {"W1": 520.0, "W2": None})
+        self.assertEqual(spec["records"][-1][0], "WIRELEN")
+
+    def test_wire_length_errors(self):
+        spec = build_layout_spec(
+            self.layout,
+            wires=[
+                {"designator": "W9", "length_mm": 1},
+                {"designator": "W1"},
+                {"designator": "W2", "length_mm": 0},
+                {"designator": "W2", "length_mm": 1e9},
+            ],
+        )
+        text = " ".join(spec["errors"])
+        self.assertIn("'W9' not found", text)
+        self.assertIn("give length_mm", text)
+        self.assertEqual(text.count("must be between"), 2)
+        self.assertEqual(records_of(spec, "WIRELEN"), [])
+
+    def test_check_views_and_wire_lengths(self):
+        expect = {
+            "bundles": {},
+            "views": {"J1": "symbol", "P1": "physical"},
+            "wire_lengths": {"W1": None, "W2": 700.0},
+        }
+        problems, _ = check_layout(self.layout, expect)
+        self.assertEqual(problems, [])
+        self.layout["connectors"][1]["views"] = [_view(hidden=True)]
+        self.layout["wires"][1]["fixed_length"] = _len(650)
+        expect["wire_lengths"]["W3"] = None
+        problems, _ = check_layout(self.layout, expect)
+        self.assertEqual(
+            problems,
+            [
+                "connector P1: view is not physical in the saved drawing",
+                "wire W2: length not set to 700.0 mm",
+                "wire W3: not in the saved drawing",
+            ],
+        )
+
+    def test_wire_length_per_type(self):
+        routed = mm_to_coord(500)
+        self.assertAlmostEqual(
+            _wire_length(_wire("W", "U", offset_mm=20), routed)["mm"], 520.0
+        )
+        self.assertIsNone(_wire_length(_wire("W", "U"), None))
+        self.assertEqual(
+            _wire_length(_wire("W", "U", "user", user_mm=300), routed)["mm"], 300
+        )
+        self.assertEqual(
+            _wire_length(_wire("W", "U", "mcad", fixed_mm=700), None)["mm"], 700
+        )
 
 
 class TestCheckLayout(unittest.TestCase):

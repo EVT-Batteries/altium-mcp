@@ -123,6 +123,12 @@ Finally, for anything visual (routing, labels, graphics) take a screenshot of th
   - `executor_wedged: true`: both steps failed. **Do not retry.** Pass the `recovery` text on
     to the user (focus the stuck script tab and press Ctrl+F3, close an open Altium dialog, or
     restart Altium), and do non-Altium work while you wait.
+  - Before any launch the bridge, the sandbox and the recovery check
+    `_blocking_altium_dialogs()`. Altium's main window is disabled while a modal window is up.
+    If one stays up after the closable boxes are dismissed, for example the .NET error report
+    whose "Send and Close" may end Altium, nothing is launched: a new `X2.EXE` would only show
+    "another instance ... busy" and wait. The result then has `executor_wedged: true` and
+    names the window titles to give the user.
 
   After an Altium "Error" box the sandbox stops waiting about 3 s later rather than running to
   its timeout. It reports dialog texts where Windows exposes them (`dismissed_dialog_texts`);

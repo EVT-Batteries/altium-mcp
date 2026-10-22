@@ -20,6 +20,7 @@ class TestRecoverScriptExecutor(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.patchers = [
             patch("main._dismiss_altium_dialogs", return_value=[]),
+            patch("main._blocking_altium_dialogs", return_value=[]),
             patch("main.subprocess.run", MagicMock()),
             patch("main.asyncio.sleep", AsyncMock()),
         ]
@@ -70,6 +71,21 @@ class TestRecoverScriptExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["recovered"])
         self.assertEqual(responds.await_count, 1)
 
+    async def test_modal_dialog_launches_nothing(self):
+        # X2.EXE -REditScript:Stop would wait behind Altium's .NET error box
+        with (
+            patch("main._blocking_altium_dialogs", return_value=["Error"]),
+            patch("main._script_engine_responds", AsyncMock()) as responds,
+            patch("main._send_ctrl_f3") as keys,
+        ):
+            result = await main._recover_script_executor()
+        self.assertFalse(result["recovered"])
+        self.assertEqual(result["blocking_dialogs"], ["Error"])
+        self.assertIn("Error", result["ask_user"])
+        self.stop_cmd.assert_not_called()
+        responds.assert_not_awaited()
+        keys.assert_not_called()
+
 
 class TestSandboxRecovers(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -87,6 +103,7 @@ class TestSandboxRecovers(unittest.IsolatedAsyncioTestCase):
         with (
             patch("main.subprocess.Popen"),
             patch("main._dismiss_altium_dialogs", return_value=[]),
+            patch("main._blocking_altium_dialogs", return_value=[]),
             patch(
                 "main._recover_script_executor", AsyncMock(return_value=recovery)
             ) as rec,
@@ -105,6 +122,7 @@ class TestSandboxRecovers(unittest.IsolatedAsyncioTestCase):
         with (
             patch("main.subprocess.Popen"),
             patch("main._dismiss_altium_dialogs", return_value=[]),
+            patch("main._blocking_altium_dialogs", return_value=[]),
             patch("main._recover_script_executor", AsyncMock()) as rec,
             patch(
                 "main.SANDBOX_RESULT", MagicMock(exists=MagicMock(return_value=False))
@@ -116,6 +134,30 @@ class TestSandboxRecovers(unittest.IsolatedAsyncioTestCase):
             )
         rec.assert_not_awaited()
         self.assertTrue(out["executor_wedged"], out)
+
+    async def test_modal_dialog_blocks_the_run(self):
+        with (
+            patch("main.subprocess.Popen") as launch,
+            patch("main._blocking_altium_dialogs", return_value=["Error"]),
+            patch("main._recover_script_executor", AsyncMock()) as rec,
+        ):
+            out = json.loads(await main._run_sandbox("ResultText := 'x';", 0))
+        launch.assert_not_called()
+        rec.assert_not_awaited()
+        self.assertTrue(out["executor_wedged"])
+        self.assertIn("ask the user", out["recovery"])
+
+
+class TestBridgeRefusesWhenBlocked(unittest.IsolatedAsyncioTestCase):
+    async def test_no_request_while_blocked(self):
+        with (
+            patch("main._blocking_altium_dialogs", return_value=["Error"]),
+            patch.object(main.altium_bridge, "run_altium_script", AsyncMock()) as run,
+        ):
+            out = await main.altium_bridge._execute_command_locked("ping", {})
+        run.assert_not_awaited()
+        self.assertFalse(out["success"])
+        self.assertTrue(out["executor_wedged"])
 
 
 if __name__ == "__main__":

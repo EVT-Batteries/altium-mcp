@@ -346,6 +346,14 @@ class AltiumBridge:
         self, command: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         try:
+            blocking = _blocking_altium_dialogs()
+            if blocking:
+                return {
+                    "success": False,
+                    "error": f"Altium is blocked; {_blocked_ask_user(blocking)}",
+                    "executor_wedged": True,
+                }
+
             # Clean up any existing response file
             if RESPONSE_FILE.exists():
                 RESPONSE_FILE.unlink()
@@ -1513,6 +1521,60 @@ def _altium_main_window():
     return max(best)[1] if best else None
 
 
+def _blocking_altium_dialogs() -> list[str]:
+    """Titles of the modal windows that block Altium, after closing the ones
+    _dismiss_altium_dialogs may close; [] when Altium is free.
+
+    Altium disables its main window while a modal window is up. One the MCP
+    must not close, such as the .NET "Error" report (Send and Close may end
+    Altium), also blocks the command line: X2.EXE started then shows "another
+    instance ... is busy" and waits, so nothing may be launched until the user
+    has closed it.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:
+        return []
+    user32 = ctypes.windll.user32
+    for _ in range(2):
+        main_hwnd = _altium_main_window()
+        if not main_hwnd or user32.IsWindowEnabled(main_hwnd):
+            return []
+        if not _dismiss_altium_dialogs():
+            break
+        time.sleep(1.0)
+    else:
+        main_hwnd = _altium_main_window()
+        if not main_hwnd or user32.IsWindowEnabled(main_hwnd):
+            return []
+    titles = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, lparam):
+        if hwnd == main_hwnd or not user32.IsWindowVisible(hwnd):
+            return True
+        if not user32.IsWindowEnabled(hwnd):
+            return True
+        n = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.GetWindowTextW(hwnd, buf, n + 1)
+        if buf.value and _window_process_name(hwnd).lower() == "x2.exe":
+            titles.append(buf.value)
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return titles or ["(untitled window)"]
+
+
+def _blocked_ask_user(titles: list[str]) -> str:
+    return (
+        f"Altium shows a modal window the MCP must not close ({', '.join(titles)}). "
+        "Stop retrying and ask the user to read it and close it (for Altium's error "
+        "report, choose to continue if offered, not Send and Close), then try again."
+    )
+
+
 def _send_ctrl_f3() -> bool:
     """Press Ctrl+F3 (Run » Stop, stops a paused script) in Altium's main
     window. Keys carry scan codes: Altium ignores virtual-key-only events.
@@ -1558,6 +1620,15 @@ async def _recover_script_executor() -> dict[str, Any]:
     nothing worked, "ask_user" holds what to ask the user to do.
     """
     _dismiss_altium_dialogs()
+    blocking = _blocking_altium_dialogs()
+    if blocking:
+        # EditScript:Stop would wait behind it ("another instance ... busy")
+        return {
+            "recovered": False,
+            "method": None,
+            "blocking_dialogs": blocking,
+            "ask_user": _blocked_ask_user(blocking),
+        }
     exe = altium_bridge.config.altium_exe_path
     subprocess.run(f'"{exe}" -REditScript:Stop', shell=True)
     await asyncio.sleep(2)
@@ -1678,6 +1749,17 @@ async def _run_sandbox(script: str, timeout_seconds: int, recover: bool = True) 
 
     # Altium runs outside Claude Desktop's MSIX package and cannot see the
     # virtualized AppData path this process sees (issue #19)
+    blocking = _blocking_altium_dialogs()
+    if blocking:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "Altium is blocked by a modal window; the script did not run",
+                "executor_wedged": True,
+                "recovery": _blocked_ask_user(blocking),
+            }
+        )
+
     sandbox_prj = AltiumBridge._resolve_msix_path(str(work_prj))
     cmd = (
         f'"{altium_bridge.config.altium_exe_path}" -RScriptingSystem:RunScript('
@@ -2740,11 +2822,13 @@ async def edit_harness_layout(
     coverings: list | None = None,
     layout_labels: list | None = None,
     delete: list | None = None,
+    wires: list | None = None,
     dry_run: bool = False,
 ) -> str:
     """
-    Create, move, edit and delete objects on a Harness Layout Drawing (.LdrDoc): connectors,
-    connection points, bundles, coverings and layout labels.
+    Create, move, edit and delete objects on a Harness Layout Drawing (.LdrDoc): connectors
+    (including their physical / symbol view), connection points, bundles, coverings, layout
+    labels and wire lengths.
 
     Objects are named by designator (unnamed ones by the unique_id get_harness_data reports)
     and edited in place, so their links to the wiring diagram survive. Coordinates are true
@@ -2766,6 +2850,17 @@ async def edit_harness_layout(
             The connector's own connection point (CP_P5) follows with the same offset, turned
             with the connector, unless it is given a position in connection_points or here as
             "connection_point": {"x": ..., "y": ...}; bundles on it follow too.
+            "view": "physical" shows the connector as a picture of its footprint's 3D model
+            (top view, 50 mm box, turned with the connector), "symbol" as its schematic
+            symbol, e.g. [{"designator": "P2", "view": "physical"}]. As Altium's Properties
+            panel does, "symbol" hides the connector's views and "physical" shows them again.
+            A connector that has never had a rendered view gets a new one: Altium renders
+            the picture only after loading the project from disk, so that closes and reopens
+            the whole harness project (its other tabs close too) and updates the connector
+            from its library (as changing its part does: database parameters are refreshed,
+            its pins in the layout get new UniqueIDs, wires stay linked). Refused, with
+            nothing rendered, while a document of that project has unsaved changes. A new
+            view's side and zoom are Altium's defaults (change them in Altium).
         connection_points (list): New or existing connection points, e.g.
             [{"designator": "CP1", "x": 12000, "y": 12000, "style": "circle",
               "show_name": True, "orientation": 0, "objects": ["SP1"],
@@ -2797,15 +2892,19 @@ async def edit_harness_layout(
               "part_number": "...", "source_library": "..."}].
         delete (list): Designators / unique ids of bundles, coverings, layout labels or
             connection points (which must hold nothing) to remove.
+        wires (list): Fixed total wire lengths, e.g. [{"designator": "W1", "length_mm": 520}];
+            None returns the wire to the length of its bundle route. Altium shows a fixed
+            length as length type "MCAD CoDesigner" and no longer follows bundle changes.
         dry_run (bool): Only validate and return the spec records.
 
-    Not supported: connector views (physical / symbol, set in Altium) and wire length
-    offsets. Wires re-assigned to other bundles by hand in Altium are not detected: routes
-    are computed as Altium's default, the shortest bundle path.
+    Not supported (Altium's script interface has no setter): wire length offsets
+    ("Offset Length", calculated type), user-defined wire lengths and manual wire paths.
+    get_harness_data reports all of them once set in Altium (length_type, length_offset,
+    via_bundles, length).
 
     Returns:
         str: JSON with success, saved, reloaded, counts, not_found, warnings, bundles,
-             problems and unrouted_wires.
+             problems, unrouted_wires and newly_unrouted_wires.
     """
     if not document_path:
         return json.dumps({"success": False, "error": "document_path is required"})
@@ -2824,6 +2923,7 @@ async def edit_harness_layout(
             coverings=coverings,
             layout_labels=layout_labels,
             delete=delete,
+            wires=wires,
         )
     except (KeyError, TypeError, ValueError, IndexError) as e:
         return json.dumps({"success": False, "error": f"invalid request: {e!r}"})
