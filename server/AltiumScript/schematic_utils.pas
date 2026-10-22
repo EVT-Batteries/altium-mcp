@@ -2344,6 +2344,34 @@ begin
     Result := True;
 end;
 
+// First twist (93) or shield (92) on Doc whose child designator is Des, or nil.
+function FindHarnessByChildDesignator(Doc: ISch_Document; ObjId: Integer; Des: String): ISch_GraphicalObject;
+var
+    Iter      : ISch_Iterator;
+    ChildIter : ISch_Iterator;
+    Obj       : ISch_GraphicalObject;
+    Prim      : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(ObjId));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        ChildIter := Obj.SchIterator_Create;
+        ChildIter.AddFilter_ObjectSet(MkSet(25));
+        Prim := ChildIter.FirstSchObject;
+        Obj.SchIterator_Destroy(ChildIter);
+        if (Prim <> nil) and (AnsiUpperCase(Prim.Text) = AnsiUpperCase(Des)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
 // First sheet text (eLabel) at X, Y mils whose text is OldText (any text
 // when OldText is empty), or nil.
 function FindLabelAt(Doc: ISch_Document; X, Y: Integer; OldText: String): ISch_GraphicalObject;
@@ -3225,8 +3253,8 @@ begin
                 // SHIELD|x1|y1|x2|y2|<rotation 0-3>|<style: 0 shield, 1 shield with connection>[|<Designator>]
                 // CABLE|x1|y1|x2|y2|<rotation 0-3>|<Designator>|<Comment>|<PartNumber>|<SourceLibraryName>[|Name|Value...]
                 // A rectangle across the wires; Altium links every wire it
-                // touches. An identical rectangle (or, for a cable, the same
-                // designator) is updated instead of placed again.
+                // touches. An identical rectangle or the same designator is
+                // updated (moved / resized) instead of placed again.
                 RX1 := MinInt(StrToInt(SpecField(Rec, 1)), StrToInt(SpecField(Rec, 3)));
                 RY1 := MinInt(StrToInt(SpecField(Rec, 2)), StrToInt(SpecField(Rec, 4)));
                 RX2 := MaxInt(StrToInt(SpecField(Rec, 1)), StrToInt(SpecField(Rec, 3)));
@@ -3237,6 +3265,10 @@ begin
                 Obj := nil;
                 if (j = 98) and (SpecField(Rec, 6) <> '') then
                     Obj := FindHarnessCable(TargetDoc, SpecField(Rec, 6));
+                if (j = 93) and (SpecField(Rec, 6) <> '') then
+                    Obj := FindHarnessByChildDesignator(TargetDoc, j, SpecField(Rec, 6));
+                if (j = 92) and (SpecField(Rec, 7) <> '') then
+                    Obj := FindHarnessByChildDesignator(TargetDoc, j, SpecField(Rec, 7));
                 if (Obj = nil) then
                     Obj := FindHarnessRect(TargetDoc, j, RX1, RY1, RX2, RY2);
                 FoundOnSheet := (Obj <> nil);

@@ -2288,7 +2288,7 @@ def _rotation(item: dict) -> str:
 
 
 def _wire_label_positions(item: dict, pts: list[int]) -> tuple[list, list]:
-    from harness_router import label_positions
+    from harness_check import label_positions
 
     des_pos = item.get("designator_pos")
     com_pos = item.get("comment_pos")
@@ -2403,8 +2403,9 @@ async def add_harness_wiring(
             removes them.
         twists (list): Twist marks; a rectangle in mils across the wires to twist, e.g.
             [{"x1": 13300, "y1": 8000, "x2": 13400, "y2": 8600, "designator": "TW1"}].
-            Altium links every wire the rectangle crosses or touches. Sending the rectangle of
-            an existing twist (or shield) with a designator only re-annotates it.
+            Altium links every wire the rectangle crosses or touches. A twist (or shield)
+            with the designator of an existing one is moved / resized to the new rectangle;
+            sending the rectangle of an existing one with a new designator re-annotates it.
         shields (list): Shields, a rectangle across the shielded wires, e.g.
             [{"x1": 13800, "y1": 7700, "x2": 14300, "y2": 8700, "style": "with_connection",
               "rotation": 0, "designator": "SH1"}]
@@ -2424,7 +2425,8 @@ async def add_harness_wiring(
             closes and reopens the saved document ("relinked": true; the undo history is
             lost) and reports the links read back from the file under "links". A
             rectangle that links no wire or a break on no wire end is listed in not_found.
-            Placing an identical rectangle or a break at the same point again updates it.
+            Placing an identical rectangle (or a twist / shield / cable with the same
+            designator) or a break at the same point again updates it.
         relink (bool): Reopen the document after saving to recompute those links even when
             no geometry changed (e.g. twists copied in the GUI keep the copied links).
         label_updates (list): Change existing sheet texts (eLabel), e.g.
@@ -3156,79 +3158,43 @@ async def get_sheet_style(ctx: Context, document_path: str = "") -> str:
 
 
 @mcp.tool()
-async def reroute_harness_wiring(
-    ctx: Context,
-    document_path: str,
-    trunk_x_start: int | None = None,
-    channel_spacing_mils: int = 300,
-    dry_run: bool = False,
-) -> str:
-    """Re-route every wire of an Altium Harness Wiring Diagram (.WirDoc) orthogonally, in place.
+async def check_harness_wiring(ctx: Context, file_path: str) -> str:
+    """Check the drawing of an Altium Harness Wiring Diagram (.WirDoc); read-only.
 
-    Use after connectors moved and wires rubber-banded. Endpoints stay on their pins and
-    splices; only the path between them and the label positions change. Wires are moved in
-    place, so their UniqueIDs, parameters, colours, library links and layout-drawing (.LdrDoc)
-    links survive. Text, rectangles, splices and no-connects are not touched.
+    Run it after placing or moving wires (add_harness_wiring wires / reroutes / twists),
+    together with a screenshot: it sees the whole sheet, including what a screenshot shows
+    too small or off-screen. It reads the SAVED file and works without Altium.
 
-    Routing rules (see harness_router.py): straight wires stay straight; vertical drops live
-    in per-connector-pair corridors near the destination side; 300 mil channel pitch; UP and
-    DOWN wires nested as concentric staircases; channels shared only when that adds no
-    crossing; channels and labels keep clear of pin names and splices; labels side by side on
-    the longest horizontal run, staggered by 900 mils on tight parallel runs.
-
-    The routes are computed from the SAVED file: save the document in Altium first.
+    errors: diagonal segments; wire ends on no pin hot end, splice or wire break; wires
+    drawn on top of each other (shared stretch); wires running through another
+    connector's pins.
+    warnings: crossings with < 100 mils straight next to them; parallel horizontal runs
+    < 100 mils apart; vertical runs < 200 mils apart; vertical runs in front of pin names
+    or pin callout text (+ 150 mils); wire labels on other wires, labels, sheet text or
+    pin names; labels away from their wire; twist marks linking other than 2 wires, not
+    spanning exactly between their two wire runs, or shorter than 300 mils.
+    Crossings are counted and listed but are not problems: those forced by the pin order
+    of two connectors cannot be routed away.
 
     Args:
-        document_path: Full path to target .WirDoc file. Required.
-        trunk_x_start: Optional X (mils) of the first channel of every corridor. By default each
-            corridor starts next to its destination side.
-        channel_spacing_mils: Distance between vertical channels (default 300 mils).
-        dry_run: Only compute and report the routes, change nothing.
+        file_path: Full path to the .WirDoc.
 
     Returns:
-        JSON with success, summary (corridors, channels, crossings, ...), warnings
-        (pin-name or splice clearance problems, wires that could not be rerouted) and
-        Altium's report.
+        JSON with clean (no problems at all), summary (wire_count, crossings, errors,
+        warnings, by_type), problems [{severity, type, wires, detail, at (mils)}] and
+        crossings [{wires, at}] (each list capped at 200 entries).
     """
-    import harness_router
+    import harness_check
 
-    if not document_path or Path(document_path).suffix.lower() != ".wirdoc":
-        return json.dumps(
-            {"success": False, "error": "document_path to a .WirDoc is required"}
-        )
-
+    if not file_path or Path(file_path).suffix.lower() != ".wirdoc":
+        return json.dumps({"success": False, "error": "file_path to a .WirDoc is required"})
     try:
-        routing = harness_router.calculate_harness_reroute(
-            document_path=document_path,
-            trunk_x_start=trunk_x_start,
-            channel_spacing_mils=channel_spacing_mils,
-        )
+        result = harness_check.check_harness_wiring(file_path)
     except Exception as e:
-        logger.error(f"Error calculating harness reroute: {e}")
-        return json.dumps(
-            {"success": False, "error": f"Failed to calculate reroute: {e!s}"}
-        )
-
-    if dry_run:
-        return json.dumps({"success": True, "dry_run": True, **routing}, indent=2)
-
-    res_str = await add_harness_wiring(
-        ctx, document_path=document_path, reroutes=routing["reroutes"]
-    )
-    try:
-        res_json = json.loads(res_str)
-    except ValueError:
-        res_json = {"success": False, "raw": res_str}
-
+        logger.error(f"Error checking harness wiring: {e}")
+        return json.dumps({"success": False, "error": f"Failed to check {file_path}: {e!s}"})
     return json.dumps(
-        {
-            "success": bool(res_json.get("success")),
-            "document_path": str(Path(document_path).resolve()),
-            "summary": routing["summary"],
-            "warnings": routing["warnings"],
-            "altium_response": res_json,
-        },
-        indent=2,
+        {"success": True, "file_path": str(Path(file_path).resolve()), **result}, indent=2
     )
 
 

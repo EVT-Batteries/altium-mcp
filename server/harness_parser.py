@@ -298,6 +298,16 @@ def parse_wirdoc_records(
                     if name == "Comment" and val:
                         connectors[owner]["comment"] = val
             elif owner in wires_dict:
+                # Visible label positions (hidden ones need no clearance)
+                if (
+                    name in ("Designator", "Comment")
+                    and "Location.X" in props
+                    and props.get("IsHidden") != "T"
+                ):
+                    wires_dict[owner][f"{name.lower()}_pos"] = {
+                        "x": _coord(props, "Location.X"),
+                        "y": _coord(props, "Location.Y"),
+                    }
                 if name == "Designator" and val:
                     wires_dict[owner]["designator"] = val
                 elif name == "Comment" and val:

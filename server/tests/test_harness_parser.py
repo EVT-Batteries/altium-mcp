@@ -756,26 +756,31 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(decoded, ["X", "a|b", "100%", "l1\r\nl2"])
 
-    async def test_reroute_dry_run_changes_nothing(self):
+    async def test_check_harness_wiring_is_read_only(self):
         import main
         if not SLAVE_WIRDOC.exists():
             self.skipTest("Sample Slave WirDoc not found in workspace")
-        res = json.loads(await main.reroute_harness_wiring(
-            None, document_path=str(SLAVE_WIRDOC), dry_run=True,
-        ))
-        self.assertTrue(res["dry_run"])
-        self.assertEqual(len(res["reroutes"]), 40)
+        res = json.loads(await main.check_harness_wiring(None, file_path=str(SLAVE_WIRDOC)))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["summary"]["wire_count"], 40)
         self.mock_bridge.assert_not_called()
+
+    async def test_check_harness_wiring_needs_a_wirdoc(self):
+        import main
+        res = json.loads(await main.check_harness_wiring(None, file_path=r"C:\x\sheet.SchDoc"))
+        self.assertFalse(res["success"])
 
     async def test_reroute_moves_wires_in_place(self):
         import main
         from altium_files import read_altium_text
-        if not SLAVE_WIRDOC.exists():
-            self.skipTest("Sample Slave WirDoc not found in workspace")
         self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
-        await main.reroute_harness_wiring(None, document_path=str(SLAVE_WIRDOC))
+        await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            reroutes=[{"designator": "W1", "points": [1000, 500, 3000, 500, 3000, 900, 5000, 900]}],
+        )
         lines = read_altium_text(self.spec_file).splitlines()
-        self.assertEqual(sum(l.startswith("REROUTE|") for l in lines), 40)
+        self.assertEqual(sum(l.startswith("REROUTE|W1|") for l in lines), 1)
         self.assertNotIn("CLEAR_EXISTING", lines)
         self.assertFalse(any(l.startswith(("WIRE|", "SPLICE|", "NOCONNECT|", "LABEL|")) for l in lines))
 

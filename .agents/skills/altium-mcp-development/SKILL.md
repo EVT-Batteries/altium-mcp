@@ -78,7 +78,7 @@ for it) using the bundled runner:
 
 It imports `server/main.py` from this checkout and prints the tool's return value. This is the
 official tool entry point, not an ad-hoc script: it gets the same validation, encoding and locking.
-Pure-Python modules (`harness_parser`, `harness_router`, `dblib`) can be imported the same way.
+Pure-Python modules (`harness_parser`, `harness_check`, `dblib`) can be imported the same way.
 
 Remember the old daemon is still running: if you call the *MCP* tool `run_altium_script` before a
 restart, an old server may rewrite the tracked `server/SandboxScript/Sandbox.pas`; restore it with
@@ -163,6 +163,9 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   AddStringParameter('FileName', <full path>); AddStringParameter('PromptToSave', 'False');
   RunProcess('WorkspaceManager:CloseObject');
   ```
+  That has left a saved lone scratch `.WirDoc` (in no project) open; close such a document
+  with `Obj1 := Client.GetDocumentByPath(<full path>); Client.CloseDocument(Obj1);` and check
+  `Client.GetDocumentByPath` returns nil afterwards.
 
 ## 6. Finding out how Altium works
 
