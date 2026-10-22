@@ -2402,7 +2402,9 @@ async def add_harness_wiring(
             The listed parts replace the owner's associated parts; "part_number": "" only
             removes them.
         twists (list): Twist marks; a rectangle in mils across the wires to twist, e.g.
-            [{"x1": 13300, "y1": 8000, "x2": 13400, "y2": 8600, "designator": "TW1"}].
+            [{"x1": 13300, "y1": 7900, "x2": 13800, "y2": 8400, "designator": "TW1"}]
+            for wires at y 8000 and 8300 (100 mils beyond each wire puts the mark's hook
+            tips on them; rotation 1 for a vertical pair).
             Altium links every wire the rectangle crosses or touches. A twist (or shield)
             with the designator of an existing one is moved / resized to the new rectangle;
             sending the rectangle of an existing one with a new designator re-annotates it.
@@ -3171,8 +3173,9 @@ async def check_harness_wiring(ctx: Context, file_path: str) -> str:
     warnings: crossings with < 100 mils straight next to them; parallel horizontal runs
     < 100 mils apart; vertical runs < 200 mils apart; vertical runs in front of pin names
     or pin callout text (+ 150 mils); wire labels on other wires, labels, sheet text or
-    pin names; labels away from their wire; twist marks linking other than 2 wires, not
-    spanning exactly between their two wire runs, or shorter than 300 mils.
+    pin names; labels away from their wire; twist marks linking other than 2 wires, on
+    wire labels, or not in the sheet style (rectangle 100 mils beyond each wire so the
+    hook tips land on the wires, 500 mils along them).
     Crossings are counted and listed but are not problems: those forced by the pin order
     of two connectors cannot be routed away.
 

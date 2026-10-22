@@ -130,14 +130,20 @@ class TestHarnessCheck(unittest.TestCase):
         ], breaks=brk))
         self.assertIn("label_on_wire", self.types(res))
 
-    def test_twist_spanning_its_runs(self):
+    def test_twist_in_sheet_style(self):
+        # Wires at 4700 / 5000 mils: rectangle 100 beyond each, 500 along
         wires = [_wire("W1", [120, 500, 500, 500]), _wire("W2", [120, 470, 500, 470])]
-        good = {"x1": 250, "y1": 470, "x2": 290, "y2": 500, "designator": "TW1", "wires": ["W1", "W2"]}
-        self.assertNotIn("twist_placement", self.types(self.check(_sheet(wires, twists=[good]))))
-        small = {"x1": 250, "y1": 465, "x2": 260, "y2": 505, "designator": "TW1", "wires": ["W1", "W2"]}
-        details = [p["detail"] for p in self.check(_sheet(wires, twists=[small]))["problems"]]
-        self.assertTrue(any("do not land" in d for d in details))
+        good = {"x1": 250, "y1": 460, "x2": 300, "y2": 510, "designator": "TW1", "wires": ["W1", "W2"]}
+        self.assertTrue(self.check(_sheet(wires, twists=[good]))["clean"])
+        flush = {"x1": 250, "y1": 470, "x2": 260, "y2": 500, "designator": "TW1", "wires": ["W1", "W2"]}
+        details = [p["detail"] for p in self.check(_sheet(wires, twists=[flush]))["problems"]]
+        self.assertTrue(any("hook tips land on the wires at [4600, 5100]" in d for d in details))
         self.assertTrue(any("100 mils long" in d for d in details))
+
+    def test_twist_on_a_label(self):
+        wires = [_wire("W1", [120, 500, 500, 500], labels=(260, 501.5)), _wire("W2", [120, 470, 500, 470])]
+        twist = {"x1": 250, "y1": 460, "x2": 300, "y2": 510, "designator": "TW1", "wires": ["W1", "W2"]}
+        self.assertIn("twist_on_label", self.types(self.check(_sheet(wires, twists=[twist]))))
 
     def test_parser_keeps_visible_wire_label_positions(self):
         records = [

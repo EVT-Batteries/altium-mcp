@@ -10,8 +10,9 @@ errors   - diagonal segments, wire ends on neither a pin hot end nor a splice,
 warnings - crossings too close to a bend, parallel wires closer than 100 mils,
            vertical drops closer than 200 mils, channels in front of pin names,
            wire labels on other wires, labels, pins or sheet text, labels away
-           from their wire, twist marks that do not span exactly between their
-           two wires or are narrower than 300 mils.
+           from their wire, twist marks not in the sheet style (rectangle 100
+           mils beyond each wire so the hook tips land on the wires, 500 mils
+           along them) or on wire labels.
 
 Crossings are counted and listed but are not problems in themselves: a crossing
 that comes from the pin order of two connectors cannot be routed away.
@@ -38,7 +39,10 @@ MIN_PARALLEL = 100
 MIN_CHANNEL_PITCH = 200
 MIN_STRAIGHT = 100
 LABEL_REACH = 120
-MIN_TWIST_LENGTH = 300
+# Twist mark (user's style): 500 mils along the pair, rectangle 100 mils beyond
+# each wire so the hook tips land on the wires
+TWIST_LENGTH = 500
+TWIST_OVERHANG = 100
 MAX_LISTED = 200
 
 Segment = tuple[int, int, int, int]
@@ -381,7 +385,8 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
         for conn in sorted({c for c, pbox in pin_boxes if _boxes_overlap(box, pbox)}):
             label_report("label_on_pins", [des], f"label overlaps {conn} pin names", box[:2])
 
-    # Twist marks: two wires, ends on the two runs, long enough to read
+    # Twist marks: two wires, hook tips on the two runs (rectangle TWIST_OVERHANG
+    # beyond each), TWIST_LENGTH along them, clear of labels
     for t in parsed.get("twists", []):
         des = t.get("designator") or "twist"
         tw = t.get("wires", [])
@@ -390,6 +395,9 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
         if len(tw) != 2:
             report("warning", "twist_wires", tw, f"{des} links {len(tw)} wires, not 2", at)
             continue
+        on_labels = sorted({ld for ld, lbox in label_boxes if _boxes_overlap(box, lbox)})
+        if on_labels:
+            report("warning", "twist_on_label", tw, f"{des} overlaps the labels of {', '.join(on_labels)}", at)
         runs = {"h": [], "v": []}
         for wd in tw:
             for s in seg_by_wire.get(wd, []):
@@ -398,18 +406,20 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
                 elif s[0] == s[2] and box[0] <= s[0] <= box[2] and min(s[1], s[3]) <= box[1] and max(s[1], s[3]) >= box[3]:
                     runs["v"].append(s[0])
         if len(runs["h"]) == 2:
-            span, along = sorted(runs["h"]), box[2] - box[0]
-            aligned = (box[1], box[3]) == tuple(span)
+            span, along, across = sorted(runs["h"]), box[2] - box[0], (box[1], box[3])
         elif len(runs["v"]) == 2:
-            span, along = sorted(runs["v"]), box[3] - box[1]
-            aligned = (box[0], box[2]) == tuple(span)
+            span, along, across = sorted(runs["v"]), box[3] - box[1], (box[0], box[2])
         else:
             report("warning", "twist_placement", tw, f"{des} is not on a straight parallel stretch of its two wires", at)
             continue
-        if not aligned:
-            report("warning", "twist_placement", tw, f"{des} ends do not land on the two wire runs ({span})", at)
-        if along < MIN_TWIST_LENGTH:
-            report("warning", "twist_placement", tw, f"{des} is {along} mils long (>= {MIN_TWIST_LENGTH} reads better)", at)
+        want = (span[0] - TWIST_OVERHANG, span[1] + TWIST_OVERHANG)
+        if across != want:
+            report(
+                "warning", "twist_placement", tw,
+                f"{des} spans {list(across)} across the pair; hook tips land on the wires at {list(want)}", at,
+            )
+        if along != TWIST_LENGTH:
+            report("warning", "twist_placement", tw, f"{des} is {along} mils long, not {TWIST_LENGTH}", at)
 
     errors = sum(p["severity"] == "error" for p in problems)
     counts: dict[str, int] = {}
