@@ -95,7 +95,7 @@ harness project first so the drawing has its wiring diagram. Document ObjectId 8
 | 106 (top-level) | 81 | connector | `Location`, `Orientation` (0-3), `IsMirrored`, `WiringDiagramOriginUniqueId`; child 41 `LayoutDrawingSymbolModel<n>` (`IsImageParameter=T`, `Text` = `ViewName=..\|ViewType=ePhysicalView\|ViewSide\|Rotation\|Zoom\|MainModel=True..`) + child 30 image |
 | 113 | - | pin | `WiringDiagramOriginUniqueId`, `ConnectedWireUniqueId<n>` |
 | 110 | 85 | connection point | `Location`, `Orientation`, `Style` (0 circle, 1 square, 2 insulator), `ShowName`, `ConnectedBundleUniqueId<n>`; designator = child 34 |
-| 111 | 86 | bundle | `LocationCount`, `X<i>`/`Y<i>`, `LineWidth`, `LengthLong`, `DrawnLength`, `IsLengthSetManually`, `ShowBreakSymbol`, `EndVertex1/2ConnectedObjectUniqueID` (CP uids); children 34 designator, 41 Comment |
+| 111 | 86 | bundle | `LocationCount`, `X<i>`/`Y<i>`, `LineWidth`, `LengthLong`, `DrawnLength`, `IsLengthSetManually`, `ShowBreakSymbol`, `EndVertex1/2ConnectedObjectUniqueID` (CP uids); children 34 designator, 41 Comment, 41 `LengthParameter` (the length text, "58.42mm" on the sheet; `Text` = length in coords; script name `Length`), 41 Description (hidden) |
 | 128 | 104 | covering | `Thickness`, `PhysicalStartDistance`, `PhysicalEndDistance`, `PhysicalLength`, `CoveredItemsCount`, `CoveredItemId<i>` (0-based), `DesignItemId`, `SourceLibraryName`; child 34 |
 | 109 | 84 | layout label | `Location`, `Text`, `Alignment`, `Orientation`, `ShowOnlyFirstLine`, `DesignItemId`; child 34 |
 | 41 + `IsImageParameter=T` | 100 | connector view (image parameter) | child of the connector, `IsHidden=T` when hidden; child 30 = the rendered picture (bitmap in `Storage`); no model path stored (found from the connector's PCBLIB implementation at render time) |
@@ -120,6 +120,16 @@ What works: connection point factory(85) + `Location`, `MoveToXY`, `SetState_Sty
 `SetState_Alignment`, `SetState_ShowOnlyFirstLine`; connector `MoveToXY`, `Orientation`,
 `Mirror(Location)`; `RemoveSchObject` for deletes. Designators of all of them via the child
 designator (ObjectId 25).
+
+Texts (verified 2026-10-22): an object's texts are its children of ObjectId 25 (designator,
+`Name` = `Designator`) and `eParameter` (27: Comment, a bundle's `Length`, a connector's
+database parameters, mostly hidden), found by `Name`. `Location :=` (bottom-left corner of the
+text) and `IsHidden` inside `SCHM_BeginModify` / `SCHM_EndModify` persist through save and a
+close + reopen. An unnamed bundle shows `*` as designator and comment; its length text sits on
+its first vertex, so after a fresh draw the lengths pile up on the connection points. A
+connector's designator and comment can come in far outside the sheet (J1 at -1694, 2354 after
+the import). Sheet font 1 (Times New Roman 10) is about 5 DXP units wide per character and 7
+tall.
 
 Gotchas found:
 - **Bundle ends connect to connection points by position, and only when Altium loads the

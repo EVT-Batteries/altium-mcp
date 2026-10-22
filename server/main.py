@@ -2898,6 +2898,14 @@ async def edit_harness_layout(
             length as length type "MCAD CoDesigner" and no longer follows bundle changes.
         dry_run (bool): Only validate and return the spec records.
 
+    Texts: every connector, connection point, bundle, covering and layout label takes
+    "texts" to place or hide its texts, e.g. {"designator": "B1", "texts": {"designator":
+    [3500, 15030], "length": [3380, 14880], "comment": {"hidden": True}}}: name -> [x, y]
+    (mils, the text's bottom-left corner) or {"x", "y", "hidden"}. Names are Altium's
+    (Designator, Comment, a bundle's Length, or a parameter name such as a connector's
+    PartNumber, shown with "hidden": False), any case. Positions are absolute and applied
+    after the call's moves. get_harness_data reports each object's texts (DXP units).
+
     Altium routes a wire through the bundles only from pins a connection point holds by
     UniqueID. An update from the library, and Altium's own import, give pins new UniqueIDs
     and leave the old ones in the connection points, so no wire gets routed. Every call
@@ -2914,8 +2922,8 @@ async def edit_harness_layout(
     via_bundles, length).
 
     Returns:
-        str: JSON with success, saved, reloaded, counts, not_found, warnings, bundles,
-             problems, unrouted_wires and newly_unrouted_wires.
+        str: JSON with success, saved, reloaded, counts (texts_placed, ...), not_found,
+             warnings, bundles, problems, unrouted_wires and newly_unrouted_wires.
     """
     if not document_path:
         return json.dumps({"success": False, "error": "document_path is required"})
@@ -5138,7 +5146,9 @@ async def get_harness_data(
     length in mils and mm, end connection points, wires), coverings, layout_labels, wires
     (ends as "P3.12" / "SP1", route = bundles on the shortest path between the connection
     points of the two ends, routed_length), unrouted_wires, splices, twists and
-    no_connects. Edit it with edit_harness_layout.
+    no_connects. Every connector, connection point, bundle, covering and label lists its
+    texts (designator, comment, a bundle's length; a connector's shown parameters) with
+    position and hidden flag. Edit it with edit_harness_layout.
 
     A full wiring diagram can be very large; use summary_only or designators to keep
     the answer small.

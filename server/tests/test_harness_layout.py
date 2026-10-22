@@ -491,6 +491,82 @@ class TestViewsAndWireLengths(unittest.TestCase):
         self.assertIn("connector J1: wired pins 1 are held", problems[0])
 
 
+class TestTexts(unittest.TestCase):
+    def setUp(self):
+        self.layout = make_layout()
+        pos = {"x": 1100, "y": 1000, "hidden": False}
+        self.layout["bundles"][0]["texts"] = {
+            "Designator": pos,
+            "Comment": pos,
+            "Length": pos,
+        }
+        self.layout["connection_points"][1]["texts"] = {"Designator": pos}
+
+    def test_text_records_come_last_with_altium_names(self):
+        spec = build_layout_spec(
+            self.layout,
+            connectors=[
+                {
+                    "designator": "J1",
+                    "x": 9000,
+                    "y": 10000,
+                    "texts": {"designator": [8000, 11000]},
+                }
+            ],
+            connection_points=[
+                {"designator": "CP1", "texts": {"DESIGNATOR": [12000, 12500]}}
+            ],
+            bundles=[
+                {
+                    "designator": "B1",
+                    "new_designator": "B9",
+                    "texts": {
+                        "length": [11000, 9800],
+                        "comment": {"hidden": True},
+                        "designator": {"x": 11000, "y": 10050, "hidden": False},
+                    },
+                },
+                {
+                    "from": "CP_J1",
+                    "to": "CP_P1",
+                    "texts": {"designator": [15000, 10050]},
+                },
+            ],
+        )
+        self.assertEqual(spec["errors"], [])
+        texts = records_of(spec, "TEXT")
+        self.assertEqual(
+            texts,
+            [
+                ["TEXT", "UJ1", "designator", 8000, 11000, ""],
+                ["TEXT", "UCP1", "Designator", 12000, 12500, ""],
+                ["TEXT", "UB1", "Length", 11000, 9800, ""],
+                ["TEXT", "UB1", "Comment", "", "", "1"],
+                ["TEXT", "UB1", "Designator", 11000, 10050, "0"],
+                # a bundle created in the same call is found by its designator
+                ["TEXT", "DES:B2", "designator", 15000, 10050, ""],
+            ],
+        )
+        # after the connector move (which carries its texts along)
+        self.assertEqual(spec["records"][-len(texts) :], texts)
+
+    def test_text_errors(self):
+        spec = build_layout_spec(
+            self.layout,
+            bundles=[
+                {"designator": "B1", "texts": {"Weight": [1, 2]}},
+                {"designator": "B1", "texts": {"Length": [1]}},
+                {"designator": "B1", "texts": {"Length": {"x": 1}}},
+                {"designator": "B1", "texts": ["Length", 1, 2]},
+            ],
+        )
+        self.assertEqual(len(spec["errors"]), 4)
+        self.assertIn("no text 'Weight'", spec["errors"][0])
+        self.assertIn("needs [x, y]", spec["errors"][1])
+        self.assertIn("needs [x, y]", spec["errors"][2])
+        self.assertIn("texts must be", spec["errors"][3])
+
+
 class TestCheckLayout(unittest.TestCase):
     def test_expected_and_lost_connections(self):
         before = make_layout()

@@ -3729,6 +3729,38 @@ begin
     SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
 end;
 
+// Place the text child of Obj named Name (its designator, comment, a
+// bundle's length or any parameter): X, Y mils ('' = keep), Hidden '1' / '0'
+// ('' = keep). False when Obj has no such text.
+function PlaceChildText(Obj: ISch_GraphicalObject; Name, X, Y, Hidden: String): Boolean;
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+    Found     : ISch_GraphicalObject;
+begin
+    Result := False;
+    Found := nil;
+    ChildIter := Obj.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(25, eParameter));
+    Prim := ChildIter.FirstSchObject;
+    while (Prim <> nil) and (Found = nil) do
+    begin
+        if (UpperCase(Prim.Name) = UpperCase(Name)) then
+            Found := Prim;
+        Prim := ChildIter.NextSchObject;
+    end;
+    Obj.SchIterator_Destroy(ChildIter);
+    if (Found = nil) then Exit;
+    SchServer.RobotManager.SendMessage(Found.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    if (X <> '') then
+        Found.Location := Point(MilsToCoord(StrToInt(X)), MilsToCoord(StrToInt(Y)));
+    if (Hidden <> '') then
+        Found.IsHidden := (Hidden = '1');
+    SchServer.RobotManager.SendMessage(Found.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+    Obj.GraphicallyInvalidate;
+    Result := True;
+end;
+
 // Vertices of a bundle from the x|y pairs of Rec from field FirstField on.
 procedure SetBundleVertices(Obj: ISch_GraphicalObject; Rec: String; FirstField: Integer);
 var
@@ -3919,6 +3951,7 @@ end;
 //   LABEL|uid or ''|designator|text|x|y|orientation|alignment|first_line|part|library
 //   VIEW|connector uid|physical or symbol|render 1/0
 //   WIRELEN|wire data uid|length (0 = calculated from the bundles)
+//   TEXT|owner ref|text name|x|y|hidden 1/0  (designator, comment, length, ...)
 //   RELOADPROJECT                     (alone: close + reopen the project)
 //   RENDER|connector uid              (render its views from the library)
 // Altium connects bundle ends to connection points by position when it loads
@@ -3957,6 +3990,7 @@ var
     LblUpdated   : Integer;
     ViewsChanged : Integer;
     WireLengths  : Integer;
+    TextsPlaced  : Integer;
     PinsSynced   : Integer;
     Rendered     : Integer;
     RenderPending : String;
@@ -4065,6 +4099,7 @@ begin
         LblUpdated := 0;
         ViewsChanged := 0;
         WireLengths := 0;
+        TextsPlaced := 0;
         PinsSynced := 0;
         Rendered := 0;
         RenderPending := '';
@@ -4429,6 +4464,17 @@ begin
                     Obj.SetState_Length(StrToInt(SpecField(Rec, 2)));
                     WireLengths := WireLengths + 1;
                 end;
+            end
+            else if (Kind = 'TEXT') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) then
+                    Misses.Add('text_owner:' + SpecField(Rec, 1))
+                else if not PlaceChildText(Obj, SpecField(Rec, 2), SpecField(Rec, 3),
+                                           SpecField(Rec, 4), SpecField(Rec, 5)) then
+                    Misses.Add('text:' + SpecField(Rec, 1) + '.' + SpecField(Rec, 2))
+                else
+                    TextsPlaced := TextsPlaced + 1;
             end;
         end;
         // Connectors getting a new view lose their pins until it is
@@ -4525,6 +4571,7 @@ begin
                   ', "layout_labels_updated": ' + IntToStr(LblUpdated) +
                   ', "views_changed": ' + IntToStr(ViewsChanged) +
                   ', "wire_lengths_set": ' + IntToStr(WireLengths) +
+                  ', "texts_placed": ' + IntToStr(TextsPlaced) +
                   ', "connection_point_pins_synced": ' + IntToStr(PinsSynced) +
                   ', "views_rendered": ' + IntToStr(Rendered) +
                   ', "render_pending": [' + RenderPending + ']' +

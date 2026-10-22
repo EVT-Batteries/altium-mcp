@@ -43,6 +43,8 @@ SYNCED_OBJECTS = {
     "122": "twists",
     "127": "cables",
 }
+# Text names stored differently on disk: file name -> script name
+TEXT_NAMES_ON_DISK = {"LengthParameter": "Length"}
 
 
 def coord_to_mm(value: float) -> float:
@@ -172,6 +174,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "origin_uid": props.get("WiringDiagramOriginUniqueId", ""),
                 "views": [],
                 "pin_uids": [],
+                "texts": {},
             }
         elif rtype == "113" and owned:
             owner = int(props["OwnerIndex"])
@@ -196,6 +199,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "bundle_uids": _uid_list(
                     props, "ConnectedBundlesUniqueIdsCount", "ConnectedBundleUniqueId"
                 ),
+                "texts": {},
             }
         elif rtype == "111" and not owned:
             bundles[idx] = {
@@ -210,6 +214,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "unique_id": props.get("UniqueID", ""),
                 "end1_uid": props.get("EndVertex1ConnectedObjectUniqueID", ""),
                 "end2_uid": props.get("EndVertex2ConnectedObjectUniqueID", ""),
+                "texts": {},
             }
         elif rtype == "109" and not owned:
             labels[idx] = {
@@ -225,6 +230,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "part_number": _text(props, "DesignItemId"),
                 "source_library": _text(props, "SourceLibraryName"),
                 "unique_id": props.get("UniqueID", ""),
+                "texts": {},
             }
         elif rtype == "128" and not owned:
             count = int(props.get("CoveredItemsCount", 0) or 0)
@@ -242,6 +248,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                     for i in range(count)
                     if f"CoveredItemId{i}" in props
                 ],
+                "texts": {},
             }
         elif rtype == "115":
             wires[idx] = {
@@ -288,13 +295,26 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         elif rtype in ("34", "41") and owned:
             owner = int(props["OwnerIndex"])
             name, val = props.get("Name", ""), _text(props, "Text")
+            is_view = (
+                name.startswith("LayoutDrawingSymbolModel")
+                and props.get("IsImageParameter") == "T"
+            )
+            text = {
+                "x": _coord(props, "Location.X"),
+                "y": _coord(props, "Location.Y"),
+                "hidden": props.get("IsHidden") == "T",
+            }
+            # Texts as the script names them (a bundle's length is stored as
+            # LengthParameter); a connector's hidden parameters are left out
+            text_name = TEXT_NAMES_ON_DISK.get(name, name)
             if owner in connectors:
+                if not is_view and (
+                    not text["hidden"] or name in ("Designator", "Comment")
+                ):
+                    connectors[owner]["texts"][text_name] = text
                 if name == "Designator":
                     connectors[owner]["designator"] = val
-                elif (
-                    name.startswith("LayoutDrawingSymbolModel")
-                    and props.get("IsImageParameter") == "T"
-                ):
+                elif is_view:
                     view = dict(
                         part.split("=", 1) for part in val.split("|") if "=" in part
                     )
@@ -319,6 +339,8 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                     or labels.get(owner)
                     or coverings.get(owner)
                 )
+                if target is not None:
+                    target["texts"][text_name] = text
                 if target is not None and name in ("Designator", "Comment"):
                     target[name.lower()] = val
                 if owner in cps and name == "Designator":
@@ -520,6 +542,51 @@ def _flag(value: Any) -> str:
     return "1" if bool(value) else "0"
 
 
+def _text_records(
+    ref: str,
+    texts: Any,
+    owner: str,
+    errors: list[str],
+    known: dict[str, Any] | None = None,
+) -> list[list[Any]]:
+    """TEXT records placing or hiding texts of one object. texts is {name:
+    [x, y] or {"x", "y", "hidden"}} in mils; names as Altium's script names
+    them (Designator, Comment, Length, or a parameter name), any case. known:
+    the object's texts from parse_ldrdoc, to check the names against."""
+    if not texts:
+        return []
+    if not isinstance(texts, dict):
+        errors.append(f"{owner}: texts must be {{name: [x, y] or {{x, y, hidden}}}}")
+        return []
+    names = {n.lower(): n for n in known or {}}
+    records: list[list[Any]] = []
+    for name, pos in texts.items():
+        name = str(name).strip()
+        if isinstance(pos, dict):
+            x, y, hidden = pos.get("x"), pos.get("y"), pos.get("hidden")
+        elif isinstance(pos, (list, tuple)) and len(pos) == 2:
+            (x, y), hidden = pos, None
+        else:
+            x = y = hidden = None
+        if not name or (x is None) != (y is None) or (x is None and hidden is None):
+            errors.append(f"{owner}: text '{name}' needs [x, y] or {{x, y, hidden}}")
+            continue
+        if known is not None and name.lower() not in names:
+            errors.append(f"{owner}: no text '{name}' (has {sorted(known)})")
+            continue
+        records.append(
+            [
+                "TEXT",
+                ref,
+                names.get(name.lower(), name),
+                "" if x is None else int(x),
+                "" if y is None else int(y),
+                _flag(hidden),
+            ]
+        )
+    return records
+
+
 def _follow_end(points: list[int], at_start: bool, x: int, y: int) -> list[int]:
     """Bundle points (flat, mils) with one end moved to (x, y). The vertex next
     to it moves along the segment's axis, so a straight end segment stays
@@ -634,6 +701,7 @@ def build_layout_spec(
         cp_pos[cp["designator"]] = (x, y)
 
     connector_records: list[list[Any]] = []
+    text_records: list[list[Any]] = []
     cp_records: list[list[Any]] = []
     assign_records: list[list[Any]] = []
     # Connection points given a position explicitly
@@ -675,6 +743,10 @@ def build_layout_spec(
                 render = view == "physical" and not _rendered_main_view(conn["views"])
                 view_records.append(["VIEW", conn["unique_id"], view, _flag(render)])
             expect_views[des] = view
+        # A connector's hidden parameters can be shown too: names unchecked
+        text_records += _text_records(
+            conn["unique_id"], item.get("texts"), f"connector '{des}'", errors
+        )
         if not {"x", "y", "orientation", "mirrored"} & item.keys():
             continue
         connector_records.append(
@@ -764,6 +836,13 @@ def build_layout_spec(
                 ]
             )
             ref = cp["unique_id"]
+        text_records += _text_records(
+            ref,
+            item.get("texts"),
+            f"connection point '{des}'",
+            errors,
+            None if cp is None else cp.get("texts"),
+        )
         for obj_des in item.get("objects") or []:
             obj = held.get(obj_des)
             if obj is None:
@@ -908,6 +987,13 @@ def build_layout_spec(
         if points is not None:
             record.extend(points)
         bundle_records.append(record)
+        text_records += _text_records(
+            f"DES:{des}" if bundle is None else bundle["unique_id"],
+            item.get("texts"),
+            f"bundle '{des}'",
+            errors,
+            None if bundle is None else bundle.get("texts"),
+        )
         if bundle is None:
             new_bundles.add(des)
         elif points is not None:
@@ -984,6 +1070,13 @@ def build_layout_spec(
                 *(refs if refs is not None else []),
             ]
         )
+        text_records += _text_records(
+            f"DES:{key}" if cov is None else cov["unique_id"],
+            item.get("texts"),
+            f"covering '{key}'",
+            errors,
+            None if cov is None else cov.get("texts"),
+        )
 
     label_records: list[list[Any]] = []
     for item in layout_labels or []:
@@ -1022,6 +1115,13 @@ def build_layout_spec(
                 str(item.get("source_library") or ""),
             ]
         )
+        text_records += _text_records(
+            f"DES:{key}" if lbl is None else lbl["unique_id"],
+            item.get("texts"),
+            f"layout label '{key}'",
+            errors,
+            None if lbl is None else lbl.get("texts"),
+        )
 
     wire_records: list[list[Any]] = []
     expect_lengths: dict[str, float | None] = {}
@@ -1059,6 +1159,8 @@ def build_layout_spec(
             *covering_records,
             *label_records,
             *wire_records,
+            # Last: texts of objects created above, and after connector moves
+            *text_records,
         ],
         "errors": errors,
         "warnings": warnings,
