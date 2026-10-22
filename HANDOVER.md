@@ -463,6 +463,11 @@ scratch copy first.
    - `sync_harness_library`: reload the document (`relink`) after writing cavity parts so the
      compiler sees them, or say in the result that a reload is needed.
    - `check_harness_wiring`: key wires by UniqueID, not designator (unannotated `W?` wires merge).
+   - `check_harness_wiring`: parse the sheet rectangles (RECORD 14, the connector frames) and
+     report labels and channels inside another connector's frame (today only the screenshot shows
+     them).
+   - `get_screenshot(view_type="sch")` on a harness sheet: optional zoom (whole sheet via
+     `Sch:Zoom Action=Document`, or an area), so the agent can see every part of a large sheet.
 2. Fix the 15 pre-existing test failures (synthetic records instead of a real WirDoc).
 3. Open question: should view options (side, zoom) be copied from a template connector?
 4. Not supported yet: LdrDoc notes / text frames; wire `LengthOffset` / user length / manual wire
