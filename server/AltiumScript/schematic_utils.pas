@@ -3810,6 +3810,101 @@ begin
         Obj.DesignItemId := PN;
 end;
 
+// UniqueIds of the pins (ObjectId 88) of a harness connector, into Ids.
+procedure ConnectorPinIds(Conn: ISch_GraphicalObject; Ids: TStringList);
+var
+    ChildIter : ISch_Iterator;
+    Pin       : ISch_GraphicalObject;
+begin
+    Ids.Clear;
+    ChildIter := Conn.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(88));
+    Pin := ChildIter.FirstSchObject;
+    while (Pin <> nil) do
+    begin
+        Ids.Add(Pin.UniqueId);
+        Pin := ChildIter.NextSchObject;
+    end;
+    Conn.SchIterator_Destroy(ChildIter);
+end;
+
+// A connection point names the pins of each connector it holds by UniqueId,
+// and Altium routes a wire through the bundles only from a pin some
+// connection point names. An update from the library (and Altium's own
+// import) gives pins new UniqueIds and leaves the old ones behind, so no
+// wire gets routed. Drop the ids of pins that no longer exist; a connector
+// entry left without pins, whose connector has no pin held anywhere, gets
+// all its pins. Connectors whose UniqueId is in Release lose all their pins
+// instead (none of their wires routed). Returns the number of entries changed.
+function SyncConnectionPointPins(Doc: ISch_Document; Release: TStringList): Integer;
+var
+    Iter    : ISch_Iterator;
+    CP      : ISch_GraphicalObject;
+    Conn    : ISch_GraphicalObject;
+    Entry   : ISch_GraphicalObject;
+    Ids     : TStringList;
+    Held    : TStringList;
+    Uid     : String;
+    Pass    : Integer;
+    i, j    : Integer;
+    Changed : Boolean;
+begin
+    Result := 0;
+    Ids := TStringList.Create;
+    Held := TStringList.Create;
+    try
+        for Pass := 1 to 2 do
+        begin
+            Iter := Doc.SchIterator_Create;
+            Iter.AddFilter_ObjectSet(MkSet(85));
+            CP := Iter.FirstSchObject;
+            while (CP <> nil) do
+            begin
+                for i := 0 to CP.GetState_ConnectorsCount - 1 do
+                begin
+                    Entry := CP.GetState_Connector(i);
+                    Uid := Entry.GetState_UniqueId;
+                    Conn := FindLayoutObject(Doc, Uid);
+                    // Splices hold no pins
+                    if (Conn <> nil) and (Conn.ObjectId = 81) then
+                    begin
+                        ConnectorPinIds(Conn, Ids);
+                        Changed := False;
+                        SchServer.RobotManager.SendMessage(CP.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                        if (Pass = 1) then
+                        begin
+                            for j := Entry.GetState_PinsCount - 1 downto 0 do
+                                if (Release.IndexOf(Uid) >= 0) or (Ids.IndexOf(Entry.GetState_PinId(j)) < 0) then
+                                begin
+                                    Entry.RemovePin(Entry.GetState_PinId(j));
+                                    Changed := True;
+                                end;
+                            if (Entry.GetState_PinsCount > 0) then
+                                Held.Add(Uid);
+                        end
+                        else if (Entry.GetState_PinsCount = 0) and (Held.IndexOf(Uid) < 0) and
+                                (Release.IndexOf(Uid) < 0) then
+                        begin
+                            for j := 0 to Ids.Count - 1 do
+                                Entry.AddPin(Ids[j]);
+                            Held.Add(Uid);
+                            Changed := True;
+                        end;
+                        SchServer.RobotManager.SendMessage(CP.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                        if Changed then
+                            Result := Result + 1;
+                    end;
+                end;
+                CP := Iter.NextSchObject;
+            end;
+            Doc.SchIterator_Destroy(Iter);
+        end;
+    finally
+        Ids.Free;
+        Held.Free;
+    end;
+end;
+
 // Create, edit, move and delete harness layout drawing (.LdrDoc) objects:
 // connectors, connection points, bundles, coverings and layout labels.
 // Spec records (built by harness_layout.build_layout_spec; mils, lengths in
@@ -3824,14 +3919,16 @@ end;
 //   LABEL|uid or ''|designator|text|x|y|orientation|alignment|first_line|part|library
 //   VIEW|connector uid|physical or symbol|render 1/0
 //   WIRELEN|wire data uid|length (0 = calculated from the bundles)
+//   RELOADPROJECT                     (alone: close + reopen the project)
+//   RENDER|connector uid              (render its views from the library)
 // Altium connects bundle ends to connection points by position when it loads
 // a drawing, so after geometry changes the saved drawing is closed, opened
 // again and saved. A connector shows its symbol when its views are hidden.
 // A new physical view is an image parameter that becomes the main model only
 // when the project is loaded from disk and is rendered by a library update:
-// so for a view to render the whole project is closed and opened again
-// (refused while one of its documents has unsaved changes), the connectors
-// are updated from the library and the drawing is saved once more.
+// the caller then runs RELOADPROJECT (refused while a document of the
+// project has unsaved changes) and RENDER for the connectors listed in
+// render_pending, each in a script run of its own.
 function ExecuteEditHarnessLayout(SpecPath: String): String;
 var
     Spec         : TStringList;
@@ -3860,6 +3957,11 @@ var
     LblUpdated   : Integer;
     ViewsChanged : Integer;
     WireLengths  : Integer;
+    PinsSynced   : Integer;
+    Rendered     : Integer;
+    RenderPending : String;
+    ReloadProject : Boolean;
+    HasRender    : Boolean;
     ViewUids     : TStringList;
     Physical     : Boolean;
     n            : Integer;
@@ -3882,9 +3984,14 @@ begin
     try
         Spec.LoadFromFile(SpecPath);
         DocPath := '';
+        ReloadProject := False;
         for i := 0 to Spec.Count - 1 do
+        begin
             if (SpecField(Spec[i], 0) = 'DOCUMENT') then
                 DocPath := StringReplace(SpecField(Spec[i], 1), '/', '\', REPLACEALL);
+            if (SpecField(Spec[i], 0) = 'RELOADPROJECT') then
+                ReloadProject := True;
+        end;
         if (DocPath = '') then
         begin
             Result := '{"success": false, "error": "no DOCUMENT given; document_path is required"}';
@@ -3908,6 +4015,43 @@ begin
             Exit;
         end;
 
+        // RELOADPROJECT: close the drawing's project and open it again (a
+        // load from disk makes new views the main ones), nothing else
+        if ReloadProject then
+        begin
+            PrjPath := ProjectPathOfDocument(DocPath);
+            Unsaved := '';
+            if (PrjPath <> '') then
+                Unsaved := UnsavedProjectDocuments(PrjPath);
+            if (PrjPath = '') or (Unsaved <> '') then
+            begin
+                Result := '{"success": false, "error": "project not reloaded: ' +
+                          JSONEscapeString(Unsaved) + '"}';
+                Exit;
+            end;
+            // Hold nothing of the project while Altium frees it
+            Doc := nil;
+            ServerDoc := nil;
+            ResetParameters;
+            AddStringParameter('Action', 'Close');
+            AddStringParameter('ObjectKind', 'Project');
+            AddStringParameter('FileName', PrjPath);
+            AddStringParameter('PromptToSave', 'False');
+            RunProcess('WorkspaceManager:CloseObject');
+            ResetParameters;
+            AddStringParameter('ObjectKind', 'Project');
+            AddStringParameter('FileName', PrjPath);
+            RunProcess('WorkspaceManager:OpenObject');
+            ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
+            if (ServerDoc <> nil) then
+                Client.ShowDocument(ServerDoc);
+            if (ServerDoc <> nil) and (SchServer.GetSchDocumentByPath(DocPath) <> nil) then
+                Result := '{"success": true, "project_reloaded": true}'
+            else
+                Result := '{"success": false, "error": "drawing not open after the project reload"}';
+            Exit;
+        end;
+
         Deleted := 0;
         ConnMoved := 0;
         CpCreated := 0;
@@ -3921,6 +4065,10 @@ begin
         LblUpdated := 0;
         ViewsChanged := 0;
         WireLengths := 0;
+        PinsSynced := 0;
+        Rendered := 0;
+        RenderPending := '';
+        HasRender := False;
         Unsaved := '';
         GeoChanged := False;
         Reloaded := False;
@@ -4210,7 +4358,11 @@ begin
                     Item := ChildIter.FirstSchObject;
                     while (Item <> nil) do
                     begin
-                        Item.IsHidden := not Physical;
+                        // A view without a picture stays hidden until RENDER:
+                        // a shown main view without one makes Altium's
+                        // SchHarnessComponent.GetState_OwnBoundingRectangle
+                        // raise a .NET error (also when the file is opened)
+                        Item.IsHidden := (not Physical) or (SpecField(Rec, 3) = '1');
                         n := n + 1;
                         Item := ChildIter.NextSchObject;
                     end;
@@ -4229,7 +4381,7 @@ begin
                         else
                         begin
                             Item.Name := 'LayoutDrawingSymbolModel1';
-                            Item.IsHidden := False;
+                            Item.IsHidden := True;
                             Obj.AddSchObject(Item);
                             SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast,
                                 SCHM_PrimitiveRegistration, Item.I_ObjectAddress);
@@ -4238,6 +4390,31 @@ begin
                     end;
                     Obj.GraphicallyInvalidate;
                     ViewsChanged := ViewsChanged + 1;
+                end;
+            end
+            else if (Kind = 'RENDER') then
+            begin
+                // After RELOADPROJECT: render the connector's views
+                HasRender := True;
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 81) then
+                    Misses.Add('physical_view_not_rendered:' + SpecField(Rec, 1))
+                else if not RefreshFromLibrary(Obj) then
+                    Misses.Add('physical_view_not_rendered:' + Obj.DesignItemId + ' not found in its library')
+                else
+                begin
+                    // Rendered: show the views (hidden until now)
+                    ChildIter := Obj.SchIterator_Create;
+                    ChildIter.AddFilter_ObjectSet(MkSet(100));
+                    Item := ChildIter.FirstSchObject;
+                    while (Item <> nil) do
+                    begin
+                        Item.IsHidden := False;
+                        Item := ChildIter.NextSchObject;
+                    end;
+                    Obj.SchIterator_Destroy(ChildIter);
+                    Obj.GraphicallyInvalidate;
+                    Rendered := Rendered + 1;
                 end;
             end
             else if (Kind = 'WIRELEN') then
@@ -4254,6 +4431,13 @@ begin
                 end;
             end;
         end;
+        // Connectors getting a new view lose their pins until it is
+        // rendered (rendering one with routed wires raised a .NET error);
+        // the caller repairs them in a run of their own after RENDER
+        if not HasRender then
+            PinsSynced := SyncConnectionPointPins(Doc, ViewUids);
+        if (PinsSynced > 0) then
+            GeoChanged := True;
         SchServer.ProcessControl.PostProcess(Doc, '');
         Doc.GraphicallyInvalidate;
 
@@ -4265,8 +4449,10 @@ begin
         Saved := not ServerDoc.Modified;
         DocName := Doc.DocumentName;
 
-        // New physical views: reload the whole project from disk (closing a
-        // document alone does not reload it), then render the views
+        // New physical views render only after the project is loaded from
+        // disk. Altium raised a .NET error when the project was closed and
+        // the views rendered in the same script run as the edits, so the
+        // caller does that in two more runs (RELOADPROJECT, then RENDER).
         if Saved and (ViewUids.Count > 0) then
         begin
             PrjPath := ProjectPathOfDocument(DocPath);
@@ -4278,52 +4464,12 @@ begin
                 Misses.Add('physical_view_not_rendered:save or close first: ' + Unsaved)
             else
             begin
-                // Hold nothing of the project while Altium frees it
-                Obj := nil;
-                Item := nil;
-                Doc := nil;
-                ServerDoc := nil;
-                ResetParameters;
-                AddStringParameter('Action', 'Close');
-                AddStringParameter('ObjectKind', 'Project');
-                AddStringParameter('FileName', PrjPath);
-                AddStringParameter('PromptToSave', 'False');
-                RunProcess('WorkspaceManager:CloseObject');
-                ResetParameters;
-                AddStringParameter('ObjectKind', 'Project');
-                AddStringParameter('FileName', PrjPath);
-                RunProcess('WorkspaceManager:OpenObject');
-                ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
-                Doc := nil;
-                if (ServerDoc <> nil) then
+                for j := 0 to ViewUids.Count - 1 do
                 begin
-                    Client.ShowDocument(ServerDoc);
-                    Doc := SchServer.GetSchDocumentByPath(DocPath);
+                    if (j > 0) then RenderPending := RenderPending + ', ';
+                    RenderPending := RenderPending + '"' + ViewUids[j] + '"';
                 end;
-                if (Doc = nil) then
-                    Saved := False
-                else
-                begin
-                    SchServer.ProcessControl.PreProcess(Doc, '');
-                    for j := 0 to ViewUids.Count - 1 do
-                    begin
-                        Obj := FindLayoutObject(Doc, ViewUids[j]);
-                        if (Obj = nil) then
-                            Misses.Add('physical_view_not_rendered:' + ViewUids[j])
-                        else if not RefreshFromLibrary(Obj) then
-                            Misses.Add('physical_view_not_rendered:' + Obj.DesignItemId + ' not found in its library');
-                    end;
-                    SchServer.ProcessControl.PostProcess(Doc, '');
-                    Doc.GraphicallyInvalidate;
-                    ServerDoc.Modified := True;
-                    try
-                        ServerDoc.DoFileSave('');
-                    except
-                    end;
-                    Reloaded := not ServerDoc.Modified;
-                    Saved := Reloaded;
-                end;
-                // The project reload linked the bundles too
+                // The project reload links the bundles too
                 GeoChanged := False;
             end;
         end;
@@ -4379,6 +4525,9 @@ begin
                   ', "layout_labels_updated": ' + IntToStr(LblUpdated) +
                   ', "views_changed": ' + IntToStr(ViewsChanged) +
                   ', "wire_lengths_set": ' + IntToStr(WireLengths) +
+                  ', "connection_point_pins_synced": ' + IntToStr(PinsSynced) +
+                  ', "views_rendered": ' + IntToStr(Rendered) +
+                  ', "render_pending": [' + RenderPending + ']' +
                   ', "reloaded": ' + LowerCase(BoolToStr(Reloaded, True)) +
                   ', "not_found": [' + InfoStr + ']}';
     finally

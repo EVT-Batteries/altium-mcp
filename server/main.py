@@ -2855,9 +2855,10 @@ async def edit_harness_layout(
             symbol, e.g. [{"designator": "P2", "view": "physical"}]. As Altium's Properties
             panel does, "symbol" hides the connector's views and "physical" shows them again.
             A connector that has never had a rendered view gets a new one: Altium renders
-            the picture only after loading the project from disk, so that closes and reopens
-            the whole harness project (its other tabs close too) and updates the connector
-            from its library (as changing its part does: database parameters are refreshed,
+            the picture only after loading the project from disk, so after saving the edits
+            the tool closes and reopens the whole harness project (its other tabs close too)
+            and then updates the connector from its library, each in a script run of its own
+            (in one run Altium raised a .NET error) (as changing its part does: database parameters are refreshed,
             its pins in the layout get new UniqueIDs, wires stay linked). Refused, with
             nothing rendered, while a document of that project has unsaved changes. A new
             view's side and zoom are Altium's defaults (change them in Altium).
@@ -2897,6 +2898,16 @@ async def edit_harness_layout(
             length as length type "MCAD CoDesigner" and no longer follows bundle changes.
         dry_run (bool): Only validate and return the spec records.
 
+    Altium routes a wire through the bundles only from pins a connection point holds by
+    UniqueID. An update from the library, and Altium's own import, give pins new UniqueIDs
+    and leave the old ones in the connection points, so no wire gets routed. Every call
+    repairs that ("connection_point_pins_synced"); a call with only document_path does just
+    the repair. get_harness_data lists each connector's "unassigned_pins".
+
+    Wire lengths for the fabrication drawing: a wire's length is the sum of the physical
+    lengths of the bundles on its route (bundle "length_mm", independent of the drawn
+    length) plus its offset, unless a fixed length is set (wires).
+
     Not supported (Altium's script interface has no setter): wire length offsets
     ("Offset Length", calculated type), user-defined wire lengths and manual wire paths.
     get_harness_data reports all of them once set in Altium (length_type, length_offset,
@@ -2932,7 +2943,12 @@ async def edit_harness_layout(
             {"success": False, "errors": spec["errors"], "warnings": spec["warnings"]},
             indent=2,
         )
-    if not spec["records"]:
+    # Every run also repairs the connection points' pin lists (Altium routes
+    # wires only from pins a connection point holds), so a call without
+    # changes still runs when pins are held by none
+    if not spec["records"] and not any(
+        c.get("unassigned_pins") for c in layout["connectors"]
+    ):
         return json.dumps({"success": False, "error": "nothing to change"})
     lines = [_spec_line("DOCUMENT", str(doc_path))]
     lines += [_spec_line(*rec) for rec in spec["records"]]
@@ -2948,25 +2964,63 @@ async def edit_harness_layout(
             indent=2,
         )
 
+    async def run(spec_lines: list[str]) -> dict[str, Any]:
+        write_altium_text(HARNESS_LAYOUT_SPEC_FILE, "\n".join(spec_lines) + "\n")
+        response = await altium_bridge._execute_command_locked(
+            "edit_harness_layout", {}
+        )
+        if not response.get("success", False):
+            return {"success": False, "error": response.get("error", "unknown error")}
+        out = response.get("result", {})
+        if isinstance(out, str):
+            try:
+                out = json.loads(out)
+            except ValueError:
+                return {"success": False, "error": out}
+        return out
+
     try:
         async with altium_bridge.exclusive():
             HARNESS_LAYOUT_SPEC_FILE.parent.mkdir(parents=True, exist_ok=True)
-            write_altium_text(HARNESS_LAYOUT_SPEC_FILE, "\n".join(lines) + "\n")
-            response = await altium_bridge._execute_command_locked(
-                "edit_harness_layout", {}
-            )
+            result = await run(lines)
+            pending = result.get("render_pending") or []
+            if result.get("saved") and pending:
+                # New views render only after a project reload. Altium raised
+                # a .NET error when the reload and the rendering ran in the
+                # same script run as the edits, so each gets a run of its own.
+                # The connectors to render hold no pins meanwhile (rendering one
+                # with routed wires raised that error too); the last run, with
+                # no records, gives them their pins back.
+                steps = [await run([lines[0], _spec_line("RELOADPROJECT")])]
+                if steps[-1].get("success"):
+                    steps.append(
+                        await run(
+                            [lines[0]] + [_spec_line("RENDER", uid) for uid in pending]
+                        )
+                    )
+                    if steps[-1].get("saved"):
+                        steps.append(await run([lines[0]]))
+                rendered = sum(s.get("views_rendered", 0) for s in steps)
+                result["views_rendered"] = rendered
+                result["connection_point_pins_synced"] = result.get(
+                    "connection_point_pins_synced", 0
+                ) + sum(s.get("connection_point_pins_synced", 0) for s in steps)
+                result["not_found"] = result.get("not_found", []) + [
+                    miss for s in steps for miss in s.get("not_found", [])
+                ]
+                result["render_pending"] = [] if rendered else pending
+                result["reloaded"] = bool(steps[-1].get("saved"))
+                failed = next((s for s in steps if not s.get("success")), None)
+                if failed is not None:
+                    result["success"] = False
+                    if failed.get("error"):
+                        result["error"] = f"views not rendered: {failed['error']}"
     except TimeoutError as e:
-        response = {"success": False, "error": str(e)}
-    if not response.get("success", False):
+        result = {"success": False, "error": str(e)}
+    if "saved" not in result:
         return json.dumps(
-            {"success": False, "error": response.get("error", "unknown error")}
+            {"success": False, "error": result.get("error", "unknown error")}
         )
-    result = response.get("result", {})
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except ValueError:
-            return result
     if spec["warnings"]:
         result["warnings"] = spec["warnings"]
     if result.get("saved"):

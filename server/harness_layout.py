@@ -56,7 +56,7 @@ def mm_to_coord(value: float) -> int:
 def read_connection_point_streams(
     file_path: Path | str,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Objects assigned to each connection point: {cp uid: [{uid, pin_count}]}.
+    """Objects assigned to each connection point: {cp uid: [{uid, pin_count, pins}]}.
 
     The 'HarnessConnectionPointConnector' stream is a record header followed
     by a zlib block holding: int32 version, int32 count, then per connection
@@ -99,7 +99,7 @@ def read_connection_point_streams(
             for _ in range(int32()):
                 obj_uid = pstr()
                 pins = [pstr() for _ in range(int32())]
-                objects.append({"uid": obj_uid, "pin_count": len(pins)})
+                objects.append({"uid": obj_uid, "pin_count": len(pins), "pins": pins})
             result[cp_uid] = objects
     except (struct.error, IndexError):
         pass
@@ -332,10 +332,15 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     synced_by_uid = {s["unique_id"]: s for s in synced.values()}
     cp_by_uid = {cp["unique_id"]: cp for cp in cps.values()}
     holder: dict[str, str] = {}  # object uid -> cp uid
+    # Altium finds a connector wire's connection point by the pin ids the
+    # point holds for that connector, not by the connector: pin uid -> cp uid
+    pin_holder: dict[str, str] = {}
     for cp in cps.values():
         cp["objects"] = []
         for obj in cp_objects.get(cp["unique_id"], []):
             holder[obj["uid"]] = cp["unique_id"]
+            for pin_uid in obj.get("pins", []):
+                pin_holder[pin_uid] = cp["unique_id"]
             target = by_uid.get(obj["uid"]) or synced_by_uid.get(obj["uid"])
             cp["objects"].append(target["designator"] if target else obj["uid"])
 
@@ -362,9 +367,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         if uid in pins:
             pin = pins[uid]
             conn = connectors[pin["connector_index"]]
-            return f"{conn['designator']}.{pin['designator']}", holder.get(
-                conn["unique_id"]
-            )
+            return f"{conn['designator']}.{pin['designator']}", pin_holder.get(uid)
         if uid in synced_by_uid:
             obj = synced_by_uid[uid]
             return obj["designator"], holder.get(uid)
@@ -415,7 +418,13 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         c["connection_point"] = (
             cp_by_uid.get(holder.get(c["unique_id"], "")) or {}
         ).get("designator")
-        c.pop("pin_uids")
+        # Pins no connection point holds: their wires cannot be routed (a
+        # connection point keeping the ids of pins replaced by an update
+        # from the library holds none)
+        c["unassigned_pins"] = sorted(
+            (pins[u]["designator"] for u in c.pop("pin_uids") if u not in pin_holder),
+            key=lambda d: (len(d), d),
+        )
     synced_lists: dict[str, list[dict[str, Any]]] = {
         k: [] for k in SYNCED_OBJECTS.values()
     }
@@ -1087,6 +1096,16 @@ def check_layout(
             and not (b.get("end1_connection_point") and b.get("end2_connection_point"))
         ):
             problems.append(f"bundle {name}: lost its connection to a connection point")
+    wired = {w.get(end) for w in layout.get("wires", []) for end in ("end1", "end2")}
+    for c in layout["connectors"]:
+        loose = [
+            p for p in c.get("unassigned_pins", []) if f"{c['designator']}.{p}" in wired
+        ]
+        if loose:
+            problems.append(
+                f"connector {c['designator']}: wired pins {', '.join(loose)} are held "
+                "by no connection point (their wires cannot be routed)"
+            )
     for name, ends in expect.get("bundles", {}).items():
         b = bundles.get(name)
         if b is None:

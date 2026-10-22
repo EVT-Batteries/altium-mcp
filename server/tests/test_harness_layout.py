@@ -482,6 +482,14 @@ class TestViewsAndWireLengths(unittest.TestCase):
             _wire_length(_wire("W", "U", "mcad", fixed_mm=700), None)["mm"], 700
         )
 
+    def test_wired_pins_held_by_no_connection_point(self):
+        self.layout["connectors"][0]["unassigned_pins"] = ["1", "2"]
+        self.layout["wires"][0].update({"end1": "J1.1", "end2": "SP1"})
+        problems, _ = check_layout(self.layout, {"bundles": {}})
+        # pin 2 has no wire: not a problem
+        self.assertEqual(len(problems), 1)
+        self.assertIn("connector J1: wired pins 1 are held", problems[0])
+
 
 class TestCheckLayout(unittest.TestCase):
     def test_expected_and_lost_connections(self):
@@ -575,6 +583,78 @@ class TestEditHarnessLayoutTool(unittest.IsolatedAsyncioTestCase):
         data = json.loads(raw)
         self.assertFalse(data["success"])
         self.assertIn("not connected", data["problems"][0])
+
+    async def test_new_view_renders_in_runs_of_its_own(self):
+        import main
+
+        self.after = copy.deepcopy(self.before)
+        self.after["connectors"][0]["views"] = [_view()]
+        self.parse.stop()
+        self.parse = patch("main.parse_ldrdoc", side_effect=[self.before, self.after])
+        self.parse.start()
+        specs = []
+
+        async def bridge(command, params):
+            specs.append(self.spec_file.read_text(encoding="utf-8-sig").splitlines())
+            results = [
+                {
+                    "success": True,
+                    "saved": True,
+                    "not_found": [],
+                    "render_pending": ["UJ1"],
+                },
+                {"success": True, "project_reloaded": True},
+                {
+                    "success": True,
+                    "saved": True,
+                    "not_found": [],
+                    "views_rendered": 1,
+                    "connection_point_pins_synced": 0,
+                    "render_pending": [],
+                },
+                {
+                    "success": True,
+                    "saved": True,
+                    "not_found": [],
+                    "connection_point_pins_synced": 3,
+                },
+            ]
+            return {"success": True, "result": results[len(specs) - 1]}
+
+        self.mock_bridge.side_effect = bridge
+        raw = await main.edit_harness_layout(
+            None,
+            document_path=str(self.doc),
+            connectors=[{"designator": "J1", "view": "physical"}],
+        )
+        data = json.loads(raw)
+        self.assertTrue(data["success"], data)
+        self.assertEqual(data["views_rendered"], 1)
+        self.assertTrue(data["reloaded"])
+        self.assertEqual(data["render_pending"], [])
+        doc = f"DOCUMENT|{self.doc.resolve()}"
+        self.assertEqual(specs[0], [doc, "VIEW|UJ1|physical|1"])
+        self.assertEqual(specs[1], [doc, "RELOADPROJECT"])
+        self.assertEqual(specs[2], [doc, "RENDER|UJ1"])
+        # the last run only gives the rendered connector its pins back
+        self.assertEqual(specs[3], [doc])
+        self.assertEqual(data["connection_point_pins_synced"], 3)
+
+    async def test_call_without_changes_repairs_pins(self):
+        import main
+
+        self.before["connectors"][0]["unassigned_pins"] = ["1"]
+        raw = await main.edit_harness_layout(None, document_path=str(self.doc))
+        self.assertTrue(json.loads(raw)["success"])
+        lines = self.spec_file.read_text(encoding="utf-8-sig").splitlines()
+        self.assertEqual(lines, [f"DOCUMENT|{self.doc.resolve()}"])
+
+    async def test_nothing_to_change(self):
+        import main
+
+        raw = await main.edit_harness_layout(None, document_path=str(self.doc))
+        self.assertEqual(json.loads(raw)["error"], "nothing to change")
+        self.mock_bridge.assert_not_awaited()
 
     async def test_dry_run_and_errors_never_reach_altium(self):
         import main
