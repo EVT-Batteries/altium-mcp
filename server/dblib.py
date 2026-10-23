@@ -27,6 +27,8 @@ class DbTable:
     # Columns whose field map turns them into a system field such as
     # [Library Ref]; they are not copied as parameters
     system_columns: set[str] = field(default_factory=set)
+    # Every column of the table, in file order
+    columns: list[str] = field(default_factory=list)
 
     def parameters(self, row: dict[str, str]) -> dict[str, str]:
         """The row's columns that become component parameters."""
@@ -63,7 +65,10 @@ def _read_csv_table(path: Path, name: str, system_columns: set[str]) -> DbTable:
             clean = {k: (v or "").strip() for k, v in row.items() if k}
             if clean.get(key):
                 rows[clean[key]] = clean
-    return DbTable(name=name, key=key, rows=rows, system_columns=system_columns)
+    columns = [c for c in reader.fieldnames or [] if c]
+    return DbTable(
+        name=name, key=key, rows=rows, system_columns=system_columns, columns=columns
+    )
 
 
 def load_csv_table(path: Path | str) -> DbLib:

@@ -881,6 +881,106 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["connectors_refreshed"], {"P1": ["Max Operating Temperature"]})
         self.assertTrue(res["success"])
 
+    def _stale_fixture(self):
+        """A library whose wire column 'Wire Gauge' was renamed 'Gauge' and whose
+        terminal/connector column 'Old Col' was deleted, and a sheet still
+        carrying the old names."""
+        import tempfile
+
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "wires.csv").write_text(
+            "PartNumber,Gauge,Color,Insulation\nWB-22,22 AWG,Black,PTFE\n", encoding="utf-8"
+        )
+        (tmp / "parts.csv").write_text(
+            "PartNumber,Description,Manufacturer 1,Finish\nT-1,Socket,Acme,\nC-1,Housing,Acme,\n",
+            encoding="utf-8",
+        )
+        (tmp / "lib.DbLib").write_text(
+            "[DatabaseLinks]\n"
+            "ConnectionString=Provider=MSDASQL.1;Extended Properties=\"Driver={Microsoft Access "
+            "Text Driver (*.txt, *.csv)};Dbq=Z:\\missing\\;Extensions=csv;\"\n"
+            "[Table1]\nTableName=wires.csv\nEnabled=True\n"
+            "[Table2]\nTableName=parts.csv\nEnabled=True\n",
+            encoding="utf-8",
+        )
+        doc = tmp / "h.WirDoc"
+        doc.write_bytes(b"")
+        fake = {
+            "wires": [{"designator": "W1", "parameters": {
+                "PartNumber": "WB-22", "Gauge": "22 AWG", "Wire Gauge": "22 AWG",
+                "VoltageRating": "600V", "Insulation": "PTFE", "Design Item Id": "WB-22"}}],
+            "connectors": [{
+                "designator": "P1",
+                "parameters": {"PartNumber": "C-1", "Comment": "C-1", "Old Col": "x"},
+                "pins": [{"designator": "1", "cavity_parts": [{
+                    "type": "crimp", "part_number": "T-1",
+                    # Finish: a column emptied in the database, no longer carried
+                    "parameters": {"PartNumber": "T-1", "Old Col": "y", "Finish": "Tin"}}]}],
+            }],
+        }
+        return doc, fake
+
+    async def test_sync_harness_library_reports_stale_parameters(self):
+        import main
+        from altium_files import read_altium_text
+        doc, fake = self._stale_fixture()
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        with patch("main.parse_wirdoc", return_value=fake):
+            res = json.loads(await main.sync_harness_library(None, document_path=str(doc)))
+        self.assertEqual(
+            res["stale_parameters"],
+            {"Old Col": ["P1", "P1.1 T-1"], "VoltageRating": ["W1"], "Wire Gauge": ["W1"]},
+        )
+        self.assertEqual(res["stale_parameters_deleted"], {})
+        self.assertTrue(any("ask the user" in w for w in res["warnings"]))
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertFalse(any(l.startswith(("DELETE_WIREPARAM", "DELETE_COMPPARAM")) for l in lines))
+        crimp = [l for l in lines if l.startswith("CAVITYPART|P1|1|")]
+        # kept stale parameter carried over; emptied database column dropped
+        self.assertEqual(crimp, ["CAVITYPART|P1|1|0|T-1|lib.DbLib|parts.csv|Socket|"
+                                 "PartNumber|T-1|Manufacturer 1|Acme|Old Col|y"])
+        self.assertTrue(res["success"])
+
+    async def test_sync_harness_library_deletes_chosen_stale_parameters(self):
+        import main
+        from altium_files import read_altium_text
+        doc, fake = self._stale_fixture()
+        self.mock_bridge.return_value = {
+            "success": True, "result": {"success": True, "parameters_deleted": 2}}
+        with patch("main.parse_wirdoc", return_value=fake):
+            res = json.loads(await main.sync_harness_library(
+                None, document_path=str(doc), delete_stale_parameters=["wire gauge", "Old Col"]))
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertIn("DELETE_WIREPARAM|W1|Wire Gauge", lines)
+        self.assertNotIn("DELETE_WIREPARAM|W1|VoltageRating", lines)
+        self.assertIn("DELETE_COMPPARAM|P1|Old Col", lines)
+        crimp = [l for l in lines if l.startswith("CAVITYPART|P1|1|")]
+        self.assertEqual(crimp, ["CAVITYPART|P1|1|0|T-1|lib.DbLib|parts.csv|Socket|"
+                                 "PartNumber|T-1|Manufacturer 1|Acme"])
+        self.assertEqual(res["stale_parameters"], {"VoltageRating": ["W1"]})
+        self.assertEqual(
+            res["stale_parameters_deleted"], {"Old Col": ["P1", "P1.1 T-1"], "Wire Gauge": ["W1"]}
+        )
+        self.assertEqual(res["parameters_deleted_count"], 2)
+        # a connector with nothing to refresh is not reported as refreshed
+        self.assertEqual(res["connectors_refreshed"], {})
+
+    async def test_sync_harness_library_deletes_all_stale_parameters(self):
+        import main
+        from altium_files import read_altium_text
+        doc, fake = self._stale_fixture()
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        with patch("main.parse_wirdoc", return_value=fake):
+            res = json.loads(await main.sync_harness_library(
+                None, document_path=str(doc), delete_stale_parameters=True))
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertIn("DELETE_WIREPARAM|W1|VoltageRating", lines)
+        self.assertIn("DELETE_WIREPARAM|W1|Wire Gauge", lines)
+        # database columns and the library link are never deleted
+        self.assertFalse(any(l.startswith("DELETE_") and l.endswith(("|Gauge", "|Insulation",
+                         "|PartNumber", "|Design Item Id", "|Comment")) for l in lines))
+        self.assertEqual(res["stale_parameters"], {})
+
     async def test_sync_harness_library_cavity_slots_associated_parts_and_cables(self):
         import tempfile
 

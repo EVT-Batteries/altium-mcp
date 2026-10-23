@@ -2109,6 +2109,41 @@ begin
     end;
 end;
 
+// Delete every parameter named PName from Owner. Returns how many were removed.
+function RemoveSchParameter(Owner: ISch_BasicContainer; PName: String): Integer;
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+    Found     : TList;
+    k         : Integer;
+begin
+    Result := 0;
+    Found := TList.Create;
+    try
+        ChildIter := Owner.SchIterator_Create;
+        ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+        Prim := ChildIter.FirstSchObject;
+        while (Prim <> nil) do
+        begin
+            if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
+                Found.Add(Prim);
+            Prim := ChildIter.NextSchObject;
+        end;
+        Owner.SchIterator_Destroy(ChildIter);
+
+        for k := 0 to Found.Count - 1 do
+        begin
+            Prim := Found[k];
+            Owner.RemoveSchObject(Prim);
+            SchServer.RobotManager.SendMessage(Owner.I_ObjectAddress, c_BroadCast,
+                SCHM_PrimitiveRegistration, Prim.I_ObjectAddress);
+        end;
+        Result := Found.Count;
+    finally
+        Found.Free;
+    end;
+end;
+
 // Mirror the parameters that have a native harness wire property onto it.
 procedure ApplyHarnessWireProperty(Wire: ISch_GraphicalObject; PName: String; PVal: String);
 var
@@ -2540,6 +2575,7 @@ var
     CachedCompObj : ISch_GraphicalObject;
     MovedCount    : Integer;
     ParamCount    : Integer;
+    ParamDelCount : Integer;
     Cleared       : TStringList;
     CavType       : Integer;
     CavPartCount  : Integer;
@@ -2652,6 +2688,7 @@ begin
         CachedCompObj := nil;
         MovedCount := 0;
         ParamCount := 0;
+        ParamDelCount := 0;
         WireCount := 0;
         SpliceCount := 0;
         NcCount := 0;
@@ -3071,6 +3108,51 @@ begin
                     ParamCount := ParamCount + 1;
                 end;
             end
+            else if (Kind = 'DELETE_COMPPARAM') then
+            begin
+                // DELETE_COMPPARAM|<ComponentDesignator>|<ParamName>
+                ConnDes := SpecField(Rec, 1);
+                PName   := SpecField(Rec, 2);
+                if (CachedCompObj <> nil) and (AnsiUpperCase(CachedCompDes) = AnsiUpperCase(ConnDes)) then
+                    Obj := CachedCompObj
+                else
+                begin
+                    Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                    if (Obj <> nil) then
+                    begin
+                        CachedCompDes := ConnDes;
+                        CachedCompObj := Obj;
+                        CompsUpdated := CompsUpdated + 1;
+                    end
+                    else if (Misses.IndexOf('connector:' + ConnDes) < 0) then
+                        Misses.Add('connector:' + ConnDes);
+                end;
+                if (Obj <> nil) then
+                    ParamDelCount := ParamDelCount + RemoveSchParameter(Obj, PName);
+            end
+            else if (Kind = 'DELETE_WIREPARAM') then
+            begin
+                // DELETE_WIREPARAM|<WireDesignator>|<ParamName>
+                WireDes := SpecField(Rec, 1);
+                PName   := SpecField(Rec, 2);
+                Obj := nil;
+                if (CachedWireObj <> nil) and (AnsiUpperCase(CachedWireDes) = AnsiUpperCase(WireDes)) then
+                    Obj := CachedWireObj
+                else
+                begin
+                    Obj := FindHarnessWire(TargetDoc, WireDes);
+                    if (Obj <> nil) then
+                    begin
+                        CachedWireDes := WireDes;
+                        CachedWireObj := Obj;
+                        WiresUpdated := WiresUpdated + 1;
+                    end
+                    else if (Misses.IndexOf('wire:' + WireDes) < 0) then
+                        Misses.Add('wire:' + WireDes);
+                end;
+                if (Obj <> nil) then
+                    ParamDelCount := ParamDelCount + RemoveSchParameter(Obj, PName);
+            end
             else if (Kind = 'UPDATE_WIREPARAM') then
             begin
                 // UPDATE_WIREPARAM|<WireDesignator>|<ParamName>|<ParamValue>
@@ -3474,6 +3556,7 @@ begin
                   '", "wires": ' + IntToStr(WireCount) +
                   ', "wires_updated": ' + IntToStr(WiresUpdated) +
                   ', "parameters_set": ' + IntToStr(ParamCount) +
+                  ', "parameters_deleted": ' + IntToStr(ParamDelCount) +
                   ', "crimps": ' + IntToStr(CrimpCount) +
                   ', "cavity_parts": ' + IntToStr(CavPartCount) +
                   ', "associated_parts": ' + IntToStr(AssocCount) +

@@ -2381,8 +2381,10 @@ async def add_harness_wiring(
                 {"x": 16700, "y": 8400, "orientation": 0, "text": "BMSS_C01_POS"}
             ]
         net_labels (list): Deprecated alias of labels.
-        wire_updates (list): Parameters to upsert on existing wires, e.g.:
-            [{"designator": "W1", "parameters": {"Gauge": "22 AWG"}, "tcolor": 0}]
+        wire_updates (list): Parameters to upsert on existing wires, and names of parameters
+            to delete from them, e.g.:
+            [{"designator": "W1", "parameters": {"Gauge": "22 AWG"}, "tcolor": 0,
+              "delete_parameters": ["Wire Gauge"]}]
         cavity_crimps (list): Terminals to put in connector cavities, e.g.:
             [{"connector": "P1", "pin": "1", "terminal": "64900613722DEC",
               "source_library": "my.DbLib", "source_table": "terminals-db.csv",
@@ -2441,8 +2443,10 @@ async def add_harness_wiring(
             Use it for unannotated objects ("P?", "*") that no designator can address.
             Applied before every other change of the call, so later entries may use the
             new designators. show_name only applies to no-connects.
-        component_updates (list): Parameters to upsert on placed connectors/components, e.g.:
-            [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"}}]
+        component_updates (list): Parameters to upsert on placed connectors/components, and
+            names of parameters to delete from them, e.g.:
+            [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"},
+              "delete_parameters": ["Old Column"]}]
         clear_existing (bool, optional): If True, removes existing harness wires, splices,
             and harness no-connects (only those) before adding new ones. Defaults to False.
         sheet_style (str, optional): Change the sheet size, e.g. "D" or "A3". Left unchanged
@@ -2626,6 +2630,8 @@ async def add_harness_wiring(
         w_des = str(wu.get("designator", "")).strip()
         for pk, pv in _param_pairs(wu.get("parameters")):
             lines.append(_spec_line("UPDATE_WIREPARAM", w_des, pk, pv))
+        for pk in wu.get("delete_parameters") or []:
+            lines.append(_spec_line("DELETE_WIREPARAM", w_des, str(pk)))
         if wu.get("tcolor") is not None:
             lines.append(_spec_line("WIRECOLOR", w_des, int(wu["tcolor"])))
 
@@ -2722,6 +2728,8 @@ async def add_harness_wiring(
         c_des = str(cu.get("designator", "")).strip()
         for pk, pv in _param_pairs(cu.get("parameters")):
             lines.append(_spec_line("UPDATE_COMPPARAM", c_des, pk, pv))
+        for pk in cu.get("delete_parameters") or []:
+            lines.append(_spec_line("DELETE_COMPPARAM", c_des, str(pk)))
 
     # Spec file and command under one hold of the bridge: another server
     # process must not replace the spec between writing and running it
@@ -3201,6 +3209,32 @@ async def check_harness_wiring(ctx: Context, file_path: str) -> str:
     )
 
 
+# Parameters a synced object carries that are no database column: the library
+# link, Altium's own fields and its built-in harness wire properties. Never
+# reported as stale.
+NON_DATABASE_PARAMETERS = {
+    "comment",
+    "description",
+    "designator",
+    "partnumber",
+    "design item id",
+    "source library",
+    "source table",
+    "library reference",
+    "crimp",
+    "net",
+    "systemdesignuniqueid",
+    # Altium's built-in harness wire properties (read-only parameters)
+    "gauge",
+    "color",
+    "border",
+    "min. bending radius",
+    "min bending radius",
+    "thickness",
+    "include cut",
+}
+
+
 def _awg(text: str | None) -> str | None:
     """Gauge number in a text like '22 AWG (Twisted Pair)'."""
     match = re.search(r"(\d+(?:/\d+)?)\s*AWG", text or "", re.IGNORECASE)
@@ -3223,6 +3257,7 @@ async def _sync_harness_from_library(
     sync_associated: bool = False,
     sync_cables: bool = False,
     associated_map: dict | None = None,
+    delete_stale_parameters: bool | list | None = None,
 ) -> dict[str, Any]:
     """Shared engine of sync_harness_library and sync_harness_wires."""
     target_path = str(Path(document_path).resolve())
@@ -3238,6 +3273,34 @@ async def _sync_harness_from_library(
             if params.get(column):
                 out[alias] = params[column]
         return out
+
+    # Stale parameters: on a synced object but no column of its database
+    # table (a column renamed or deleted since the last sync)
+    not_stale = NON_DATABASE_PARAMETERS | {
+        n.lower() for n in [*aliases, *(extra_wire_parameters or {})]
+    }
+    if isinstance(delete_stale_parameters, (list, tuple, set)):
+        delete_names = {str(n).lower() for n in delete_stale_parameters}
+    else:
+        delete_names = None
+    stale: dict[str, list[str]] = {}
+    stale_deleted: dict[str, list[str]] = {}
+
+    def stale_in(where: str, table: Any, params: dict[str, str]) -> list[str]:
+        """Record the stale parameter names of one object; return those to delete."""
+        columns = {c.lower() for c in table.columns}
+        to_delete = []
+        for name in params:
+            if name.lower() in columns or name.lower() in not_stale:
+                continue
+            if delete_stale_parameters is True or (
+                delete_names is not None and name.lower() in delete_names
+            ):
+                stale_deleted.setdefault(name, []).append(where)
+                to_delete.append(name)
+            else:
+                stale.setdefault(name, []).append(where)
+        return to_delete
 
     wire_updates = []
     if sync_wires:
@@ -3288,6 +3351,9 @@ async def _sync_harness_from_library(
             if src_lib:
                 params["Source Library"] = src_lib
             update: dict[str, Any] = {"designator": des, "parameters": params}
+            to_delete = stale_in(des, table, wp)
+            if to_delete:
+                update["delete_parameters"] = to_delete
             tcolor = color_to_tcolor(row.get("Color", ""), color_map)
             if tcolor is not None:
                 update["tcolor"] = tcolor
@@ -3303,9 +3369,9 @@ async def _sync_harness_from_library(
         """Database-backed part dicts for part_numbers, or None (reported)
         when one is not in the database: a slot is replaced as a whole, so
         it is left alone rather than losing that part. Parameters the
-        current part of the same number carries beyond the database row
-        (e.g. a strip length typed in Altium) are kept: replacing the part
-        would otherwise drop them."""
+        current part of the same number carries that are no database column
+        (e.g. a strip length typed in Altium) are kept, unless they are
+        stale ones to delete: replacing the part would otherwise drop them."""
         kept = {
             p["part_number"]: p.get("parameters", {}) for p in current or [] if p.get("part_number")
         }
@@ -3319,8 +3385,16 @@ async def _sync_harness_from_library(
                 return None
             table, row = found
             params = with_aliases(table.parameters(row))
+            columns = {c.lower() for c in table.columns}
+            dropped = set(stale_in(f"{where} {pn}", table, kept.get(pn, {})))
             for name, value in kept.get(pn, {}).items():
-                if name not in params and name != "Description" and value:
+                if (
+                    name not in params
+                    and name != "Description"
+                    and value
+                    and name.lower() not in columns  # emptied in the database
+                    and name not in dropped
+                ):
                     params[name] = value
             parts.append(
                 {
@@ -3447,8 +3521,15 @@ async def _sync_harness_from_library(
                 for name, value in table.parameters(row).items()
                 if name in current and current[name] != value
             }
-            if changed:
-                component_updates.append({"designator": c["designator"], "parameters": changed})
+            to_delete = stale_in(c["designator"], table, current)
+            if changed or to_delete:
+                component_updates.append(
+                    {
+                        "designator": c["designator"],
+                        "parameters": changed,
+                        "delete_parameters": to_delete,
+                    }
+                )
 
     if wire_updates or cavity_parts or component_updates or associated_parts or cable_updates:
         res_str = await add_harness_wiring(
@@ -3467,6 +3548,14 @@ async def _sync_harness_from_library(
     else:
         res_json = {"success": True, "note": "nothing to update"}
 
+    if stale:
+        warnings.append(
+            f"{len(stale)} parameter name(s) under stale_parameters are no column of their "
+            "database table any more (renamed or deleted) and were kept: ask the user whether "
+            "to keep or delete them, then run again with delete_stale_parameters=True (all) "
+            "or a list of the names to delete"
+        )
+
     return {
         "success": bool(res_json.get("success")) and not unresolved,
         "document_path": target_path,
@@ -3482,7 +3571,14 @@ async def _sync_harness_from_library(
             "associated_parts", sum(1 for p in associated_parts if p["part_number"])
         ),
         "cables_synced_count": res_json.get("cables", len(cable_updates)),
-        "connectors_refreshed": {u["designator"]: sorted(u["parameters"]) for u in component_updates},
+        "connectors_refreshed": {
+            u["designator"]: sorted(u["parameters"]) for u in component_updates if u["parameters"]
+        },
+        "stale_parameters": {name: sorted(set(w)) for name, w in sorted(stale.items())},
+        "stale_parameters_deleted": {
+            name: sorted(set(w)) for name, w in sorted(stale_deleted.items())
+        },
+        "parameters_deleted_count": res_json.get("parameters_deleted", 0),
         "unresolved": unresolved,
         "warnings": warnings,
         "altium_response": res_json,
@@ -3504,6 +3600,7 @@ async def sync_harness_library(
     associated_parts: bool = True,
     cables: bool = True,
     associated_map: dict | None = None,
+    delete_stale_parameters: bool | list | None = None,
 ) -> str:
     """Link harness wires, cavity parts, associated parts and cables to a local CSV-backed .DbLib and copy their parameters.
 
@@ -3518,6 +3615,13 @@ async def sync_harness_library(
     connector/splice associated parts keep their current parts unless cavity_map /
     associated_map assign others. Anything that cannot be matched is listed under "unresolved"
     and left unchanged.
+
+    Stale parameters - on a synced wire, cavity part, associated part or connector but no
+    column of its database table any more (the column was renamed or deleted) - are listed
+    under "stale_parameters" ({name: [objects]}) and kept. Ask the user whether to keep or
+    delete them, then run again with delete_stale_parameters. The library link, Comment,
+    Description, Net, SystemDesignUniqueId and Altium's built-in wire properties (Gauge,
+    Color, Border, Min. Bending Radius, Thickness, Include Cut) are never stale.
 
     Args:
         document_path: Target .WirDoc path. Required.
@@ -3543,9 +3647,13 @@ async def sync_harness_library(
             pink, tan, light blue, light green). Striped names use their base colour.
         parameter_aliases: Extra parameter names copied from a column, {alias: column},
             e.g. {"Gauge": "Wire Gauge"}.
+        delete_stale_parameters: True deletes every stale parameter, a list deletes the stale
+            parameters of those names (e.g. ["Wire Gauge", "VoltageRating"]); default None
+            only reports them. Only ever applied to stale parameters.
 
     Returns:
-        str: JSON with counts, unresolved items, warnings and Altium's report.
+        str: JSON with counts, stale_parameters, stale_parameters_deleted, unresolved items,
+        warnings and Altium's report.
     """
     if not document_path or not Path(document_path).exists():
         return json.dumps(
@@ -3577,6 +3685,7 @@ async def sync_harness_library(
         sync_associated=associated_parts,
         sync_cables=cables,
         associated_map=associated_map,
+        delete_stale_parameters=delete_stale_parameters,
     )
     result["dblib_path"] = str(lib_path)
     return json.dumps(result, indent=2)
