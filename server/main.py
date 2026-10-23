@@ -3229,7 +3229,6 @@ NON_DATABASE_PARAMETERS = {
     "color",
     "border",
     "min. bending radius",
-    "min bending radius",
     "thickness",
     "include cut",
 }
