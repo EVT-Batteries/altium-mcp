@@ -283,6 +283,26 @@ class TestBuildLayoutSpec(unittest.TestCase):
             [["CPUNASSIGN", "UCP1", "USP1"], ["CPASSIGN", "UCPP1", "USP1"]],
         )
 
+    def test_wire_end_no_connect_can_be_held(self):
+        # A free wire end (no-connect) is held like a splice, so its wire routes
+        self.layout["no_connects"] = [
+            {"designator": "TERM1", "unique_id": "UNC1", "connection_point": None}
+        ]
+        spec = build_layout_spec(
+            self.layout,
+            connection_points=[{"designator": "CP1", "objects": ["TERM1"]}],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(records_of(spec, "CPASSIGN"), [["CPASSIGN", "UCP1", "UNC1"]])
+        spec = build_layout_spec(
+            self.layout,
+            connection_points=[{"designator": "CP1", "objects": ["TERM9"]}],
+        )
+        self.assertEqual(
+            spec["errors"],
+            ["connection point 'CP1': no connector, splice or no-connect 'TERM9'"],
+        )
+
     def test_covering_on_new_bundle_and_label(self):
         spec = build_layout_spec(
             self.layout,

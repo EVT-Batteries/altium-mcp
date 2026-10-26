@@ -163,6 +163,11 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   That has left a saved lone scratch `.WirDoc` (in no project) open; close such a document
   with `Obj1 := Client.GetDocumentByPath(<full path>); Client.CloseDocument(Obj1);` and check
   `Client.GetDocumentByPath` returns nil afterwards.
+- **Never close a project by script.** `WorkspaceManager:CloseObject` with
+  `ObjectKind=Project` ignores `FileName` and closes the *focused* project: on 2026-10-26 it
+  closed the user's whole multiboard project group (and raised a save prompt that wedged the
+  executor) instead of the scratch `.PrjHar`. Close the scratch documents as above and ask the
+  user to close the scratch project in the Projects panel.
 
 ## 6. Finding out how Altium works
 

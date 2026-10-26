@@ -633,8 +633,14 @@ def build_layout_spec(
     cps_by_uid = {cp["unique_id"]: cp for cp in layout["connection_points"]}
     cps = {cp["designator"]: cp for cp in layout["connection_points"]}
     cps.update({uid: cp for uid, cp in cps_by_uid.items()})
+    # A no-connect at a wire end (a free end, e.g. a loose contact) is held like a splice
     held = {
-        o["designator"]: o for o in [*layout["connectors"], *layout.get("splices", [])]
+        o["designator"]: o
+        for o in [
+            *layout["connectors"],
+            *layout.get("splices", []),
+            *layout.get("no_connects", []),
+        ]
     }
     holder = {
         obj: cp for cp in layout["connection_points"] for obj in cp.get("objects", [])
@@ -847,7 +853,8 @@ def build_layout_spec(
             obj = held.get(obj_des)
             if obj is None:
                 errors.append(
-                    f"connection point '{des}': no connector or splice '{obj_des}'"
+                    f"connection point '{des}': no connector, splice or no-connect "
+                    f"'{obj_des}'"
                 )
                 continue
             old = holder.get(obj_des)

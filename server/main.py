@@ -2937,10 +2937,11 @@ async def edit_harness_layout(
             [{"designator": "CP1", "x": 12000, "y": 12000, "style": "circle",
               "show_name": True, "orientation": 0, "objects": ["SP1"],
               "designator_pos": [12200, 12400]}].
-            style is "circle", "square" or "insulator". "objects" are connectors or splices
-            to hold here (taken from the connection point holding them); "release" removes
-            held ones; "new_designator" renames. A wire is routed through the bundles between
-            the connection points holding its two ends, so every splice needs one. Moving a
+            style is "circle", "square" or "insulator". "objects" are connectors, splices or
+            no-connects (a free wire end) to hold here (taken from the connection point holding
+            them); "release" removes held ones; "new_designator" renames. A wire is routed
+            through the bundles between the connection points holding its two ends, so every
+            splice and wire-end no-connect needs one. Moving a
             connection point moves the ends of its bundles (a straight end segment stays
             straight).
         bundles (list): New or existing bundles, e.g.
