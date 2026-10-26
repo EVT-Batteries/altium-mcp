@@ -17,8 +17,15 @@ import win32api
 import win32con
 import win32gui
 import win32process
-import win32ui
+from PIL import Image
+import io
+import base64
+import glob
+import re
+import uuid
+
 from altium_files import read_altium_text, write_altium_text
+import sandbox
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from harness_layout import build_layout_spec, check_layout, parse_ldrdoc
 from harness_parser import (
@@ -82,9 +89,33 @@ EXCHANGE_DIR = Path("C:/Users/Public/altium_mcp")
 EXCHANGE_DIR.mkdir(exist_ok=True)
 REQUEST_FILE = EXCHANGE_DIR / "request.json"
 RESPONSE_FILE = EXCHANGE_DIR / "response.json"
-BRIDGE_LOCK_FILE = EXCHANGE_DIR / "bridge.lock"
-# Longer than one script's 120 s response timeout
-BRIDGE_LOCK_TIMEOUT = 300
+
+# Seconds for a running Altium to pick up a request (normally ~1-5 s), for a
+# cold Altium launch to get that far, and for a started command to finish
+START_TIMEOUT = 20
+START_TIMEOUT_COLD = 240
+RESPONSE_TIMEOUT = 120
+
+# Present while a script the MCP launched is stuck (paused in Altium's
+# debugger). Only then is the debugger stopped, so a script the user is
+# running or debugging is never stopped. Every server using this exchange
+# folder sees it, including after a restart.
+STUCK_MARKER = EXCHANGE_DIR / "mcp_script_stuck.txt"
+
+
+def _mark_script_stuck(what: str):
+    try:
+        STUCK_MARKER.write_text(what, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_script_stuck():
+    try:
+        STUCK_MARKER.unlink()
+    except OSError:
+        pass
+
 
 # Initialize FastMCP server
 mcp = MCPServer("AltiumMCP")
@@ -312,39 +343,69 @@ class AltiumBridge:
         exchange folder (e.g. one started by Gemini and one by Claude). The OS
         releases the lock if a process dies."""
         async with self._command_lock:
-            with open(BRIDGE_LOCK_FILE, "a+b") as handle:  # noqa: ASYNC230
-                deadline = time.time() + BRIDGE_LOCK_TIMEOUT
-                while True:
-                    try:
-                        handle.seek(0)
-                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                        break
-                    except OSError:
-                        if time.time() > deadline:
-                            raise TimeoutError(
-                                "Altium bridge busy: another MCP server process held "
-                                f"{BRIDGE_LOCK_FILE} for {BRIDGE_LOCK_TIMEOUT} s"
-                            ) from None
-                        await asyncio.sleep(0.25)
-                try:
-                    yield
-                finally:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return await self._execute_command_locked(command, params)
 
-    async def execute_command(
-        self, command: str, params: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Execute a command in Altium via the bridge script"""
+    @staticmethod
+    def _altium_running() -> bool:
         try:
-            async with self.exclusive():
-                return await self._execute_command_locked(command, params)
-        except TimeoutError as e:
-            return {"success": False, "error": str(e)}
+            out = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq X2.EXE", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            return "X2.EXE" in out.upper()
+        except Exception:
+            return True  # unknown: assume running and use the normal timeouts
+
+    async def stop_script_debugger(self):
+        """Stop a script of ours paused in Altium's debugger.
+
+        A runtime error leaves a script paused in the debugger, after which
+        Altium refuses every new RunScript until it is stopped. Each refused
+        launch leaves a modal "Another script executing now" error open, and
+        while it is open Altium turns the Stop request away as well ("another
+        instance ... is busy"), so Altium's message boxes are closed first.
+        Harmless when nothing is paused.
+        """
+        _dismiss_altium_dialogs(message_boxes_only=True)
+        await asyncio.sleep(1)
+        logger.warning(
+            "Sending -REditScript:Stop to Altium to unblock the script executor"
+        )
+        try:
+            subprocess.Popen(
+                f'"{self.config.altium_exe_path}" -REditScript:Stop', shell=True
+            )
+        except Exception as e:
+            logger.error(f"Could not send -REditScript:Stop: {e}")
+
+    @staticmethod
+    async def _wait_for_start(timeout: float) -> bool:
+        """The bridge script deletes request.json as soon as it has read it."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if not REQUEST_FILE.exists() or RESPONSE_FILE.exists():
+                return True
+            await asyncio.sleep(0.25)
+        return not REQUEST_FILE.exists() or RESPONSE_FILE.exists()
+
+    @staticmethod
+    async def _read_response_text() -> str:
+        """Read response.json, retrying while Altium may still be writing it."""
+        text = ""
+        for _ in range(12):
+            try:
+                text = read_altium_text(RESPONSE_FILE)
+                json.loads(text)
+                return text
+            except (OSError, json.JSONDecodeError):
+                await asyncio.sleep(0.25)
+        return text
 
     async def _execute_command_locked(
-        self, command: str, params: dict[str, Any]
-    ) -> dict[str, Any]:
+        self, command: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         try:
             blocking = _blocking_altium_dialogs()
             if blocking:
@@ -358,53 +419,115 @@ class AltiumBridge:
             if RESPONSE_FILE.exists():
                 RESPONSE_FILE.unlink()
 
-            # Write the request file with command and parameters
+            # The script echoes request_id so a late reply to an earlier,
+            # timed-out command is never mistaken for this command's result
+            request_id = uuid.uuid4().hex[:12]
             with open(REQUEST_FILE, "w") as f:
                 json.dump(
                     {
                         "command": command,
+                        "request_id": request_id,
                         **params,  # Include parameters directly in the main JSON object
                     },
                     f,
                     indent=2,
                 )
 
-            logger.info(f"Wrote request file for command: {command}")
+            logger.info(
+                f"Wrote request file for command: {command} (request_id={request_id})"
+            )
 
-            # Run the Altium script
+            cold_start = not self._altium_running()
+            if cold_start:
+                logger.info(
+                    "Altium is not running - launching it, allowing time for startup"
+                )
+
             success = await self.run_altium_script()
             if not success:
                 return {"success": False, "error": "Failed to run Altium script"}
 
-            # Wait for the response file
-            logger.info("Waiting for response file to appear...")
-            timeout = 120  # seconds
-            start_time = time.time()
-            while not RESPONSE_FILE.exists() and time.time() - start_time < timeout:
-                await asyncio.sleep(0.5)
+            # A running Altium picks the request up within seconds. If it does
+            # not and a script of ours is stuck in the debugger, stop it and
+            # launch once more. The script consumes request.json, so a queued
+            # first launch cannot run it twice. Any other script is left alone:
+            # it may be one the user is running or debugging.
+            started = await self._wait_for_start(
+                START_TIMEOUT_COLD if cold_start else START_TIMEOUT
+            )
+            recovered = False
+            if not started and STUCK_MARKER.exists():
+                logger.warning(
+                    f"Altium did not pick up the request within {START_TIMEOUT}s "
+                    f"and a script of ours is stuck - attempting recovery"
+                )
+                await self.stop_script_debugger()
+                await asyncio.sleep(2)
+                recovered = True
+                if REQUEST_FILE.exists():
+                    await self.run_altium_script()
+                started = await self._wait_for_start(START_TIMEOUT)
 
-            if not RESPONSE_FILE.exists():
-                logger.error("Timeout waiting for response from Altium")
-                # Usually the script paused in the debugger, which blocks
-                # every later call until it is stopped
-                # Tools pass only "error" on, so the outcome goes into it
-                recovery = await _recover_script_executor()
-                if recovery["recovered"]:
-                    detail = (
-                        f"script engine unblocked automatically ({recovery['method']}); "
-                        "the command did not complete, check its document before retrying"
-                    )
-                else:
-                    detail = recovery["ask_user"]
+            if not started:
+                try:
+                    REQUEST_FILE.unlink()  # a launch Altium runs later must find nothing to do
+                except OSError:
+                    pass
+                # Each refused launch left an OK-only "Another script executing
+                # now" box in Altium: do not leave it in front of the user
+                _dismiss_altium_dialogs(message_boxes_only=True)
+                logger.error("Altium never started the bridge script")
+                # Tools pass on only "error", so the explanation goes in it
+                why = (
+                    "A script of ours was stuck in Altium's debugger and stopping it did "
+                    "not free Altium."
+                    if recovered
+                    else "Altium is not accepting script runs: a dialog may be open, Altium may "
+                    "be busy or still starting up, or a script of the user's own may be "
+                    "running or paused in its debugger. Nothing was stopped."
+                )
                 return {
                     "success": False,
-                    "error": f"No response received from Altium (timeout); {detail}",
-                    "executor_wedged": not recovery["recovered"],
+                    "error": f"Altium did not start the command (not executed). {why} Check "
+                    f"the Altium window for an open dialog or a running or paused "
+                    f"script, then retry.",
+                }
+            _clear_script_stuck()
+
+            logger.info("Bridge script started, waiting for response file...")
+            start_time = time.time()
+            while time.time() - start_time < RESPONSE_TIMEOUT:
+                if RESPONSE_FILE.exists():
+                    response_text = await self._read_response_text()
+                    try:
+                        rid = json.loads(response_text).get("request_id")
+                    except (json.JSONDecodeError, AttributeError):
+                        rid = None
+                    if rid is None or rid == request_id:
+                        break
+                    logger.warning(f"Discarding stale response for request_id={rid}")
+                    try:
+                        RESPONSE_FILE.unlink()
+                    except OSError:
+                        pass
+                await asyncio.sleep(0.25)
+            else:
+                logger.error("Timeout waiting for response from Altium")
+                # The script started but never finished: it is most likely
+                # paused in the debugger now. Unblock it for the next command.
+                _mark_script_stuck(f"bridge command {command}")
+                await self.stop_script_debugger()
+                return {
+                    "success": False,
+                    "error": f"No response from Altium within {RESPONSE_TIMEOUT}s: command "
+                    f"'{command}' started but did not finish. It probably hit a "
+                    f"runtime error and paused in Altium's debugger (now stopped, "
+                    f"so the next command can run), or it is still working on a "
+                    f"very large design.",
                 }
 
-            # Read the response file and print it for debugging
-            logger.info("Response file found, reading response")
-            response_text = read_altium_text(RESPONSE_FILE)
+            if recovered:
+                logger.info("Command succeeded after automatic executor recovery")
 
             # Log the raw response for debugging
             logger.info(f"Raw response (first 200 chars): {response_text[:200]}")
@@ -529,6 +652,7 @@ class AltiumBridge:
 
 # Create a global bridge instance
 altium_bridge = AltiumBridge()
+
 
 async def _get_active_harness_path() -> Path | None:
     """The harness project (.PrjHar) or wiring document Altium has focused.
@@ -985,7 +1109,9 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
                     f"Retrieved {len(h_components)} harness schematic components as fallback"
                 )
                 return json.dumps(
-                    {"components": h_components, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+                    {"components": h_components, **_disk_source(h_path)},
+                    indent=2,
+                    ensure_ascii=False,
                 )
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
@@ -1001,7 +1127,9 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
             h_components = get_harness_schematic_data(h_path, cmp_designators)
             if h_components:
                 return json.dumps(
-                    {"components": h_components, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+                    {"components": h_components, **_disk_source(h_path)},
+                    indent=2,
+                    ensure_ascii=False,
                 )
         logger.info("No schematic data found")
         return json.dumps({"error": "No schematic data found"})
@@ -1034,7 +1162,9 @@ async def get_schematic_data(ctx: Context, cmp_designators: list) -> str:
                 h_components = get_harness_schematic_data(h_path, cmp_designators)
                 if h_components:
                     return json.dumps(
-                        {"components": h_components, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+                        {"components": h_components, **_disk_source(h_path)},
+                        indent=2,
+                        ensure_ascii=False,
                     )
 
         result = {
@@ -1158,7 +1288,9 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
                 logger.info(
                     f"Retrieved {len(h_data['components'])} harness components as fallback"
                 )
-                return json.dumps({**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
+                return json.dumps(
+                    {**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+                )
         if not response.get("success", False):
             error_msg = response.get("error", "Unknown error")
             logger.error(f"Error getting component data: {error_msg}")
@@ -1172,7 +1304,9 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
         if h_path:
             h_data = get_harness_component_data(h_path, cmp_designators)
             if h_data.get("components"):
-                return json.dumps({**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
+                return json.dumps(
+                    {**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+                )
         logger.info("No component data found")
         return json.dumps({"error": "No component data found"})
 
@@ -1203,7 +1337,9 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
             if h_path:
                 h_data = get_harness_component_data(h_path, cmp_designators)
                 if h_data.get("components"):
-                    return json.dumps({**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
+                    return json.dumps(
+                        {**h_data, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+                    )
 
         result = {
             "components": components,
@@ -1382,11 +1518,9 @@ async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
 
 SANDBOX_DIR = MCP_DIR / "SandboxScript"
 SANDBOX_PAS = SANDBOX_DIR / "Sandbox.pas"
-SANDBOX_PRJ = SANDBOX_DIR / "Sandbox.PrjScr"
-SANDBOX_LOG = EXCHANGE_DIR / "sandbox_log.txt"
-SANDBOX_RESULT = EXCHANGE_DIR / "sandbox_result.json"
-SANDBOX_BEGIN = "// === BEGIN EXPERIMENT"
-SANDBOX_END = "// === END EXPERIMENT"
+# Run files live in the exchange folder: Altium runs outside Claude Desktop's
+# MSIX package and cannot see the virtualized AppData path (issue #19)
+SANDBOX_RUNS = EXCHANGE_DIR / "runs"
 
 
 def _window_process_name(hwnd) -> str:
@@ -1415,7 +1549,7 @@ def _window_process_name(hwnd) -> str:
         kernel32.CloseHandle(handle)
 
 
-def _dismiss_altium_dialogs():
+def _dismiss_altium_dialogs(message_boxes_only: bool = False):
     """Close Altium modal popups that would otherwise block a script run.
 
     Altium uses two kinds: Win32 task dialogs (#32770) and Delphi TMessageForm
@@ -1423,7 +1557,8 @@ def _dismiss_altium_dialogs():
     (TForm_RunScriptParameters) when it cannot find the script project; that
     one stays open and blocks every later script run. Only windows owned by
     the Altium process (X2.EXE) are touched, so dialogs of other applications
-    are never closed.
+    are never closed. With message_boxes_only, only the OK-only Error and
+    Information boxes are closed: the ones a refused script launch raises.
 
     Returns (handle, class name, title, text) of the windows that were closed,
     so the caller can tell the user (a closed dialog may have been one the
@@ -1457,6 +1592,10 @@ def _dismiss_altium_dialogs():
             "Confirm",
         ):
             return True
+        if message_boxes_only and (
+            cls.value != "TMessageForm" or title not in ("Error", "Information")
+        ):
+            return True
         if _window_process_name(hwnd).lower() != "x2.exe":
             return True
         found.append((hwnd, cls.value, title, _dialog_text(hwnd)))
@@ -1468,184 +1607,12 @@ def _dismiss_altium_dialogs():
     return found
 
 
-def _dialog_text(hwnd) -> str:
-    """Text of a dialog's static controls (the message of a #32770 box)."""
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.windll.user32
-    parts = []
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(child, lparam):
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(child, cls, 64)
-        if cls.value == "Static":
-            n = user32.GetWindowTextLengthW(child)
-            buf = ctypes.create_unicode_buffer(n + 1)
-            user32.GetWindowTextW(child, buf, n + 1)
-            if buf.value.strip():
-                parts.append(buf.value.strip())
-        return True
-
-    user32.EnumChildWindows(hwnd, cb, 0)
-    return "\n".join(parts)
-
-
-def _altium_main_window():
-    """Handle of Altium's main frame (largest visible X2.EXE window titled
-    "Altium Designer"), or None."""
-    import ctypes
-    from ctypes import wintypes
-
-    user32 = ctypes.windll.user32
-    best = []
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(hwnd, lparam):
-        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
-            return True
-        n = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(n + 1)
-        user32.GetWindowTextW(hwnd, buf, n + 1)
-        if "Altium Designer" not in buf.value:
-            return True
-        if _window_process_name(hwnd).lower() != "x2.exe":
-            return True
-        r = wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(r))
-        best.append(((r.right - r.left) * (r.bottom - r.top), hwnd))
-        return True
-
-    user32.EnumWindows(cb, 0)
-    return max(best)[1] if best else None
-
-
-def _blocking_altium_dialogs() -> list[str]:
-    """Titles of the modal windows that block Altium, after closing the ones
-    _dismiss_altium_dialogs may close; [] when Altium is free.
-
-    Altium disables its main window while a modal window is up. One the MCP
-    must not close, such as the .NET "Error" report (Send and Close may end
-    Altium), also blocks the command line: X2.EXE started then shows "another
-    instance ... is busy" and waits, so nothing may be launched until the user
-    has closed it.
-    """
-    try:
-        import ctypes
-        from ctypes import wintypes
-    except ImportError:
-        return []
-    user32 = ctypes.windll.user32
-    for _ in range(2):
-        main_hwnd = _altium_main_window()
-        if not main_hwnd or user32.IsWindowEnabled(main_hwnd):
-            return []
-        if not _dismiss_altium_dialogs():
-            break
-        time.sleep(1.0)
-    else:
-        main_hwnd = _altium_main_window()
-        if not main_hwnd or user32.IsWindowEnabled(main_hwnd):
-            return []
-    titles = []
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(hwnd, lparam):
-        if hwnd == main_hwnd or not user32.IsWindowVisible(hwnd):
-            return True
-        if not user32.IsWindowEnabled(hwnd):
-            return True
-        n = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(n + 1)
-        user32.GetWindowTextW(hwnd, buf, n + 1)
-        if buf.value and _window_process_name(hwnd).lower() == "x2.exe":
-            titles.append(buf.value)
-        return True
-
-    user32.EnumWindows(cb, 0)
-    return titles or ["(untitled window)"]
-
-
-def _blocked_ask_user(titles: list[str]) -> str:
-    return (
-        f"Altium shows a modal window the MCP must not close ({', '.join(titles)}). "
-        "Stop retrying and ask the user to read it and close it (for Altium's error "
-        "report, choose to continue if offered, not Send and Close), then try again."
+def _sandbox() -> sandbox.Sandbox:
+    return sandbox.Sandbox(
+        altium_exe=altium_bridge.config.altium_exe_path,
+        template=SANDBOX_PAS,
+        runs_dir=SANDBOX_RUNS,
     )
-
-
-def _send_ctrl_f3() -> bool:
-    """Press Ctrl+F3 (Run » Stop, stops a paused script) in Altium's main
-    window. Keys carry scan codes: Altium ignores virtual-key-only events.
-    Returns False when Altium could not be brought to the front, in which case
-    nothing is typed (the keys would go to another application)."""
-    import ctypes
-
-    user32 = ctypes.windll.user32
-    hwnd = _altium_main_window()
-    if not hwnd:
-        return False
-    # A synthetic Alt press lets a background process take the foreground
-    user32.keybd_event(0x12, 0, 0, 0)
-    user32.keybd_event(0x12, 0, 2, 0)
-    user32.SetForegroundWindow(hwnd)
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        time.sleep(0.1)
-        fg = user32.GetForegroundWindow()
-        if fg and _window_process_name(fg).lower() == "x2.exe":
-            break
-    else:
-        return False
-    for vk, flags in ((0x11, 0), (0x72, 0), (0x72, 2), (0x11, 2)):  # Ctrl, F3
-        user32.keybd_event(vk, user32.MapVirtualKeyW(vk, 0), flags, 0)
-        time.sleep(0.05)
-    return True
-
-
-async def _script_engine_responds() -> bool:
-    """True when Altium runs a trivial sandbox script to its end."""
-    result = json.loads(await _run_sandbox("ResultText := 'pong';", 20, recover=False))
-    return result.get("success") is True and result.get("result") == "pong"
-
-
-async def _recover_script_executor() -> dict[str, Any]:
-    """Unblock Altium's script engine after a script paused in the debugger
-    or a run that never started. Tries EditScript:Stop, then Ctrl+F3 in the
-    Altium window, checking after each with a trivial script. The caller holds
-    the bridge lock.
-
-    Returns {"recovered": bool, "method": "stop" | "ctrl_f3" | None}; when
-    nothing worked, "ask_user" holds what to ask the user to do.
-    """
-    _dismiss_altium_dialogs()
-    blocking = _blocking_altium_dialogs()
-    if blocking:
-        # EditScript:Stop would wait behind it ("another instance ... busy")
-        return {
-            "recovered": False,
-            "method": None,
-            "blocking_dialogs": blocking,
-            "ask_user": _blocked_ask_user(blocking),
-        }
-    exe = altium_bridge.config.altium_exe_path
-    subprocess.run(f'"{exe}" -REditScript:Stop', shell=True)
-    await asyncio.sleep(2)
-    if await _script_engine_responds():
-        return {"recovered": True, "method": "stop"}
-    if _send_ctrl_f3():
-        await asyncio.sleep(2)
-        if await _script_engine_responds():
-            return {"recovered": True, "method": "ctrl_f3"}
-    return {
-        "recovered": False,
-        "method": None,
-        "ask_user": "Altium's script engine is still blocked after EditScript:Stop and "
-        "Ctrl+F3. Stop retrying and ask the user to focus the stuck script tab in "
-        "Altium and press Ctrl+F3 (Run » Stop), close any open Altium dialog, or "
-        "restart Altium; then try again.",
-    }
 
 
 @mcp.tool()
@@ -1657,27 +1624,36 @@ async def run_altium_script(
     what happened, step by step.
 
     Use this to develop and verify Altium API code before relying on it.
-    Altium has no headless test mode and its failure modes are hostile: a
-    runtime error leaves the script PAUSED IN THE DEBUGGER with no dialog,
-    after which every later script run silently does nothing until the
-    debugger is stopped (Ctrl+F3) or Altium is restarted. This tool detects
-    that state, reports exactly which statement died, and then unblocks the
-    executor itself (EditScript:Stop, then Ctrl+F3 in the Altium window,
-    each checked with a trivial script). If both fail, "executor_wedged"
-    stays true and "recovery" says what to ask the user: do not retry then.
-
-    The script runs in a SEPARATE script project, so a crash here can never
-    break the other MCP tools.
+    Each call writes the script into a fresh copy of SandboxScript/Sandbox.pas
+    with a unique file name and runs it with ScriptingSystem:RunScriptFile, so
+    a script that failed earlier can never be re-run from Altium's editor.
+    When Altium reports a compile or run-time error, the tool returns Altium's
+    message with the line in YOUR script, answers the dialog, stops the
+    debugger and confirms with a probe run that the next call will work. No
+    manual Ctrl+F3 or -REditScript:Stop is needed. Only scripts the MCP
+    started are ever stopped: a script the user is running or debugging in
+    Altium is left alone, and the tool says Altium is busy instead.
 
     Writing the script:
     - Call SandboxLog('...') before each risky statement. The log is flushed
       after every call, so the last logged line identifies what failed.
     - Assign findings to the string variable ResultText - it is returned.
-    - DelphiScript has NO inline variable declarations. Reuse the provided
-      scratch variables: S1..S3 (String), I1..I3 and B1 (Integer),
-      Obj1..Obj5 (IDispatch), List1 (TStringList), IntMan, DbDoc.
-    - try/except does NOT catch runtime errors such as bad conversions or
-      invalid API calls, so it cannot be relied on to keep a script alive.
+    - Variables: either start the script with your own block, e.g.
+          var
+              Doc, Comp : IDispatch;
+              X, Y : Integer;
+      or reuse the scratch variables S1..S9 (String), I1..I9 and B1..B3
+      (Integer), F1..F4 (Double), Obj1..Obj9 (IDispatch), List1..List3
+      (TStringList), IntMan, DbDoc. Assigning an undeclared plain name is
+      refused before Altium is called. Do not assign to a for-loop variable
+      inside its loop (compile error).
+    - Helpers: MM(mm) converts millimetres to internal units;
+      OpenSchDoc(path) returns the ISch_Document, opening the file if needed
+      (GetSchDocumentByPath alone returns nil for a closed file, and a call on
+      nil stops the script); SaveDoc(path) marks a document modified and saves it.
+    - Errors inside the script (undeclared identifiers, calls on nil, bad
+      conversions) are caught by the sandbox and come back as "script error"
+      with Altium's message and the last step; no try/except is needed.
     - The sandbox is standalone: helpers and constants from the production
       units (TrimJSON, AddJSONProperty, ...) are NOT available; REPLACEALL is.
     - Never register objects into a library document and never write to shared
@@ -1689,162 +1665,211 @@ async def run_altium_script(
     skill is installed and can install it.
 
     Args:
-        script (str): DelphiScript statements to execute (body only).
+        script (str): DelphiScript statements to execute (body only, optionally
+            preceded by a var block).
         timeout_seconds (int): How long to wait for completion (default 120).
 
     Returns:
-        str: JSON with success, the step log, the script's ResultText, the
-             dialogs it closed (titles, and texts where Windows exposes them),
-             and on failure the last step reached, whether the executor is
-             still wedged after the automatic recovery, and "recovery".
+        str: JSON with success, the step log and the script's ResultText; on
+             failure Altium's error message and its location in the script,
+             the last step reached, and whether the executor was recovered.
     """
     logger.info(f"run_altium_script: {len(script.splitlines())} lines")
 
-    if not SANDBOX_PAS.exists() or not SANDBOX_PRJ.exists():
+    if not SANDBOX_PAS.exists():
         return json.dumps(
-            {"success": False, "error": f"sandbox project missing at {SANDBOX_DIR}"}
+            {"success": False, "error": f"sandbox template missing: {SANDBOX_PAS}"}
         )
 
-    async with altium_bridge.exclusive():
-        return await _run_sandbox(script, timeout_seconds)
-
-
-async def _run_sandbox(script: str, timeout_seconds: int, recover: bool = True) -> str:
-    # The tracked SandboxScript/ files are a template: each run works on a
-    # copy in the exchange folder, so running scripts never dirties the repo.
-    work_dir = EXCHANGE_DIR / "sandbox"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    work_pas = work_dir / SANDBOX_PAS.name
-    work_prj = work_dir / SANDBOX_PRJ.name
-    try:
-        work_prj.write_bytes(SANDBOX_PRJ.read_bytes())
-        src = SANDBOX_PAS.read_text(encoding="utf-8")
-        pre, rest = src.split(SANDBOX_BEGIN, 1)
-        marker_line, rest = rest.split("\n", 1)
-        _, post = rest.split(SANDBOX_END, 1)
-        body = "\n".join(
-            "        " + ln if ln.strip() else ln
-            for ln in script.strip("\n").splitlines()
-        )
-        work_pas.write_text(
-            pre
-            + SANDBOX_BEGIN
-            + marker_line
-            + "\n"
-            + body
-            + "\n        "
-            + SANDBOX_END
-            + post,
-            encoding="utf-8",
-        )
-    except Exception as e:
-        return json.dumps({"success": False, "error": f"could not inject script: {e}"})
-
-    for f in (SANDBOX_LOG, SANDBOX_RESULT):
-        if f.exists():
-            try:
-                f.unlink()
-            except OSError:
-                pass
-
-    # Altium runs outside Claude Desktop's MSIX package and cannot see the
-    # virtualized AppData path this process sees (issue #19)
-    blocking = _blocking_altium_dialogs()
-    if blocking:
+    split = sandbox.split_var_block(script)
+    problems = sandbox.check_script(
+        split.body, sandbox.declared_names(split.decls), split.body_offset
+    )
+    if problems:
         return json.dumps(
             {
                 "success": False,
-                "error": "Altium is blocked by a modal window; the script did not run",
-                "executor_wedged": True,
-                "recovery": _blocked_ask_user(blocking),
-            }
+                "error": "refused before execution: the script would not compile",
+                "problems": problems,
+                "executor_wedged": False,
+            },
+            indent=2,
         )
 
-    sandbox_prj = AltiumBridge._resolve_msix_path(str(work_prj))
-    cmd = (
-        f'"{altium_bridge.config.altium_exe_path}" -RScriptingSystem:RunScript('
-        f'ProjectName="{sandbox_prj}"^|ProcName="Sandbox>Run")'
-    )
-    subprocess.Popen(cmd, shell=True)
+    sb = _sandbox()
+    report = {}
+    # A script-error dialog left open blocks every new run. Answer it only
+    # when a script of ours is stuck; one from the user's own script is theirs.
+    if any(d.is_script_error for d in sandbox.altium_dialogs()):
+        if not STUCK_MARKER.exists():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "not run: Altium is showing a script error dialog from a script the MCP "
+                    "did not start. Answer or close it in Altium, then retry.",
+                    "executor_wedged": False,
+                },
+                indent=2,
+            )
+        report["recovered_before_run"] = await asyncio.to_thread(sb.recover)
+        if report["recovered_before_run"]["recovered"]:
+            _clear_script_stuck()
+
+    try:
+        files = sb.new_run_files()
+        built = sb.write(files, script)
+    except Exception as e:
+        return json.dumps(
+            {"success": False, "error": f"could not write the run file: {e}"}
+        )
+    sb.launch(files)
+    report["run_file"] = str(files.script)
 
     start = time.time()
     # Keyed by window: a dialog that ignores WM_CLOSE (Yes/No boxes do) is
     # found again on every pass and must be reported once
     dismissed = {}
-    error_seen_at = None
-    while not SANDBOX_RESULT.exists() and time.time() - start < timeout_seconds:
+    error_dialog = None
+    while not files.result.exists() and time.time() - start < timeout_seconds:
         await asyncio.sleep(0.5)
-        if time.time() - start > 6:
-            for h, c, t, text in _dismiss_altium_dialogs():
-                dismissed[h] = (c, t, text)
-                if t == "Error" and error_seen_at is None:
-                    error_seen_at = time.time()
-        # Altium's error box means the script died or never started: no
-        # result is coming, so stop waiting soon after it
-        if error_seen_at and time.time() - error_seen_at > 3:
+        for d in sandbox.altium_dialogs():
+            # A syntax error stops the script before 'sandbox start' is
+            # logged and shows Altium's Error box instead of the
+            # "Continue execution?" dialog
+            if d.is_script_error or (
+                d.cls == "TMessageForm"
+                and d.title == "Error"
+                and not files.log.exists()
+            ):
+                error_dialog = d
+                sandbox.answer_dialog(d)
+                break
+            if time.time() - start > 6:
+                sandbox.answer_dialog(d)
+                dismissed[d.hwnd] = d
+        if error_dialog:
             break
 
-    dialogs = list(dismissed.values())
-    titles = [t for _, t, _ in dialogs]
-    texts = [text for _, _, text in dialogs if text]
-    steps = []
-    if SANDBOX_LOG.exists():
-        steps = read_altium_text(SANDBOX_LOG).splitlines()
-    report = {"dialogs_dismissed": len(dialogs), "dismissed_dialog_titles": titles}
-    if texts:
-        report["dismissed_dialog_texts"] = texts
+    report["dialogs_dismissed"] = len(dismissed)
+    report["dismissed_dialog_titles"] = [d.title for d in dismissed.values()]
+    steps = (
+        sandbox.read_when_ready(files.log, read_altium_text).splitlines()
+        if files.log.exists()
+        else []
+    )
 
-    if SANDBOX_RESULT.exists():
-        result_text = read_altium_text(SANDBOX_RESULT).strip()
+    if files.result.exists():
+        _clear_script_stuck()  # our script ran to the end: Altium is free
+        result_text = sandbox.read_when_ready(files.result, read_altium_text).strip()
+        sb.prune()
+        exc = next((s for s in steps if s.startswith(sandbox.EXCEPTION_PREFIX)), None)
+        if exc is not None:
+            before = steps[: steps.index(exc)]
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "script error",
+                    "altium_message": exc[len(sandbox.EXCEPTION_PREFIX) :],
+                    "last_step_reached": before[-1] if before else None,
+                    "diagnosis": "The statement after 'last_step_reached' failed (a call on nil is "
+                    "reported as 'Undeclared identifier: <method>'). The script was "
+                    "stopped cleanly; the executor is not wedged.",
+                    "steps": steps,
+                    "executor_wedged": False,
+                    **report,
+                },
+                indent=2,
+            )
         return json.dumps(
             {"success": True, "result": result_text, "steps": steps, **report}, indent=2
         )
 
-    if any(c == "TForm_RunScriptParameters" for c, _, _ in dialogs):
+    if error_dialog:
+        # The dialog came from our run, so the stuck script is ours
+        _mark_script_stuck("run_altium_script")
+        recovery = await asyncio.to_thread(sb.recover)
+        if recovery["recovered"]:
+            _clear_script_stuck()
+        started = bool(steps)
         return json.dumps(
             {
                 "success": False,
-                "error": "Altium could not find the sandbox script project",
-                "diagnosis": f"Altium was asked to run {sandbox_prj} and showed 'Select Item To "
-                "Run' instead, so it cannot open that path. The script executor is "
-                "not wedged.",
+                "error": "run-time error" if started else "compile error",
+                "altium_message": error_dialog.text
+                or (
+                    "Altium showed an Error box before the script started; its text cannot be read "
+                    "from outside Altium. This is usually a syntax error (for example a construct "
+                    "DelphiScript does not support, such as 'on E: Exception do')."
+                ),
+                "location": sandbox.map_error_line(built, error_dialog.text),
+                "last_step_reached": steps[-1] if steps else None,
+                "diagnosis": (
+                    "The script started; the statement at 'location' failed while running "
+                    "(a call on nil is reported as 'Undeclared identifier: <method>')."
+                    if started
+                    else "The script did not compile; nothing in it ran."
+                ),
+                "steps": steps,
+                "executor_wedged": not recovery["recovered"],
+                "recovery": recovery,
+                **report,
+            },
+            indent=2,
+        )
+
+    if any(d.cls == "TForm_RunScriptParameters" for d in dismissed.values()):
+        return json.dumps(
+            {
+                "success": False,
+                "error": "Altium could not find the run file",
+                "diagnosis": f"Altium was asked to run {files.script} and showed 'Select Item To "
+                "Run' instead, so it cannot open that path.",
                 "executor_wedged": False,
                 **report,
             },
             indent=2,
         )
 
-    if steps:
-        failure = {
-            "success": False,
-            "error": "script started but did not finish",
-            "last_step_reached": steps[-1],
-            "diagnosis": "The statement AFTER the last step is what crashed or paused the script.",
-            "steps": steps,
-        }
-    else:
-        failure = {
-            "success": False,
-            "error": "script never started",
-            "diagnosis": "Usually a COMPILE error in the script (e.g. an undeclared "
-            "variable), or a previously paused script blocking execution.",
-        }
-    failure.update(report)
-    if not recover:
-        failure["executor_wedged"] = True
-        return json.dumps(failure, indent=2)
-    # A paused script blocks every later run: unblock it here rather than
-    # leaving the caller to retry against a wedged executor
-    recovery = await _recover_script_executor()
-    failure["executor_wedged"] = not recovery["recovered"]
-    if recovery["recovered"]:
-        failure["recovery"] = (
-            f"Recovered automatically ({recovery['method']}); the executor is free. "
-            "Fix the script before running it again."
+    # No result and no error dialog. If our script started, it is ours: stop
+    # it. If it never started, something else holds Altium - possibly a
+    # script the user is running or debugging - so stop only when a script
+    # of ours is known to be stuck.
+    if steps or STUCK_MARKER.exists():
+        _mark_script_stuck("run_altium_script")
+        recovery = await asyncio.to_thread(sb.recover)
+        if recovery["recovered"]:
+            _clear_script_stuck()
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"no result after {timeout_seconds} s",
+                "last_step_reached": steps[-1] if steps else None,
+                "diagnosis": (
+                    "The script started but did not finish: it was still running or "
+                    "stopped without a dialog. The debugger has been stopped, so it is no "
+                    "longer running."
+                    if steps
+                    else "Altium never started the script: a script of ours was stuck and has "
+                    "been stopped."
+                ),
+                "steps": steps,
+                "executor_wedged": not recovery["recovered"],
+                "recovery": recovery,
+                **report,
+            },
+            indent=2,
         )
-    else:
-        failure["recovery"] = recovery["ask_user"]
-    return json.dumps(failure, indent=2)
+    return json.dumps(
+        {
+            "success": False,
+            "error": f"no result after {timeout_seconds} s: Altium never started the script",
+            "diagnosis": "Altium may be busy, showing a dialog, or running or debugging a script of "
+            "the user's own. Nothing was stopped.",
+            "steps": steps,
+            **report,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -2199,9 +2224,19 @@ HARNESS_SPEC_FILE = EXCHANGE_DIR / "harness_wiring_spec.txt"
 
 # TSheetStyle ordinals accepted by ISch_Document.SheetStyle
 SHEET_STYLES = {
-    "A4": 0, "A3": 1, "A2": 2, "A1": 3, "A0": 4,
-    "A": 5, "B": 6, "C": 7, "D": 8, "E": 9,
-    "LETTER": 10, "LEGAL": 11, "TABLOID": 12,
+    "A4": 0,
+    "A3": 1,
+    "A2": 2,
+    "A1": 3,
+    "A0": 4,
+    "A": 5,
+    "B": 6,
+    "C": 7,
+    "D": 8,
+    "E": 9,
+    "LETTER": 10,
+    "LEGAL": 11,
+    "TABLOID": 12,
 }
 # ...and the names get_sheet_style reports for them (OrCAD sizes are read-only)
 SHEET_STYLE_NAMES = {v: k for k, v in SHEET_STYLES.items()} | {
@@ -2254,7 +2289,9 @@ SHIELD_STYLES = {"shield": 0, "plain": 0, "with_connection": 1, "connected": 1}
 def _cavity_type(value: Any) -> int | None:
     if isinstance(value, int) and value in CAVITY_TYPE_NAMES:
         return value
-    return CAVITY_TYPES.get(str(value if value is not None else "crimp").strip().lower())
+    return CAVITY_TYPES.get(
+        str(value if value is not None else "crimp").strip().lower()
+    )
 
 
 def _part_fields(item: dict) -> list[str]:
@@ -2464,9 +2501,7 @@ async def add_harness_wiring(
     )
 
     if not document_path:
-        return json.dumps(
-            {"success": False, "error": "document_path is required"}
-        )
+        return json.dumps({"success": False, "error": "document_path is required"})
 
     lines = [_spec_line("DOCUMENT", Path(document_path).resolve())]
     if clear_existing:
@@ -2670,7 +2705,9 @@ async def add_harness_wiring(
 
     for t in twists or []:
         lines.append(
-            _spec_line("TWIST", *_rect(t), _rotation(t), str(t.get("designator", "")).strip())
+            _spec_line(
+                "TWIST", *_rect(t), _rotation(t), str(t.get("designator", "")).strip()
+            )
         )
 
     for sh in shields or []:
@@ -2687,7 +2724,11 @@ async def add_harness_wiring(
             )
         lines.append(
             _spec_line(
-                "SHIELD", *_rect(sh), _rotation(sh), style, str(sh.get("designator", "")).strip()
+                "SHIELD",
+                *_rect(sh),
+                _rotation(sh),
+                style,
+                str(sh.get("designator", "")).strip(),
             )
         )
 
@@ -2758,7 +2799,9 @@ async def add_harness_wiring(
         and result.get("saved")
         and (twists or shields or cables or wire_breaks)
     ):
-        _check_harness_links(result, document_path, twists, shields, cables, wire_breaks)
+        _check_harness_links(
+            result, document_path, twists, shields, cables, wire_breaks
+        )
     return json.dumps(result, indent=2)
 
 
@@ -3198,14 +3241,19 @@ async def check_harness_wiring(ctx: Context, file_path: str) -> str:
     import harness_check
 
     if not file_path or Path(file_path).suffix.lower() != ".wirdoc":
-        return json.dumps({"success": False, "error": "file_path to a .WirDoc is required"})
+        return json.dumps(
+            {"success": False, "error": "file_path to a .WirDoc is required"}
+        )
     try:
         result = harness_check.check_harness_wiring(file_path)
     except Exception as e:
         logger.error(f"Error checking harness wiring: {e}")
-        return json.dumps({"success": False, "error": f"Failed to check {file_path}: {e!s}"})
+        return json.dumps(
+            {"success": False, "error": f"Failed to check {file_path}: {e!s}"}
+        )
     return json.dumps(
-        {"success": True, "file_path": str(Path(file_path).resolve()), **result}, indent=2
+        {"success": True, "file_path": str(Path(file_path).resolve()), **result},
+        indent=2,
     )
 
 
@@ -3338,7 +3386,10 @@ async def _sync_harness_from_library(
             found = library.find(part_num)
             if found is None:
                 unresolved.append(
-                    {"designator": des, "reason": f"PartNumber {part_num!r} not in database"}
+                    {
+                        "designator": des,
+                        "reason": f"PartNumber {part_num!r} not in database",
+                    }
                 )
                 continue
             table, row = found
@@ -3372,7 +3423,9 @@ async def _sync_harness_from_library(
         (e.g. a strip length typed in Altium) are kept, unless they are
         stale ones to delete: replacing the part would otherwise drop them."""
         kept = {
-            p["part_number"]: p.get("parameters", {}) for p in current or [] if p.get("part_number")
+            p["part_number"]: p.get("parameters", {})
+            for p in current or []
+            if p.get("part_number")
         }
         parts = []
         for pn in part_numbers:
@@ -3416,7 +3469,10 @@ async def _sync_harness_from_library(
                     cav_type = _cavity_type(slot)
                     if cav_type is None:
                         unresolved.append(
-                            {"designator": f"{conn}.{pin}", "reason": f"unknown cavity slot {slot!r}"}
+                            {
+                                "designator": f"{conn}.{pin}",
+                                "reason": f"unknown cavity slot {slot!r}",
+                            }
                         )
                         continue
                     pn_list = pns if isinstance(pns, list) else [pns]
@@ -3436,7 +3492,12 @@ async def _sync_harness_from_library(
                 for cav_type, pns in sorted(slots.items()):
                     if not pns:  # emptied by cavity_map
                         cavity_parts.append(
-                            {"connector": key[0], "pin": key[1], "type": cav_type, "part_number": ""}
+                            {
+                                "connector": key[0],
+                                "pin": key[1],
+                                "type": cav_type,
+                                "part_number": "",
+                            }
                         )
                         continue
                     current = [
@@ -3446,7 +3507,12 @@ async def _sync_harness_from_library(
                     ]
                     for part in library_parts(where, pns, current) or []:
                         cavity_parts.append(
-                            {"connector": key[0], "pin": key[1], "type": cav_type, **part}
+                            {
+                                "connector": key[0],
+                                "pin": key[1],
+                                "type": cav_type,
+                                **part,
+                            }
                         )
         for conn, pin in wanted:
             unresolved.append(
@@ -3455,11 +3521,17 @@ async def _sync_harness_from_library(
 
     associated_parts = []
     if sync_associated:
-        wanted_assoc = {str(k): [str(p) for p in v if p] for k, v in (associated_map or {}).items()}
+        wanted_assoc = {
+            str(k): [str(p) for p in v if p] for k, v in (associated_map or {}).items()
+        }
         owners = [*doc_data.get("connectors", []), *doc_data.get("splices", [])]
         for owner in owners:
             des = owner["designator"]
-            current = [p["part_number"] for p in owner.get("associated_parts", []) if p["part_number"]]
+            current = [
+                p["part_number"]
+                for p in owner.get("associated_parts", [])
+                if p["part_number"]
+            ]
             pns = wanted_assoc.pop(des, current)
             if not pns:
                 if current:  # emptied by associated_map
@@ -3468,7 +3540,12 @@ async def _sync_harness_from_library(
             for part in library_parts(des, pns, owner.get("associated_parts")) or []:
                 associated_parts.append({"owner": des, **part})
         for des in wanted_assoc:
-            unresolved.append({"designator": des, "reason": "connector or splice not found on the sheet"})
+            unresolved.append(
+                {
+                    "designator": des,
+                    "reason": "connector or splice not found on the sheet",
+                }
+            )
 
     # Cables carry their database columns as parameters (they keep a
     # Description parameter, unlike cavity parts)
@@ -3511,7 +3588,10 @@ async def _sync_harness_from_library(
             found = library.find(part_num)
             if found is None:
                 unresolved.append(
-                    {"designator": c["designator"], "reason": f"PartNumber {part_num!r} not in database"}
+                    {
+                        "designator": c["designator"],
+                        "reason": f"PartNumber {part_num!r} not in database",
+                    }
                 )
                 continue
             table, row = found
@@ -3530,7 +3610,13 @@ async def _sync_harness_from_library(
                     }
                 )
 
-    if wire_updates or cavity_parts or component_updates or associated_parts or cable_updates:
+    if (
+        wire_updates
+        or cavity_parts
+        or component_updates
+        or associated_parts
+        or cable_updates
+    ):
         res_str = await add_harness_wiring(
             ctx,
             document_path=target_path,
@@ -3561,7 +3647,8 @@ async def _sync_harness_from_library(
         "source_library": src_lib,
         "wires_synced_count": res_json.get("wires_updated", len(wire_updates)),
         "cavities_synced_count": res_json.get(
-            "crimps", sum(1 for p in cavity_parts if p["type"] == 0 and p["part_number"])
+            "crimps",
+            sum(1 for p in cavity_parts if p["type"] == 0 and p["part_number"]),
         ),
         "cavity_parts_synced_count": res_json.get(
             "cavity_parts", sum(1 for p in cavity_parts if p["part_number"])
@@ -3571,7 +3658,9 @@ async def _sync_harness_from_library(
         ),
         "cables_synced_count": res_json.get("cables", len(cable_updates)),
         "connectors_refreshed": {
-            u["designator"]: sorted(u["parameters"]) for u in component_updates if u["parameters"]
+            u["designator"]: sorted(u["parameters"])
+            for u in component_updates
+            if u["parameters"]
         },
         "stale_parameters": {name: sorted(set(w)) for name, w in sorted(stale.items())},
         "stale_parameters_deleted": {
@@ -3656,12 +3745,20 @@ async def sync_harness_library(
     """
     if not document_path or not Path(document_path).exists():
         return json.dumps(
-            {"success": False, "error": f"document_path to an existing .WirDoc is required: {document_path!r}"}
+            {
+                "success": False,
+                "error": f"document_path to an existing .WirDoc is required: {document_path!r}",
+            }
         )
-    lib_path = Path(dblib_path) if dblib_path else find_dblib(Path(document_path).resolve())
+    lib_path = (
+        Path(dblib_path) if dblib_path else find_dblib(Path(document_path).resolve())
+    )
     if not lib_path or not lib_path.exists():
         return json.dumps(
-            {"success": False, "error": "No .DbLib found; pass dblib_path or set ALTIUM_DBLIB_PATH"}
+            {
+                "success": False,
+                "error": "No .DbLib found; pass dblib_path or set ALTIUM_DBLIB_PATH",
+            }
         )
     try:
         library = load_dblib(lib_path)
@@ -3743,11 +3840,18 @@ async def sync_harness_wires(
         else:
             lib_path = find_dblib(Path(document_path).resolve())
             if not lib_path:
-                return json.dumps({"success": False, "error": "Wire database not found. Please provide wires_db_path."})
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": "Wire database not found. Please provide wires_db_path.",
+                    }
+                )
             library = load_dblib(lib_path)
             db_label = str(lib_path)
     except (OSError, ValueError) as e:
-        return json.dumps({"success": False, "error": f"Cannot read wire database: {e}"})
+        return json.dumps(
+            {"success": False, "error": f"Cannot read wire database: {e}"}
+        )
 
     result = await _sync_harness_from_library(
         ctx,
@@ -4609,19 +4713,24 @@ async def get_screenshot(
 
         def capture_screenshot_thread():
             try:
-                try:
-                    import win32service
+                # Work in physical pixels. Python is not DPI aware, so on a
+                # scaled display Windows hands this process window rects
+                # divided by the scale factor (1080x902 for a 2160x1804
+                # window at 200%), while the BitBlt below copies the window's
+                # real pixels: the capture came back as only the top-left
+                # part of the window. Per-monitor awareness for this thread
+                # alone gives GetWindowRect the physical size and ends with
+                # the thread. V2 (-4) needs Windows 10 1703; V1 (-3) is the
+                # fallback.
+                import ctypes
 
-                    hw = win32service.OpenWindowStation(
-                        "WinSta0", True, win32con.GENERIC_ALL
+                set_dpi_context = ctypes.windll.user32.SetThreadDpiAwarenessContext
+                set_dpi_context.restype = ctypes.c_void_p
+                set_dpi_context.argtypes = [ctypes.c_void_p]
+                if not (set_dpi_context(-4) or set_dpi_context(-3)):
+                    logger.warning(
+                        "Could not make the capture thread DPI aware; on a scaled display the capture may show only part of the window"
                     )
-                    hw.SetProcessWindowStation()
-                    hd = win32service.OpenDesktop(
-                        "Default", 0, True, win32con.GENERIC_ALL
-                    )
-                    hd.SetThreadDesktop()
-                except Exception:
-                    pass
 
                 # Find Altium windows
                 altium_windows = []
@@ -4735,37 +4844,22 @@ async def get_screenshot(
                     )
 
                 try:
-                    import ctypes
-
-                    fg_hwnd = win32gui.GetForegroundWindow()
-                    if fg_hwnd:
-                        fg_tid = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
-                        cur_tid = win32api.GetCurrentThreadId()
-                        if fg_tid != cur_tid:
-                            try:
-                                win32process.AttachThreadInput(fg_tid, cur_tid, True)
-                            except Exception:
-                                pass
-                    ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
-                    ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
-                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWMAXIMIZED)
-                    ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
-                    try:
-                        win32gui.SetForegroundWindow(hwnd)
-                        win32gui.BringWindowToTop(hwnd)
-                    except Exception:
-                        pass
-                    deadline = time.time() + 2.0
-                    while time.time() < deadline:
-                        time.sleep(0.1)
-                        if altium_is_foreground():
-                            activated = True
-                            break
-                    if fg_hwnd and fg_tid != cur_tid:
+                    for attempt in range(2):
+                        if attempt:
+                            ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
+                            ctypes.windll.user32.keybd_event(0x12, 0, 2, 0)
                         try:
-                            win32process.AttachThreadInput(fg_tid, cur_tid, False)
+                            win32gui.SetForegroundWindow(hwnd)
                         except Exception:
                             pass
+                        deadline = time.time() + 1.5
+                        while time.time() < deadline:
+                            time.sleep(0.1)
+                            if altium_is_foreground():
+                                activated = True
+                                break
+                        if activated:
+                            break
                 except Exception as e:
                     logger.warning(f"Could not bring window to foreground: {e}")
                 if not activated:
@@ -4832,7 +4926,9 @@ async def get_screenshot(
 
                     # Save a local copy of the screenshot for debugging (non-fatal if it fails)
                     try:
-                        debug_filename = str(_data_dir() / f"screenshot_{view_type}.png")
+                        debug_filename = str(
+                            _data_dir() / f"screenshot_{view_type}.png"
+                        )
                         img.save(debug_filename)
                         logger.info(f"Saved debug screenshot to {debug_filename}")
                     except Exception as save_error:
@@ -5126,22 +5222,26 @@ async def get_pcb_layer_stackup(ctx: Context) -> str:
 
 
 @mcp.tool()
-async def get_output_job_containers(ctx: Context) -> str:
+async def get_output_job_containers(ctx: Context, outjob_path: str = "") -> str:
     """
     Get all available output job containers from a specified OutJob file
 
+
     Args:
-        outjob_path (str): Path to the OutJob file (optional, will use first open OutJob if not provided)
+        outjob_path (str): Full path to the OutJob file (optional). When empty,
+            the first OutJob found in the open projects is used, in project
+            order, regardless of which document has focus.
 
     Returns:
-        str: JSON array with all output job containers and their properties
+        str: JSON with outjob_path (the file actually used) and the containers
     """
-    logger.info("Getting output job containers from the first open OutJob")
+    logger.info(
+        f"Getting output job containers from {outjob_path or 'the first open OutJob'}"
+    )
 
     # Execute the command in Altium to get output job containers
     response = await altium_bridge.execute_command(
-        "get_output_job_containers",
-        {},  # No parameters needed - will use first open OutJob
+        "get_output_job_containers", {"outjob_path": outjob_path}
     )
 
     # Check for success
@@ -5300,7 +5400,9 @@ async def get_harness_data(
                     for pin in c["pins"]
                     if pin.get("connected_wire")
                 }
-                data["wires"] = [w for w in data["wires"] if w["designator"] in touching]
+                data["wires"] = [
+                    w for w in data["wires"] if w["designator"] in touching
+                ]
                 for key in ("twists", "shields", "cables"):
                     data[key] = [
                         o
@@ -5507,7 +5609,9 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
         h_path = await _get_active_harness_path()
         if h_path:
             violations = get_harness_erc_violations(h_path)
-            return json.dumps({**violations, **_disk_source(h_path)}, indent=2, ensure_ascii=False)
+            return json.dumps(
+                {**violations, **_disk_source(h_path)}, indent=2, ensure_ascii=False
+            )
     except Exception as e:
         logger.warning(f"ERC harness fallback failed: {e}")
 
@@ -5602,22 +5706,37 @@ async def get_component_primitives(ctx: Context, designators: list) -> str:
 
 
 @mcp.tool()
-async def run_output_jobs(ctx: Context, container_names: list) -> str:
+async def run_output_jobs(
+    ctx: Context, container_names: list, outjob_path: str = ""
+) -> str:
     """
     Run specified output job containers
 
+    The OutJob's project must be open in Altium. A PDF (Publish) container
+    reports output_file and output_verified: true once Altium has written
+    that file. output_verified is false for generated-file containers and
+    for PDFs that Altium names itself (after each output, or from an
+    expression). When a PDF already exists and the container prompts before
+    overwriting (the default), Altium asks in a dialog and the run waits for
+    the answer.
+
     Args:
         container_names (list): List of container names to run
+        outjob_path (str): Full path to the OutJob file (optional). When empty,
+            the first OutJob found in the open projects is used, in project
+            order, regardless of which document has focus.
 
     Returns:
-        str: JSON object with results of running the output jobs
+        str: JSON object with outjob_path (the file actually used) and the
+             results of running the output jobs
     """
-    logger.info("Running output jobs")
+    logger.info(f"Running output jobs from {outjob_path or 'the first open OutJob'}")
     logger.info(f"Containers to run: {container_names}")
 
     # Execute the command in Altium to run output jobs
     response = await altium_bridge.execute_command(
-        "run_output_jobs", {"container_names": container_names}
+        "run_output_jobs",
+        {"outjob_path": outjob_path, "container_names": container_names},
     )
 
     # Check for success
