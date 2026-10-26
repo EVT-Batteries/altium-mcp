@@ -15,6 +15,7 @@ install that runs inside the launcher dies with it, leaving a half-built venv
 and a lock nobody will release. A detached builder finishes regardless, so a
 restarted launcher finds the venv ready or a build genuinely in progress.
 """
+
 import hashlib
 import os
 import shutil
@@ -25,11 +26,32 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 
+# The hash-locked set exported by uv. Installed when present, so no
+# dependency of mcp floats to a release it was never tested with (pydantic
+# 2.14 breaking mcp 1.5.0 at import was one).
+LOCKED_REQUIREMENTS = SCRIPT_DIR / "requirements.txt"
+
+# Fallback when the lock file is missing, or pins wheels the interpreter has
+# none for (a newer Python than the lock was made with).
 REQUIREMENTS = [
     "mcp[cli]>=2.0.0",
     "pillow>=11.1.0",
     "pywin32>=310",
 ]
+
+
+def _locked_text():
+    try:
+        return LOCKED_REQUIREMENTS.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _marker_payload():
+    # Both inputs, so a change to either the lock file or the fallback list
+    # invalidates the venv. Not which one was installed: that is decided at
+    # build time and must not make a ready venv look stale.
+    return "\n".join(REQUIREMENTS) + "\n--locked--\n" + _locked_text()
 
 
 def _data_dir():
@@ -50,7 +72,7 @@ def _data_dir():
 def _venv_key():
     # One venv per (requirements, interpreter version). Changing either gets a
     # fresh directory instead of mutating one another process may be using.
-    text = "|".join(REQUIREMENTS) + "|py%d.%d" % sys.version_info[:2]
+    text = _marker_payload() + "|py%d.%d" % sys.version_info[:2]
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
 
@@ -71,15 +93,11 @@ LAUNCH_WAIT_SECONDS = 50
 STALE_LOCK_SECONDS = 1800
 
 
-def _marker_payload():
-    return "\n".join(REQUIREMENTS)
-
-
 def venv_is_ready():
     # python.exe alone is not enough: `python -m venv` can succeed and the pip
     # install still fail, leaving an interpreter with no mcp module. The marker
     # is written last and records what was installed, so a change to
-    # REQUIREMENTS also invalidates it.
+    # the requirements also invalidates it.
     if not PYTHON_EXE.exists():
         return False
     try:
@@ -90,7 +108,10 @@ def venv_is_ready():
 
 def _manual_build_message(reason):
     pip_exe = VENV_DIR / "Scripts" / "pip.exe"
-    requirements = " ".join('"%s"' % r for r in REQUIREMENTS)
+    if _locked_text():
+        requirements = '-r "%s"' % LOCKED_REQUIREMENTS
+    else:
+        requirements = " ".join('"%s"' % r for r in REQUIREMENTS)
     return (
         "%s\n\n"
         "Build log: %s\n"
@@ -105,6 +126,7 @@ def _manual_build_message(reason):
 
 # --- lock -------------------------------------------------------------------
 
+
 def _pid_alive(pid):
     if pid <= 0:
         return False
@@ -115,8 +137,11 @@ def _pid_alive(pid):
         except OSError:
             return False
     import ctypes
+
     kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    handle = kernel32.OpenProcess(
+        0x1000, False, pid
+    )  # PROCESS_QUERY_LIMITED_INFORMATION
     if not handle:
         return False
     try:
@@ -175,6 +200,7 @@ def _release_lock():
 
 # --- builder ----------------------------------------------------------------
 
+
 def _build_venv():
     # An existing tree here is a partial build or one whose requirements moved.
     # Either way it cannot be trusted. Removing it first is what stops
@@ -187,9 +213,19 @@ def _build_venv():
                 "Something is holding it open." % VENV_DIR
             )
     subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
-    subprocess.check_call(
-        [str(VENV_DIR / "Scripts" / "pip.exe"), "install", "--quiet"] + REQUIREMENTS
-    )
+    pip = [str(VENV_DIR / "Scripts" / "pip.exe"), "install", "--quiet"]
+    installed = False
+    if _locked_text():
+        # Hashes in the file put pip in hash-checking mode for every package.
+        try:
+            subprocess.check_call(pip + ["-r", str(LOCKED_REQUIREMENTS)])
+            installed = True
+        except subprocess.CalledProcessError as exc:
+            print(
+                "locked install failed (%s); falling back to %s" % (exc, REQUIREMENTS)
+            )
+    if not installed:
+        subprocess.check_call(pip + REQUIREMENTS)
     MARKER.write_text(_marker_payload(), encoding="utf-8")
     _prune_old_venvs()
 
@@ -230,11 +266,15 @@ def _spawn_builder():
     log = open(BUILD_LOG, "a", encoding="utf-8", errors="replace")
     log.write("\n=== %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
     log.flush()
-    kwargs = dict(stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                  close_fds=True)
+    kwargs = dict(
+        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, close_fds=True
+    )
     if os.name == "nt":
-        flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-                 | subprocess.CREATE_BREAKAWAY_FROM_JOB)
+        flags = (
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_BREAKAWAY_FROM_JOB
+        )
         try:
             subprocess.Popen(cmd, creationflags=flags, **kwargs)
         except OSError:
@@ -249,13 +289,17 @@ def _spawn_builder():
 
 def _build_log_tail(lines=12):
     try:
-        return "\n".join(BUILD_LOG.read_text(encoding="utf-8", errors="replace")
-                         .splitlines()[-lines:])
+        return "\n".join(
+            BUILD_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[
+                -lines:
+            ]
+        )
     except OSError:
         return "(no build log)"
 
 
 # --- launcher ---------------------------------------------------------------
+
 
 def ensure_venv():
     if venv_is_ready():
@@ -276,13 +320,19 @@ def ensure_venv():
             # A builder ran (or never managed to start) and there is still no
             # marker: the build failed. Say so now rather than sit out the
             # deadline.
-            raise RuntimeError(_manual_build_message(
-                "Building the environment failed.\n%s" % _build_log_tail()))
+            raise RuntimeError(
+                _manual_build_message(
+                    "Building the environment failed.\n%s" % _build_log_tail()
+                )
+            )
 
-    raise RuntimeError(_manual_build_message(
-        "The virtual environment at %s is still being built (slow network?). "
-        "The build continues in the background; restart the extension in a "
-        "minute." % VENV_DIR))
+    raise RuntimeError(
+        _manual_build_message(
+            "The virtual environment at %s is still being built (slow network?). "
+            "The build continues in the background; restart the extension in a "
+            "minute." % VENV_DIR
+        )
+    )
 
 
 if __name__ == "__main__":

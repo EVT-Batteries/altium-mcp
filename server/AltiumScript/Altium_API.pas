@@ -12,6 +12,7 @@ var
 	REQUEST_FILE : String;
     RESPONSE_FILE : String;
     ROOT_DIR: String;
+    RequestId : String;  // echoed in the response so the server can reject stale replies
 
 {..............................................................................}
 { Initialize file paths using a fixed exchange directory.                      }
@@ -823,29 +824,26 @@ begin
     end;
 end;
 
-// Function to execute get output job containers
-function ExecuteGetOutputJobContainers(RequestData: TStringList): String;
+// The optional "outjob_path" request parameter, '' when absent or empty
+function RequestOutJobPath(RequestData: TStringList): String;
 var
-    ParamValue: String;
     i: Integer;
-    OutJobPath: String;
 begin
-    OutJobPath := '';
-    
-    // Parse parameters from the request
+    Result := '';
     for i := 0 to RequestData.Count - 1 do
     begin
         if (Pos('"outjob_path"', RequestData[i]) > 0) then
         begin
-            // Found the outjob_path parameter
-            ParamValue := Copy(RequestData[i], Pos(':', RequestData[i]) + 1, Length(RequestData[i]));
-            OutJobPath := JSONLineValue(RequestData[i]);
+            Result := Trim(JSONLineValue(RequestData[i]));
             break;
         end;
     end;
-    
-    // Call the appropriate function
-    Result := GetOutputJobContainers(ROOT_DIR);
+end;
+
+// Function to execute get output job containers
+function ExecuteGetOutputJobContainers(RequestData: TStringList): String;
+begin
+    Result := GetOutputJobContainers(RequestOutJobPath(RequestData), ROOT_DIR);
 end;
 
 // Function to execute run output jobs
@@ -884,7 +882,7 @@ begin
         
         if ContainersList.Count > 0 then
         begin
-            Result := RunOutputJobs(ContainersList, ROOT_DIR);
+            Result := RunOutputJobs(ContainersList, RequestOutJobPath(RequestData), ROOT_DIR);
         end
         else
         begin
@@ -1107,10 +1105,17 @@ begin
 
     // A focus failure is an answer, not a dialog: WriteResponse turns the
     // 'ERROR: ' prefix into success=false with this message.
-    if not EnsureDocumentFocused(CommandName, ViewHint) then
+    // An OutJob command that names its file needs no OutJob open in a
+    // project: the command resolves and opens the named file itself.
+    if not (((CommandName = 'get_output_job_containers') or
+             (CommandName = 'run_output_jobs')) and
+            (RequestOutJobPath(RequestData) <> '')) then
     begin
-        Result := 'ERROR: ' + FocusFailure;
-        Exit;
+        if not EnsureDocumentFocused(CommandName, ViewHint) then
+        begin
+            Result := 'ERROR: ' + FocusFailure;
+            Exit;
+        end;
     end;
 
     // Direct command execution based on the command name
@@ -1247,7 +1252,9 @@ begin
     try
         // Add properties
         AddJSONBoolean(ResultProps, 'success', ActualSuccess);
-        
+        if RequestId <> '' then
+            AddJSONProperty(ResultProps, 'request_id', RequestId);
+
         if ActualSuccess then
         begin
             // For JSON responses (starting with [ or {), don't wrap in additional quotes
@@ -1270,6 +1277,69 @@ begin
     end;
 end;
 
+function IsScriptProject(Project: IProject): Boolean;
+begin
+    Result := UpperCase(ExtractFileExt(Project.DM_ProjectFullPath)) = '.PRJSCR';
+end;
+
+// A script that crashes into the debugger leaves its script project focused,
+// and project-level commands (project info, ERC, ...) would then act on it.
+// Remember the last design project and bring it back to the front instead.
+procedure EnsureDesignProjectFocused();
+var
+    Project, Candidate : IProject;
+    Doc : IDocument;
+    ServerDoc : IServerDocument;
+    LastPath, StoreFile : String;
+    Store : TStringList;
+    P, I : Integer;
+begin
+    StoreFile := ROOT_DIR + 'last_project.txt';
+    Project := GetWorkspace.DM_FocusedProject;
+    Store := TStringList.Create;
+    try
+        if (Project <> Nil) and not IsScriptProject(Project) then
+        begin
+            Store.Text := Project.DM_ProjectFullPath;
+            Store.SaveToFile(StoreFile);
+        end
+        else
+        begin
+            LastPath := '';
+            if FileExists(StoreFile) then
+            begin
+                Store.LoadFromFile(StoreFile);
+                if Store.Count > 0 then LastPath := UpperCase(Trim(Store[0]));
+            end;
+
+            // The remembered project if it is still open, else the first design project
+            Candidate := Nil;
+            for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+            begin
+                Project := GetWorkspace.DM_Projects(P);
+                if (Project <> Nil) and not IsScriptProject(Project) then
+                    if (Candidate = Nil) or (UpperCase(Project.DM_ProjectFullPath) = LastPath) then
+                        Candidate := Project;
+            end;
+
+            // Showing one of its already open documents makes it the focused project
+            if Candidate <> Nil then
+                for I := 0 to Candidate.DM_LogicalDocumentCount - 1 do
+                begin
+                    Doc := Candidate.DM_LogicalDocuments(I);
+                    ServerDoc := Client.GetDocumentByPath(Doc.DM_FullPath);
+                    if ServerDoc <> Nil then
+                    begin
+                        Client.ShowDocument(ServerDoc);
+                        Break;
+                    end;
+                end;
+        end;
+    finally
+        Store.Free;
+    end;
+end;
+
 // Main procedure to run the bridge
 procedure Run;
 var
@@ -1281,6 +1351,7 @@ var
 begin
     // Initialize file paths based on script location
     InitializeFilePaths();
+    RequestId := '';
 
     // Check if request file exists
     if not FileExists(REQUEST_FILE) then
@@ -1298,6 +1369,9 @@ begin
         RequestData := TStringList.Create;
         try
             RequestData.LoadFromFile(REQUEST_FILE);
+            // Consume the request: its disappearance tells the server the
+            // script started, and a duplicate launch finds nothing to re-run
+            DeleteFile(REQUEST_FILE);
 
             // Default command type
             CommandType := '';
@@ -1314,6 +1388,11 @@ begin
                     CommandType := Copy(Line, ValueStart, Length(Line) - ValueStart + 1);
                     CommandType := TrimJSON(CommandType);
                 end
+                else if Pos('"request_id":', Line) > 0 then
+                begin
+                    ValueStart := Pos(':', Line) + 1;
+                    RequestId := TrimJSON(Copy(Line, ValueStart, Length(Line) - ValueStart + 1));
+                end
                 else
                 begin
                     // Extract all other parameters
@@ -1324,6 +1403,7 @@ begin
             // Execute the command if valid
             if CommandType <> '' then
             begin
+                EnsureDesignProjectFocused();
                 Result := ExecuteCommand(CommandType);
 
                 if Result <> '' then
