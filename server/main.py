@@ -10,22 +10,16 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-import win32api
+import sandbox
 import win32con
 import win32gui
 import win32process
-from PIL import Image
-import io
-import base64
-import glob
-import re
-import uuid
-
+import win32ui
 from altium_files import read_altium_text, write_altium_text
-import sandbox
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from harness_layout import build_layout_spec, check_layout, parse_ldrdoc
 from harness_parser import (
@@ -89,6 +83,9 @@ EXCHANGE_DIR = Path("C:/Users/Public/altium_mcp")
 EXCHANGE_DIR.mkdir(exist_ok=True)
 REQUEST_FILE = EXCHANGE_DIR / "request.json"
 RESPONSE_FILE = EXCHANGE_DIR / "response.json"
+BRIDGE_LOCK_FILE = EXCHANGE_DIR / "bridge.lock"
+# Longer than one script's 120 s response timeout
+BRIDGE_LOCK_TIMEOUT = 300
 
 # Seconds for a running Altium to pick up a request (normally ~1-5 s), for a
 # cold Altium launch to get that far, and for a started command to finish
@@ -343,7 +340,35 @@ class AltiumBridge:
         exchange folder (e.g. one started by Gemini and one by Claude). The OS
         releases the lock if a process dies."""
         async with self._command_lock:
-            return await self._execute_command_locked(command, params)
+            with open(BRIDGE_LOCK_FILE, "a+b") as handle:  # noqa: ASYNC230
+                deadline = time.time() + BRIDGE_LOCK_TIMEOUT
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.time() > deadline:
+                            raise TimeoutError(
+                                "Altium bridge busy: another MCP server process held "
+                                f"{BRIDGE_LOCK_FILE} for {BRIDGE_LOCK_TIMEOUT} s"
+                            ) from None
+                        await asyncio.sleep(0.25)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+    async def execute_command(
+        self, command: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute a command in Altium via the bridge script"""
+        try:
+            async with self.exclusive():
+                return await self._execute_command_locked(command, params)
+        except TimeoutError as e:
+            return {"success": False, "error": str(e)}
 
     @staticmethod
     def _altium_running() -> bool:
@@ -404,17 +429,9 @@ class AltiumBridge:
         return text
 
     async def _execute_command_locked(
-        self, command: str, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, command: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
         try:
-            blocking = _blocking_altium_dialogs()
-            if blocking:
-                return {
-                    "success": False,
-                    "error": f"Altium is blocked; {_blocked_ask_user(blocking)}",
-                    "executor_wedged": True,
-                }
-
             # Clean up any existing response file
             if RESPONSE_FILE.exists():
                 RESPONSE_FILE.unlink()
@@ -1560,10 +1577,9 @@ def _dismiss_altium_dialogs(message_boxes_only: bool = False):
     are never closed. With message_boxes_only, only the OK-only Error and
     Information boxes are closed: the ones a refused script launch raises.
 
-    Returns (handle, class name, title, text) of the windows that were closed,
-    so the caller can tell the user (a closed dialog may have been one the
-    user had open). text is the message of a Win32 dialog; Altium's own
-    TMessageForm draws its message without a window, so its text is ''.
+    Returns (handle, class name, title) of the windows that were closed, so
+    the caller can tell the user (a closed dialog may have been one the user
+    had open).
     """
     try:
         import ctypes
@@ -1598,7 +1614,7 @@ def _dismiss_altium_dialogs(message_boxes_only: bool = False):
             return True
         if _window_process_name(hwnd).lower() != "x2.exe":
             return True
-        found.append((hwnd, cls.value, title, _dialog_text(hwnd)))
+        found.append((hwnd, cls.value, title))
         return True
 
     user32.EnumWindows(cb, 0)

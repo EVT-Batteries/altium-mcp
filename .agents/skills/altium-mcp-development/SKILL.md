@@ -126,28 +126,25 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   script pauses in Altium's debugger, nothing comes back, and every later script silently does
   nothing. Recover with: `"<Altium install>\X2.EXE" -REditScript:Stop` (Altium's path is in
   `~/.altium-mcp/config.json` as `altium_exe_path`).
-- **Recovery is automatic; ask the user only when it fails.** When a sandbox run fails, and
-  when a production command times out, the server unblocks the executor itself
-  (`_recover_script_executor`). It runs `EditScript:Stop`, then presses Ctrl+F3 in the Altium
-  window (sent with scan codes, because Altium ignores virtual-key-only input), and checks
-  after each step with a trivial script. Look at the result:
-  - `executor_wedged: false` with `recovery` "Recovered automatically (stop|ctrl_f3)": the
-    executor is free. Fix your script before rerunning it.
-  - `executor_wedged: true`: both steps failed. **Do not retry.** Pass the `recovery` text on
-    to the user (focus the stuck script tab and press Ctrl+F3, close an open Altium dialog, or
-    restart Altium), and do non-Altium work while you wait.
-  - Before any launch the bridge, the sandbox and the recovery check
-    `_blocking_altium_dialogs()`. Altium's main window is disabled while a modal window is up.
-    If one stays up after the closable boxes are dismissed, for example the .NET error report
-    whose "Send and Close" may end Altium, nothing is launched: a new `X2.EXE` would only show
-    "another instance ... busy" and wait. The result then has `executor_wedged: true` and
-    names the window titles to give the user.
-
-  After an Altium "Error" box the sandbox stops waiting about 3 s later rather than running to
-  its timeout. It reports dialog texts where Windows exposes them (`dismissed_dialog_texts`);
-  Altium's own themed message boxes don't expose theirs, so only their titles are reported.
-- Sandbox compile errors block the executor too: use only the declared scratch variables
-  (`S1..S3`, `I1..I3`, `B1`, `Obj1..Obj5`; there is no `Obj6`).
+- **Recovery is automatic, and only for scripts the MCP started; ask the user only when it
+  fails.** A script the user is running or debugging is never stopped.
+  - Sandbox (`sandbox.Sandbox.recover`, `server/sandbox.py`): after a compile or run-time error
+    it answers Altium's Error/Information boxes (Confirm and Warning boxes may be the user's
+    and are left alone), runs `EditScript:Stop` and confirms with a probe script, up to three
+    times. `executor_wedged: false` means the executor is free: fix your script before
+    rerunning it. `executor_wedged: true`: **do not retry**; ask the user to close the open
+    dialog, stop the paused script (Ctrl+F3 in its tab) or restart Altium, and do non-Altium
+    work while you wait.
+  - Bridge (`AltiumBridge._execute_command_locked`): a command that started but gave no
+    response within 120 s writes `C:\Users\Public\altium_mcp\mcp_script_stuck.txt` and sends
+    `EditScript:Stop`. When Altium does not pick up a request within 20 s, the debugger is
+    stopped and the launch retried only while that marker exists; otherwise the result is
+    "Altium did not start the command (not executed)" and nothing was stopped. Pass that on to
+    the user rather than retrying.
+- Sandbox scripts are checked before they run: assigning an undeclared plain name is refused.
+  Declare your own `var` block or use the scratch variables listed in the
+  `run_altium_script` description (`S1..S9`, `I1..I9`, `B1..B3`, `F1..F4`, `Obj1..Obj9`,
+  `List1..List3`).
 - Within one `.pas` unit, define a function above its first caller; calling one defined further
   down pauses the script at runtime.
 - Prototype unknown API calls with the `run_altium_script` sandbox first. Log a step before each
