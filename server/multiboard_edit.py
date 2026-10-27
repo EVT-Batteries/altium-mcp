@@ -25,6 +25,8 @@ Operations (all resolve objects by designator):
                     a new entry of another harness, drawn two grid steps away
                     and joined to that harness's line by a new branch
   set_title         change a block's title
+  assign_entry_parts give harness entries their connector component, mated
+                    pin by pin with the device entry they plug into
 """
 
 from __future__ import annotations
@@ -354,6 +356,172 @@ def _inline_component(
         "parameters": params,
         "id": comp_id,
     }
+
+
+def _pin_number(pin: dict[str, Any]) -> str:
+    return pin.get("number") or pin.get("pinId", "")
+
+
+def _entry_pins(owner: dict[str, Any], entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pins an entry carries: mapped to it in entryPinMap, else its linked
+    component's pins (Custom Part entries)."""
+    pin_entry = {
+        m["key"]: m["value"] for m in owner.get("entryPinMap", {}).get("map", [])
+    }
+    pins = [
+        p
+        for comp in owner.get("components", [])
+        for p in comp["pins"]
+        if pin_entry.get(p["id"]) == entry["id"]
+    ]
+    if not pins and entry.get("linkedComponent") is not None:
+        comp = next(
+            (
+                c
+                for c in owner.get("components", [])
+                if c["id"] == entry["linkedComponent"]
+            ),
+            None,
+        )
+        pins = comp["pins"] if comp else []
+    return pins
+
+
+def _entry_owner(
+    doc: MbsDocument, entry_id: int
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    for owner in doc.blocks() + doc.logical.get("connections", []):
+        for e in owner.get("entries", []):
+            if e["id"] == entry_id:
+                return owner, e
+    return None
+
+
+def _set_pin_net(pin: dict[str, Any], net: str, doc: MbsDocument) -> None:
+    params = pin.setdefault("parameters", [])
+    for n, p in enumerate(params):
+        if p["name"] == "ExternalNetName":
+            params[n] = {"name": "ExternalNetName", "value": net, "id": p["id"]}
+            return
+    params.append({"name": "ExternalNetName", "value": net, "id": doc.object_id()})
+
+
+def assign_entry_parts(
+    doc: MbsDocument,
+    connection: str,
+    entries: dict[str, Any],
+    pin_sources: dict[str, list[str]] | None = None,
+    libraries: dict[str, tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Give harness entries their connector component, as Altium holds it: a
+    component of the connection whose pins entryPinMap maps to the entry, mated
+    pin by pin (by number) with the device entry it plugs into; each harness pin
+    takes the device pin's net name. The entry is renamed after the connector
+    designator. An entry already carrying the part only gets the designator."""
+    if not isinstance(entries, dict) or not entries:
+        raise MbsEditError(
+            'assign_entry_parts needs entries: {"Entry_1": {"part": ..., "designator": ...}}'
+        )
+    c = doc.connection(connection)
+    components = c.setdefault("components", [])
+    pin_map = c.setdefault("entryPinMap", {}).setdefault("map", [])
+    out: dict[str, Any] = {}
+    for name, spec in entries.items():
+        if isinstance(spec, str):
+            spec = {"part": spec}
+        part, designator = spec.get("part"), spec.get("designator")
+        if not part:
+            raise MbsEditError(f"{name}: part is required")
+        e = doc.entry(c, name)
+        carried = _entry_pins(c, e)
+        row: dict[str, Any] = {"part": part}
+        if carried:
+            ids = {p["id"] for p in carried}
+            comp = next(x for x in components if any(p["id"] in ids for p in x["pins"]))
+            if _param(comp, "DesignItemId") != part:
+                raise MbsEditError(
+                    f"{name} already carries {_param(comp, 'DesignItemId')}, not {part}"
+                )
+            if designator:
+                comp["designator"] = designator
+            row.update(designator=comp["designator"], existing=True)
+        else:
+            comp = _inline_component(
+                doc,
+                part,
+                designator or ("J?" if e.get("entryType") != 1 else "P?"),
+                pin_sources or {},
+                (libraries or {}).get(part),
+            )
+            components.append(comp)
+            pin_map.extend({"key": p["id"], "value": e["id"]} for p in comp["pins"])
+            row["designator"] = comp["designator"]
+            link = next(
+                (
+                    lk
+                    for lk in c.get("entriesConnections", [])
+                    if e["id"] in (lk.get("entry1"), lk.get("entry2"))
+                ),
+                None,
+            )
+            found = None
+            if link:
+                if link.get("physicalConnections"):
+                    raise MbsEditError(f"{name} is already mated pin by pin")
+                own_first = link["entry1"] == e["id"]
+                found = _entry_owner(doc, link["entry2" if own_first else "entry1"])
+            if found:
+                free = {_pin_number(p): p for p in comp["pins"]}
+                unpaired = []
+                pcs = link.setdefault("physicalConnections", [])
+                for dev in _entry_pins(*found):
+                    own = free.pop(_pin_number(dev), None)
+                    if own is None:
+                        unpaired.append(_pin_number(dev))
+                        continue
+                    # Altium pairs entry1's pin first (Net.AddPins(pin1, pin2))
+                    p1, p2 = (own, dev) if own_first else (dev, own)
+                    pcs.append(
+                        {
+                            "$type": "__logicalPinToPinConnection",
+                            "pinPair": {
+                                "pin1": p1["id"],
+                                "pin2": p2["id"],
+                                "parameters": [],
+                                "id": doc.object_id(),
+                            },
+                            "parameters": [],
+                            "id": doc.object_id(),
+                        }
+                    )
+                    net = _param(dev, "ExternalNetName")
+                    if net:
+                        _set_pin_net(own, net, doc)
+                if not pcs:
+                    raise MbsEditError(
+                        f"{name}: no pin number of {part} matches the mated entry's pins"
+                    )
+                row.update(
+                    mated=_entry_name(found[1]),
+                    pin_pairs=len(pcs),
+                    unpaired_device_pins=unpaired,
+                    unpaired_harness_pins=sorted(free),
+                )
+        if (
+            designator
+            and spec.get("rename_entry", True)
+            and _entry_name(e) != designator
+        ):
+            if any(_entry_name(x) == designator for x in c["entries"] if x is not e):
+                raise MbsEditError(f"{connection} already has an entry {designator}")
+            e["definedDesignator"] = e["calculatedDesignator"] = designator
+            for item in doc.items_of(e["id"], "__drawingConnectionPoint"):
+                for child in doc.children(item["id"]):
+                    if child.get("propertyValuePath") == "Designator":
+                        child["directValue"] = designator
+            row["entry"] = designator
+        out[name] = row
+    return {"op": "assign_entry_parts", "connection": connection, "entries": out}
 
 
 def _branch_chain(
@@ -746,6 +914,7 @@ OPERATIONS = {
     "swap_entry_parts": swap_entry_parts,
     "join_harnesses": join_harnesses,
     "set_title": set_title,
+    "assign_entry_parts": assign_entry_parts,
 }
 
 
@@ -764,7 +933,7 @@ def apply_operations(
                 f"operation {n}: op must be one of {', '.join(OPERATIONS)}"
             )
         args = {k: v for k, v in op.items() if k != "op"}
-        if op["op"] == "join_harnesses":
+        if op["op"] in ("join_harnesses", "assign_entry_parts"):
             args.update(pin_sources=pin_sources, libraries=libraries)
         try:
             results.append(OPERATIONS[op["op"]](doc, **args))

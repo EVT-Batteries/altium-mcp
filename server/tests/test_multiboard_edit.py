@@ -387,6 +387,93 @@ class EditTest(unittest.TestCase):
         ]
         self.assertEqual(len(corners), 2)
 
+    def test_assign_entry_parts(self):
+        logical = _logical()
+        logical["virtualModules"][0]["components"][0]["pins"][0]["parameters"] = [
+            {"name": "ExternalNetName", "value": "NET_A", "id": 14}
+        ]
+        _write(self.path, logical)
+        result, doc = self.apply(
+            {
+                "op": "assign_entry_parts",
+                "connection": "H_1",
+                "entries": {
+                    "Entry_1": {"part": "INL_F", "designator": "P1"},
+                    "Entry_2": {"part": "INL_M", "designator": "J5"},
+                },
+            }
+        )
+        rows = result[0]["entries"]
+        self.assertEqual(
+            (rows["Entry_1"]["mated"], rows["Entry_1"]["pin_pairs"]), ("J1", 2)
+        )
+        self.assertNotIn("mated", rows["Entry_2"])  # open end: nothing to mate
+        h1 = doc.connection("H_1")
+        p1, j5 = h1["components"]
+        self.assertEqual((p1["designator"], j5["designator"]), ("P1", "J5"))
+        self.assertEqual(me._param(j5, "SourceLibraryName"), "lib.DbLib")
+        pin_map = {m["key"]: m["value"] for m in h1["entryPinMap"]["map"]}
+        self.assertEqual({pin_map[p["id"]] for p in p1["pins"]}, {101})
+        pairs = [
+            pc["pinPair"] for pc in h1["entriesConnections"][0]["physicalConnections"]
+        ]
+        # entry1 is the device entry: its pin comes first
+        self.assertEqual(
+            [(pp["pin1"], pp["pin2"]) for pp in pairs],
+            [(11, p1["pins"][0]["id"]), (12, p1["pins"][1]["id"])],
+        )
+        self.assertEqual(me._param(p1["pins"][0], "ExternalNetName"), "NET_A")
+        self.assertEqual([me._entry_name(e) for e in h1["entries"]], ["P1", "J5"])
+        self.assertEqual(self.items(doc)[13]["directValue"], "J5")
+        model = mb.parse_mbsdoc(self.path)
+        self.assertEqual(
+            model["connections"][0]["entries"][0]["component_designators"], ["P1"]
+        )
+
+    def test_assign_entry_parts_refusals(self):
+        self.apply(JOIN)  # H_1.Entry_2 now carries INL_M (J?)
+        for entries, message in (
+            ({"Entry_2": {"part": "OTHER"}}, "already carries INL_M"),
+            ({"Entry_1": {"part": "INL_F", "designator": "Entry_2"}}, "already has"),
+            ({"Entry_1": {"part": "NOPINS"}}, "no pins known"),
+            ({"Entry_1": {}}, "part is required"),
+        ):
+            with self.assertRaisesRegex(me.MbsEditError, message):
+                me.apply_operations(
+                    me.MbsDocument(self.path),
+                    [
+                        {
+                            "op": "assign_entry_parts",
+                            "connection": "H_1",
+                            "entries": entries,
+                        }
+                    ],
+                    {**PINS, "NOPINS": []},
+                )
+        # The part an entry already carries only gets the designator
+        result, doc = self.apply(
+            {
+                "op": "assign_entry_parts",
+                "connection": "H_1",
+                "entries": {"Entry_2": {"part": "INL_M", "designator": "J3"}},
+            }
+        )
+        self.assertTrue(result[0]["entries"]["Entry_2"]["existing"])
+        self.assertEqual(doc.connection("H_1")["components"][0]["designator"], "J3")
+        # No pin number in common with the mated device entry
+        with self.assertRaisesRegex(me.MbsEditError, "no pin number"):
+            me.apply_operations(
+                me.MbsDocument(self.path),
+                [
+                    {
+                        "op": "assign_entry_parts",
+                        "connection": "H_1",
+                        "entries": {"Entry_1": "ODD"},
+                    }
+                ],
+                {"ODD": ["7", "8"]},
+            )
+
     def test_join_refusals(self):
         cases = [
             ({**JOIN, "entry": "H_1.Entry_1"}, "already mates"),
@@ -496,6 +583,46 @@ class EditToolTest(unittest.IsolatedAsyncioTestCase):
         result = await self.call([JOIN | {"part": "PART_A", "mate_part": "PART_B"}])
         self.assertTrue(result["saved"], result)
         self.assertEqual(result["results"][0]["pin_pairs"], 2)
+
+    async def test_assign_harness_parts_expands_from_review(self):
+        review = {
+            "harness_review": [
+                {
+                    "connection": "H_1",
+                    "matched_project": "HAR",
+                    "candidates": [],
+                    "entries": [
+                        {
+                            "entry": "H_1.Entry_1",
+                            "connector": "P1",
+                            "connector_part": "PART_B",
+                        },
+                        {"entry": "H_1.Entry_2", "candidates": ["P2", "P3"]},
+                    ],
+                },
+                {"connection": "H_2", "matched_project": None, "candidates": []},
+            ]
+        }
+        with patch("multiboard.review_multiboard", return_value=review) as rv:
+            result = await self.call(
+                [{"op": "assign_harness_parts", "connections": ["H_1"]}],
+                dry_run=True,
+            )
+        self.assertTrue(result["success"], result)
+        rv.assert_called_once()
+        row = result["results"][0]
+        self.assertEqual((row["op"], row["connection"]), ("assign_entry_parts", "H_1"))
+        self.assertEqual(row["entries"]["Entry_1"]["designator"], "P1")
+        self.assertEqual(row["entries"]["Entry_1"]["pin_pairs"], 2)
+        self.assertEqual(
+            result["skipped"],
+            [
+                {
+                    "entry": "H_1.Entry_2",
+                    "reason": "connector candidates ['P2', 'P3']; pass entry_map",
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -5611,6 +5611,20 @@ async def edit_multiboard_schematic(
           in the document, else numbered after a harness connector of that part in
           the multi-board project; pins pair by number.
       {"op": "set_title", "block": "MOD_2", "title": "Module #1 (High Side)"}
+      {"op": "assign_entry_parts", "connection": "H_1",
+       "entries": {"Entry_1": {"part": "MX34028SF1", "designator": "P1"}}}
+          Give harness entries their connector component (the harness side of the
+          system BOM): pins numbered after the harness connector of that part,
+          mapped to the entry and mated by number with the device entry it plugs
+          into (each takes the device pin's net name); the entry and component are
+          named after the designator ("rename_entry": false keeps the entry name).
+          An entry already carrying the part (inline connector) only gets the
+          designator.
+      {"op": "assign_harness_parts", "connections": ["H_1"], "entry_map": {...}}
+          assign_entry_parts for every entry from its match with the harness
+          project's connectors (get_multiboard_data harness_review); connections
+          defaults to all harness connections, entry_map settles entries that fit
+          several identical connectors. Unmatched entries are listed in skipped.
 
     Args:
         document_path: The .MbsDoc.
@@ -5646,13 +5660,74 @@ async def edit_multiboard_schematic(
             {"success": False, "error": "operations must be a non-empty list"}
         )
 
-    # Pins and library links for inline connectors
+    # assign_harness_parts: one assign_entry_parts per connection, from the
+    # entries' match with the harness projects' connectors
+    expanded: list = []
+    skipped: list[dict] = []
+    for op in operations:
+        if not (isinstance(op, dict) and op.get("op") == "assign_harness_parts"):
+            expanded.append(op)
+            continue
+        wanted = op.get("connections")
+        for row in review_multiboard(
+            p, entry_map=op.get("entry_map"), include_pins=False
+        )["harness_review"]:
+            if wanted and row["connection"] not in wanted:
+                continue
+            entries = {}
+            for e in row["entries"]:
+                name = e["entry"].split(".", 1)[1]
+                if e.get("connector") and e.get("connector_part"):
+                    entries[name] = {
+                        "part": e["connector_part"],
+                        "designator": e["connector"],
+                    }
+                else:
+                    skipped.append(
+                        {
+                            "entry": e["entry"],
+                            "reason": f"connector candidates {e['candidates']}; pass entry_map"
+                            if e.get("candidates")
+                            else "no harness connector matched",
+                        }
+                    )
+            if not row["matched_project"]:
+                skipped.append(
+                    {
+                        "entry": row["connection"],
+                        "reason": f"no single harness project matches (candidates {row['candidates']})",
+                    }
+                )
+            elif entries:
+                expanded.append(
+                    {
+                        "op": "assign_entry_parts",
+                        "connection": row["connection"],
+                        "entries": entries,
+                    }
+                )
+    operations = expanded
+    if not operations:
+        return json.dumps(
+            {"success": False, "error": "nothing to assign", "skipped": skipped}
+        )
+
+    # Pins and library links for new harness-side components
     parts = {
         op.get(k)
         for op in operations
         if isinstance(op, dict) and op.get("op") == "join_harnesses"
         for k in ("part", "mate_part")
-    } - {None}
+    } | {
+        (spec if isinstance(spec, str) else spec.get("part"))
+        for op in operations
+        if isinstance(op, dict)
+        and op.get("op") == "assign_entry_parts"
+        and isinstance(op.get("entries"), dict)
+        for spec in op["entries"].values()
+        if isinstance(spec, (str, dict))
+    }
+    parts -= {None}
     pin_sources: dict[str, list[str]] = {}
     libraries: dict[str, tuple[str, str]] = {}
     if parts:
@@ -5681,7 +5756,13 @@ async def edit_multiboard_schematic(
         return json.dumps({"success": False, "error": str(e), "saved": False})
     if dry_run:
         return json.dumps(
-            {"success": True, "dry_run": True, "saved": False, "results": results},
+            {
+                "success": True,
+                "dry_run": True,
+                "saved": False,
+                "results": results,
+                "skipped": skipped,
+            },
             indent=2,
         )
 
@@ -5730,6 +5811,7 @@ async def edit_multiboard_schematic(
             "success": True,
             "saved": True,
             "results": results,
+            "skipped": skipped,
             "backup": str(backup),
             "was_open": was_open,
             "reopened": reopened,

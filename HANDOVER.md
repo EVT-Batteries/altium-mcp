@@ -29,6 +29,29 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 11 (2026-10-27): harness entry components (uncommitted)
+- `edit_multiboard_schematic` gains `assign_entry_parts` and the tool-level shortcut
+  `assign_harness_parts`, which expands to one `assign_entry_parts` per connection from the
+  review's `harness_review` match. `assign_entry_parts` writes what Altium writes when a
+  harness entry carrying a component mates a device entry (decompiled
+  `EntriesConnectionEditor.MateEntries`, `PhysicalConnectionEditor.MatePinsByCreatingConnection`):
+  - a component of the connection, its pins mapped to the entry in `entryPinMap`;
+  - one `__logicalPinToPinConnection` per pin in the `entriesConnections` link, with entry1's
+    pin as `pin1`;
+  - each harness pin's `ExternalNetName` taken from the device pin.
+
+  Unlike Altium, which pairs pins in sorted order, it pairs by pin number. The entry and the
+  component are renamed after the connector designator.
+- Review: an entry's component designator settles its connector (no `entry_map` needed).
+  New issues: `harness_entry_without_part` (info) and `entry_part_mismatch` (error).
+  `harness_review` rows gain `connector_part`.
+- Verified on scratch copy `mbs_test\MCP_Test_Assign.MbsDoc`: Altium loads it, and an Altium
+  save keeps the 20 components, 228 pin pairs and net names. Then applied to
+  `P42C-1_System.MbsDoc`: 0 errors, 82 nets.
+- Also found by decompiling: Cable and Direct connections can start only on a module entry
+  that has no connection yet (`ModuleEntryDragDropBehavior.CanEnter`). Direct lines never
+  branch, and a branch only joins a line of the same type (`CanConnectToHost`).
+
 ### Session 10 (2026-10-26): multi-board schematic review (uncommitted)
 - New read-only `get_multiboard_data` (`multiboard.py`, tests `tests/test_multiboard.py`): parses
   a `.MbsDoc` (ZIP of JSON: `logical.json` + `Pages/*.json`, member names stored with `\`),

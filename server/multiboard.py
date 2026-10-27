@@ -207,8 +207,8 @@ def parse_mbsdoc(path: Path | str) -> dict[str, Any]:
         }
         entries = []
         for e in c.get("entries", []):
-            inline = [
-                comp["part_number"]
+            own = [
+                comp
                 for comp in comps
                 if any(pin_entry.get(p["id"]) == e["id"] for p in comp["pins"])
             ]
@@ -218,7 +218,10 @@ def parse_mbsdoc(path: Path | str) -> dict[str, Any]:
                 "label": f"{designator}.{_entry_name(e)}",
                 "gender": "female" if e.get("entryType") == 1 else "male",
                 "inline": bool(e.get("isInterConnection")),
-                "inline_part_numbers": inline,
+                # Components whose pins the entry carries: the inline connector,
+                # or the harness connector assigned to a harness end
+                "inline_part_numbers": [comp["part_number"] for comp in own],
+                "component_designators": [comp["designator"] for comp in own],
                 "mates": [],
             }
             labels[e["id"]] = entry["label"]
@@ -627,7 +630,18 @@ def review_multiboard(
             harness_review.append(review)
             continue
         harness = connectors_of(match)
-        forced = (entry_map or {}).get(c["designator"], {})
+        part_of = {k["designator"]: k["part_number"] for k in harness}
+        forced = dict((entry_map or {}).get(c["designator"], {}))
+        # An entry carrying a component designated after a harness connector
+        # (assign_entry_parts) is assigned to that connector
+        for e in c["entries"]:
+            named = [
+                d
+                for d in e["component_designators"]
+                if d in part_of and not d.endswith("?")
+            ]
+            if e["designator"] not in forced and named:
+                forced[e["designator"]] = named[0]
         taken = set(forced.values())
         pending = []
         for e in c["entries"]:
@@ -657,10 +671,34 @@ def review_multiboard(
                     row["connector"] = free[0]
                     taken.add(free[0])
                     progress = True
+        entry_by_label = {e["label"]: e for e in c["entries"]}
         for row in review["entries"]:
             if "connector" in row:
                 row.pop("candidates", None)
+                row["connector_part"] = part_of.get(row["connector"], "")
                 assigned[row["entry"]] = (match, row["connector"])
+                carried = entry_by_label[row["entry"]]["inline_part_numbers"]
+                if not carried and row["needs"]:
+                    issues.append(
+                        {
+                            "severity": "info",
+                            "type": "harness_entry_without_part",
+                            "where": row["entry"],
+                            "detail": f"no component; the harness has "
+                            f"{row['connector']} ({row['connector_part']}) here "
+                            "(edit_multiboard_schematic assign_harness_parts)",
+                        }
+                    )
+                elif carried and row["connector_part"] not in carried:
+                    issues.append(
+                        {
+                            "severity": "error",
+                            "type": "entry_part_mismatch",
+                            "where": row["entry"],
+                            "detail": f"entry carries {', '.join(carried)}, harness "
+                            f"connector {row['connector']} is {row['connector_part']}",
+                        }
+                    )
             elif row.get("candidates"):
                 issues.append(
                     {

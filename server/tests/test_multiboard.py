@@ -322,6 +322,38 @@ class MultiboardTest(unittest.TestCase):
         h1 = next(r for r in result["harness_review"] if r["connection"] == "H_1")
         self.assertEqual(h1["entries"][0]["connector"], "P2")
 
+    def test_assigned_component_settles_connector(self):
+        self.harness = {
+            **HARNESS,
+            "HAR_A": HARNESS["HAR_A"] + [{**HARNESS["HAR_A"][0], "designator": "P2"}],
+        }
+        types = self.issue_types(self.review())
+        self.assertIn(("harness_entry_without_part", "H_2.Entry_1"), types)
+        logical = _logical()
+        h1 = logical["connections"][0]
+        comp = _comp(140, "HDR_A_MATE", [_pin(141, "1", "1"), _pin(142, "2", "2")])
+        comp["designator"] = "P2"
+        h1["components"].append(comp)
+        h1["entryPinMap"]["map"] += [
+            {"key": 141, "value": 120},
+            {"key": 142, "value": 120},
+        ]
+        self.write_mbs(logical)
+        result = self.review()
+        types = self.issue_types(result)
+        self.assertNotIn(("ambiguous_harness_connector", "H_1.Entry_1"), types)
+        self.assertNotIn(("harness_entry_without_part", "H_1.Entry_1"), types)
+        row = next(r for r in result["harness_review"] if r["connection"] == "H_1")
+        self.assertEqual(
+            (row["entries"][0]["connector"], row["entries"][0]["connector_part"]),
+            ("P2", "HDR_A_MATE"),
+        )
+        # A component of another part than the matched connector is an error
+        comp["parameters"][0]["value"] = "OTHER"
+        self.write_mbs(logical)
+        result = self.review(entry_map={"H_1": {"Entry_1": "P1"}})
+        self.assertIn(("entry_part_mismatch", "H_1.Entry_1"), self.issue_types(result))
+
     def test_wrong_part_reports_no_harness_connector(self):
         logical = _logical()
         logical["virtualModules"][1]["components"][0]["parameters"][0]["value"] = (
