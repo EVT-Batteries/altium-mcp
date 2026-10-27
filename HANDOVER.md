@@ -29,6 +29,32 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 10 (2026-10-26): multi-board schematic review (uncommitted)
+- New read-only `get_multiboard_data` (`multiboard.py`, tests `tests/test_multiboard.py`): parses
+  a `.MbsDoc` (ZIP of JSON: `logical.json` + `Pages/*.json`, member names stored with `\`),
+  matches harness connections to the `.PrjHar` children of the `.PrjMbd` by connector part
+  numbers (DbLib `Mating Part`, either way), assigns entries to harness connectors (`entry_map`
+  for identical ones) and traces nets through wired pins only (no-connect pins keep callout
+  text as net name) and inline connector pin pairs. Each harness connection is one instance,
+  so a project used twice (slave sense harness) is traced twice.
+- Format and editor behaviour from decompiled `Altium.Designer.SystemDesign.dll`
+  (`LogicalObjects.Serialization.V1`, `CommandBuilder.CreateInlineConnection`,
+  `ModuleEntryCreator.PlaceEntryOnConnection`): inline connectors only come from placing an
+  entry on a harness line (split); no join of two harnesses exists.
+- Write support: `edit_multiboard_schematic` (`multiboard_edit.py`, tests
+  `tests/test_multiboard_edit.py`) edits the saved JSON: `swap_entry_parts`, `join_harnesses`
+  (inline pair + new branch, splits the target line), `set_title`. New bridge command
+  `multiboard_document` (status / close / open, kind `SdDoc`) so the file is only written while
+  Altium does not hold it (refused with unsaved edits); backup in
+  `C:\Users\Public\altium_mcp\backups`. `get_screenshot(view_type="mbs")` captures a `.MbsDoc`;
+  `get_multiboard_data(include_geometry=True)` lists entry points, junctions and segments.
+- Format facts used: ids are max + 1 per space on load (logical / drawing); lines run between
+  connect positions (entry position + direction x gridSize); Python `ZipInfo()` turns `\` into
+  `/` in member names on Windows (set `.filename` afterwards). Verified live on scratch copies:
+  Altium loads the result, and an Altium re-save keeps every added object (it only renumbers
+  system parameters and styles). Then applied to `P42C-1_System.MbsDoc` (MOD_5 J3/J4 swap,
+  H_1.Entry_4 -> H_5 inline DTM04-6P / DTM06-6S): 0 errors, all 82 traced nets closed.
+
 ### Session 9 (2026-10-22): limitations found while wiring a real harness (no code change)
 Three tool limitations, details in §6 "Multi-part connectors", "Cavity parts and ERC",
 "Checker and duplicate designators"; fixes in §8.

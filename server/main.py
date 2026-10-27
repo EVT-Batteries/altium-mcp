@@ -4651,13 +4651,14 @@ async def get_screenshot(
     Take a screenshot of the Altium window, returned as viewable image content.
 
     Args:
-        view_type (str): Type of view to capture - 'pcb' or 'sch'
+        view_type (str): Type of view to capture - 'pcb', 'sch' or 'mbs' (multi-board
+            schematic, .MbsDoc)
         zoom_to (list, optional): List of component designators (e.g. ["U12", "R42"]).
             PCB view only: Altium zooms to the bounding box of these components
             (plus a margin) before the capture, so the components fill the frame.
             Omit to capture at the current zoom level.
-        document_path (str, optional): Absolute or relative path to a schematic or
-            harness document to focus and capture.
+        document_path (str, optional): Absolute or relative path to a schematic,
+            harness or multi-board document to focus and capture.
 
     Returns:
         Image content of the captured window plus a JSON metadata text block
@@ -4695,14 +4696,21 @@ async def get_screenshot(
             focus_info = focus_info if isinstance(focus_info, dict) else {}
             focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
             focused_document = focus_info.get("focused_document", "")
-            wanted_kind = {"pcb": "PCB", "sch": "SCH"}.get(view_type.lower())
+            wanted_kind = {"pcb": "PCB", "sch": "SCH", "mbs": "SDDOC"}.get(
+                view_type.lower()
+            )
             is_sch_match = wanted_kind == "SCH" and focused_kind in (
                 "SCH",
                 "HARNESSWIRINGDIAGRAM",
                 "HARNESSLAYOUTDRAWING",
             )
             is_pcb_match = wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB")
-            if wanted_kind and focused_kind and not (is_sch_match or is_pcb_match):
+            is_mbs_match = wanted_kind == "SDDOC" and focused_kind == "SDDOC"
+            if (
+                wanted_kind
+                and focused_kind
+                and not (is_sch_match or is_pcb_match or is_mbs_match)
+            ):
                 logger.error(
                     f"Requested {view_type} view but {focused_kind} document is focused"
                 )
@@ -5460,6 +5468,277 @@ async def get_harness_data(
         return json.dumps({"error": f"Could not parse harness document: {e}"})
     data.update(_disk_source(p))
     return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def get_multiboard_data(
+    ctx: Context,
+    file_path: str = "",
+    harness_map: dict | None = None,
+    entry_map: dict | None = None,
+    include_pins: bool = True,
+    include_geometry: bool = False,
+) -> str:
+    """
+    Read and review an Altium multi-board schematic (.MbsDoc) against its harness
+    projects; read-only, works without Altium on the SAVED files.
+
+    It lists the blocks (Custom Parts and child-project modules) with their entries,
+    linked library components and pins (pin name = the net name Altium gives it), and
+    the connections (harness, cable, direct) with what each entry mates: a block entry,
+    or another harness's entry through an inline connector pair (with its pin pairs).
+    Then it matches every harness connection to a harness project (.PrjHar) of the
+    multi-board project by connector part numbers (the library's Mating Part, either
+    way), each harness entry to one connector of that project, and traces nets pin by
+    pin from device pin to device pin through the harness wires and inline connectors.
+    Two harness connections built from the same project are traced as two instances.
+
+    issues (severity error / warning / info):
+      dangling_entry - harness entry mating nothing. Altium only joins two harnesses by
+        an inline connector made by placing an entry ON a harness line (it splits that
+        harness in two); an open harness end cannot be dropped onto another harness.
+      unconnected_entry, entry_without_component, component_not_in_library,
+      harness_not_linked (no harness project linked yet), duplicate_title,
+      no_harness_connector (no connector of the matched project mates the device: wrong
+        port, key or part), ambiguous_harness_connector (several identical connectors
+        fit: pass entry_map), pin_missing_on_device / pin_missing_on_harness,
+      wired_to_unused_pin (harness wire on a device pin named NC / RSVD),
+      single_device_net (a wired net that reaches no other device pin, with every
+        harness connector on it mapped).
+
+    Args:
+        file_path: .MbsDoc or .PrjMbd. Default: the first .PrjMbd in the workspace.
+        harness_map: {"H_1": "<harness project name or path>"} to force the project of
+            a harness connection.
+        entry_map: {"H_3": {"Entry_5": "P5"}} to assign harness entries to harness
+            connector designators where identical connectors make it ambiguous.
+        include_pins: per-pin tables (pin_review) and traced nets (system_nets). Turn
+            off for a short structural answer.
+        include_geometry: also the drawn shape of each connection (geometry: entry
+            points with their connect positions and directions, junctions, line
+            segments; y up, grid_size units), to plan edit_multiboard_schematic
+            routes.
+
+    Returns:
+        JSON with summary, project, child_projects, library, blocks, connections,
+        inline_links, harness_review (matched_project, entries -> connector or
+        candidates), pin_review [{entry, harness, pins [{pin, device, harness, net}],
+        unwired_pins}], system_nets [{harness_nets, devices, unmapped_harness_pins}],
+        issues and (on request) geometry.
+    """
+    from multiboard import drawing_geometry, find_workspace_prjmbd, review_multiboard
+
+    p = (
+        Path(file_path.strip())
+        if file_path and file_path.strip()
+        else find_workspace_prjmbd()
+    )
+    if not p or not p.exists() or p.suffix.lower() not in (".mbsdoc", ".prjmbd"):
+        return json.dumps(
+            {"success": False, "error": f"No .MbsDoc or .PrjMbd found ('{file_path}')"}
+        )
+    try:
+        data = review_multiboard(
+            p, harness_map=harness_map, entry_map=entry_map, include_pins=include_pins
+        )
+        if include_geometry:
+            data["geometry"] = drawing_geometry(data["file_path"])
+    except Exception as e:
+        logger.error(f"Error reviewing multi-board schematic: {e}")
+        return json.dumps({"success": False, "error": f"Could not read {p}: {e!s}"})
+    data.update(_disk_source(Path(data["file_path"])))
+    return json.dumps({"success": True, **data}, indent=2, ensure_ascii=False)
+
+
+async def _multiboard_document(action: str, path: Path) -> dict | None:
+    """Altium's hold on a multi-board document: {open, modified} after the
+    action (status / close / open), or None when Altium could not be asked."""
+    try:
+        response = await altium_bridge.execute_command(
+            "multiboard_document", {"action": action, "document_path": str(path)}
+        )
+    except Exception as e:
+        logger.warning(f"multiboard_document {action} failed: {e}")
+        return None
+    if not response.get("success", False):
+        return {"success": False, "error": response.get("error", "unknown error")}
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return {
+                "success": False,
+                "error": f"unexpected Altium reply: {result[:200]!r}",
+            }
+    return result
+
+
+@mcp.tool()
+async def edit_multiboard_schematic(
+    ctx: Context,
+    document_path: str,
+    operations: list,
+    dry_run: bool = False,
+) -> str:
+    """
+    Edit an Altium multi-board schematic (.MbsDoc): re-assign Custom Part
+    connectors, join two harnesses with an inline connector, rename blocks.
+
+    Altium's multi-board editor has no script interface, so the tool edits the saved
+    file: if Altium holds the document it must have no unsaved changes (save it
+    first); the tool closes it, writes the file (backup in
+    C:/Users/Public/altium_mcp/backups), and opens it again. Operations apply in
+    order; if one fails nothing is written. Plan routes with
+    get_multiboard_data(include_geometry=True) and check the result with it and
+    get_screenshot(view_type="mbs", document_path=...).
+
+    operations (each a dict with "op"):
+      {"op": "swap_entry_parts", "block": "MOD_5", "entries": ["J3", "J4"]}
+          Swap the linked components (and designators) of two entries of a block;
+          harnesses stay drawn where they are, so each now mates the other part.
+          Use it when a harness is plugged into the wrong one of two connectors.
+      {"op": "join_harnesses", "entry": "H_1.Entry_4", "to": "H_5",
+       "part": "DTM04-6P", "mate_part": "DTM06-6S", "attach": [x, y],
+       "via": [[x, y], ...], "entry_gender": "male"}
+          Make an open harness end an inline connector (part) mated with a new entry
+          of the other harness (mate_part), drawn two grid steps further along the
+          end's direction - what Altium does when an entry is placed on a harness
+          line. A new branch runs from the new entry's connect position through the
+          optional via corners to attach: a junction of the other harness or a point
+          on one of its lines (that line is split there). Every leg must be
+          horizontal or vertical. Pins are copied from a component of the same part
+          in the document, else numbered after a harness connector of that part in
+          the multi-board project; pins pair by number.
+      {"op": "set_title", "block": "MOD_2", "title": "Module #1 (High Side)"}
+
+    Args:
+        document_path: The .MbsDoc.
+        operations: List of operations (see above).
+        dry_run: Apply in memory and report, write nothing.
+
+    Returns:
+        JSON with success, results per operation, saved, backup, reopened and the
+        review summary and issues of the saved document (get_multiboard_data,
+        without pins).
+    """
+    import shutil
+    from datetime import datetime
+
+    from multiboard import (
+        _harness_connectors,
+        find_prjmbd,
+        parse_prjmbd,
+        review_multiboard,
+    )
+    from multiboard_edit import MbsDocument, MbsEditError, apply_operations
+
+    p = Path(document_path).resolve() if document_path else None
+    if not p or p.suffix.lower() != ".mbsdoc" or not p.exists():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"document_path to a .MbsDoc is required: {document_path!r}",
+            }
+        )
+    if not isinstance(operations, list) or not operations:
+        return json.dumps(
+            {"success": False, "error": "operations must be a non-empty list"}
+        )
+
+    # Pins and library links for inline connectors
+    parts = {
+        op.get(k)
+        for op in operations
+        if isinstance(op, dict) and op.get("op") == "join_harnesses"
+        for k in ("part", "mate_part")
+    } - {None}
+    pin_sources: dict[str, list[str]] = {}
+    libraries: dict[str, tuple[str, str]] = {}
+    if parts:
+        prj = find_prjmbd(p)
+        for child in parse_prjmbd(prj)["child_projects"] if prj else []:
+            if child["kind"] != "harness" or not Path(child["path"]).exists():
+                continue
+            for k in _harness_connectors(Path(child["path"])):
+                if k["part_number"] in parts and k["part_number"] not in pin_sources:
+                    pin_sources[k["part_number"]] = list(k["pins"])
+        dbp = find_dblib(p.parent)
+        if dbp:
+            try:
+                db = load_dblib(dbp)
+                for part in parts:
+                    found = db.find(part)
+                    if found:
+                        libraries[part] = (db.name, found[0].name)
+            except Exception as e:
+                logger.warning(f"database library not read: {e}")
+
+    try:
+        doc = MbsDocument(p)
+        results = apply_operations(doc, operations, pin_sources, libraries)
+    except MbsEditError as e:
+        return json.dumps({"success": False, "error": str(e), "saved": False})
+    if dry_run:
+        return json.dumps(
+            {"success": True, "dry_run": True, "saved": False, "results": results},
+            indent=2,
+        )
+
+    status = await _multiboard_document("status", p)
+    was_open = bool(status and status.get("success") and status.get("open"))
+    if status and status.get("success") and status.get("modified"):
+        return json.dumps(
+            {
+                "success": False,
+                "saved": False,
+                "error": "Altium has unsaved changes in the document; save or discard them first",
+            }
+        )
+    if was_open:
+        closed = await _multiboard_document("close", p)
+        if not closed or not closed.get("success") or closed.get("open"):
+            return json.dumps(
+                {
+                    "success": False,
+                    "saved": False,
+                    "error": f"could not close the document in Altium: {closed}",
+                }
+            )
+    backup_dir = EXCHANGE_DIR / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    backup = backup_dir / f"{p.stem}.{datetime.now():%Y%m%d_%H%M%S}{p.suffix}"
+    shutil.copy2(p, backup)
+    try:
+        doc.save()
+    except OSError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "saved": False,
+                "error": f"write failed: {e}",
+                "backup": str(backup),
+            }
+        )
+    reopened = None
+    if was_open:
+        opened = await _multiboard_document("open", p)
+        reopened = bool(opened and opened.get("success") and opened.get("open"))
+    review = review_multiboard(p, include_pins=False)
+    return json.dumps(
+        {
+            "success": True,
+            "saved": True,
+            "results": results,
+            "backup": str(backup),
+            "was_open": was_open,
+            "reopened": reopened,
+            "summary": review["summary"],
+            "issues": review["issues"],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 async def _simple_command(command: str, params: dict, what: str) -> str:

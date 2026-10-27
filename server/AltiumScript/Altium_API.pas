@@ -1150,6 +1150,27 @@ begin
     Result := ExecuteGetSheetStyle(DocPath);
 end;
 
+// multiboard_document: "action" (status | close | open), "document_path"
+function ExecuteMultiboardDocumentCommand(RequestData: TStringList): String;
+var
+    i: Integer;
+    DocPath, Action: String;
+begin
+    DocPath := '';
+    Action := 'status';
+    if (RequestData <> nil) then
+    begin
+        for i := 0 to RequestData.Count - 1 do
+        begin
+            if (Pos('"document_path"', RequestData[i]) > 0) then
+                DocPath := JSONLineValue(RequestData[i])
+            else if (Pos('"action"', RequestData[i]) > 0) then
+                Action := JSONLineValue(RequestData[i]);
+        end;
+    end;
+    Result := ExecuteMultiboardDocument(Action, DocPath);
+end;
+
 // Function to execute a command with parameters
 function ExecuteCommand(CommandName: String): String;
 var
@@ -1271,6 +1292,8 @@ begin
             Result := ExecuteEditHarnessLayout(ROOT_DIR + 'harness_layout_spec.txt');
         'get_sheet_style':
             Result := ExecuteGetSheetStyleCommand(RequestData);
+        'multiboard_document':
+            Result := ExecuteMultiboardDocumentCommand(RequestData);
         'get_active_document':
             Result := GetActiveDocument(ROOT_DIR);
     else

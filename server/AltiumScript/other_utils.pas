@@ -210,6 +210,8 @@ begin
         Result := 'HarnessWiringDiagram'
     else if (AnsiUpperCase(ExtractFileExt(Path)) = '.LDRDOC') then
         Result := 'HarnessLayoutDrawing'
+    else if (AnsiUpperCase(ExtractFileExt(Path)) = '.MBSDOC') then
+        Result := 'SdDoc'
     else
         Result := 'SCH';
 end;
@@ -246,6 +248,59 @@ begin
     end;
 end;
 
+// multiboard_document: whether Altium holds a multi-board schematic (.MbsDoc,
+// kind SdDoc) and has unsaved edits in it, so the server can edit the saved
+// file while Altium does not hold it. Action "close" closes the document
+// only when it has no unsaved edits (never its project); "open" opens it, or
+// shows it when it is open already (no reload); "status" changes nothing.
+function ExecuteMultiboardDocument(Action: String; DocPath: String): String;
+var
+    ServerDoc : IServerDocument;
+    IsOpen    : String;
+    Modified  : String;
+begin
+    Result := '';
+    try
+        DocPath := StringReplace(DocPath, '/', '\', REPLACEALL);
+        if (DocPath = '') then
+        begin
+            Result := '{"success": false, "error": "document_path is required"}';
+            Exit;
+        end;
+        ServerDoc := FindOpenDocument(DocPath);
+        if (Action = 'close') and (ServerDoc <> nil) then
+        begin
+            if ServerDoc.Modified then
+            begin
+                Result := '{"success": false, "error": "the document has unsaved changes in Altium", "open": true, "modified": true}';
+                Exit;
+            end;
+            Client.CloseDocument(ServerDoc);
+            ServerDoc := FindOpenDocument(DocPath);
+        end
+        else if (Action = 'open') then
+        begin
+            if (ServerDoc = nil) then
+                ServerDoc := Client.OpenDocument('SdDoc', DocPath);
+            if (ServerDoc <> nil) then
+                Client.ShowDocument(ServerDoc);
+        end;
+        IsOpen := 'false';
+        Modified := 'false';
+        if (ServerDoc <> nil) then
+        begin
+            IsOpen := 'true';
+            if ServerDoc.Modified then
+                Modified := 'true';
+        end;
+        Result := '{"success": true, "action": "' + Action + '", "open": ' + IsOpen +
+                  ', "modified": ' + Modified + '}';
+    except
+        Result := '{"success": false, "error": "Exception in multiboard_document"}';
+        LogScriptError('Error in ExecuteMultiboardDocument');
+    end;
+end;
+
 // Modify the EnsureDocumentFocused function to handle all document types
 // and return more detailed information.
 // ViewTypeHint is only consulted by commands that can target more than one
@@ -276,6 +331,7 @@ begin
        (CommandName = 'get_active_document') or
        (CommandName = 'convert_netlabels_to_text') or
        (CommandName = 'get_sheet_style') or
+       (CommandName = 'multiboard_document') or
        (CommandName = 'take_view_screenshot') or
        (CommandName = 'get_symbol_primitives') or
        (CommandName = 'create_symbols_batch') or
@@ -652,9 +708,14 @@ begin
         DocType := 'SCH';
         ClassName := 'SchView';
     end
+    else if LowerCase(ViewType) = 'mbs' then
+    begin
+        DocType := 'MBS';
+        ClassName := '';
+    end
     else
     begin
-        Result := '{"success": false, "error": "Invalid view type: ' + ViewType + '. Must be ''pcb'' or ''sch''"}';
+        Result := '{"success": false, "error": "Invalid view type: ' + ViewType + '. Must be ''pcb'', ''sch'' or ''mbs''"}';
         Exit;
     end;
 
