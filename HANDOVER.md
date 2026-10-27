@@ -15,22 +15,27 @@ reliably create, edit, sync and verify **Altium Designer 26.7.1 harness projects
 **generic** (no project specifics in code).
 
 State: the wiring-diagram tools (`add_harness_wiring`, `sync_harness_library`,
-`check_harness_wiring`, `get_harness_data`) and the layout-drawing tool (`edit_harness_layout`:
+`check_harness_wiring`, `get_harness_data`), the layout-drawing tool (`edit_harness_layout`:
 connectors, views, connection points, bundles, coverings, labels, texts, fixed wire lengths,
-connection point pin repair, crash-safe view rendering) are done and committed. Open work: §8.
+connection point pin repair, crash-safe view rendering) and the multi-board schematic tools
+(`get_multiboard_data`, `edit_multiboard_schematic`) are done and committed. Open work: §8.
 
 ## 2. State at hand-over
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `4bb4847` (sessions 7-8 committed) | this file |
+| `altium-mcp/` | `feature/harness-support` | `e2e1203` (sessions 10-12 committed) | this file |
+
+Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
+holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`. Unit tests: 153
+passed, 7 skipped, 13 pre-existing failures (§8 item 2).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 12 (2026-10-27): multi-part connectors, wire kinds, wire break direction (uncommitted)
+### Session 12 (2026-10-27): multi-part connectors, wire kinds, wire break direction (`e2e1203`)
 - **Multi-part connectors fixed** (§8 item 1 of session 9): `PinOnPart` (pin `OwnerPartId` 0 or the
   object's `CurrentPartID`), `FindComponentWithPin` (CAVITYPART uses the part showing the pin) and
   `SiblingParts` (same designator + `LibReference`, other part id): `designator_updates` on one
@@ -62,7 +67,7 @@ of real documents first; files the user is editing are not ours.
   scratch copies of P42C-1 Top (`MCP_Test_Multi`, `MCP_Test_TopRun`), then applied to the
   four P42C-1 Main harness sheets.
 
-### Session 11 (2026-10-27): harness entry components (uncommitted)
+### Session 11 (2026-10-27): harness entry components (`aedbea7`)
 - `edit_multiboard_schematic` gains `assign_entry_parts` and the tool-level shortcut
   `assign_harness_parts`, which expands to one `assign_entry_parts` per connection from the
   review's `harness_review` match. `assign_entry_parts` writes what Altium writes when a
@@ -85,7 +90,7 @@ of real documents first; files the user is editing are not ours.
   that has no connection yet (`ModuleEntryDragDropBehavior.CanEnter`). Direct lines never
   branch, and a branch only joins a line of the same type (`CanConnectToHost`).
 
-### Session 10 (2026-10-26): multi-board schematic review (uncommitted)
+### Session 10 (2026-10-26): multi-board schematic, upstream merge repair (`81280f9`, `0bdbf41`, `8681502`)
 - New read-only `get_multiboard_data` (`multiboard.py`, tests `tests/test_multiboard.py`): parses
   a `.MbsDoc` (ZIP of JSON: `logical.json` + `Pages/*.json`, member names stored with `\`),
   matches harness connections to the `.PrjHar` children of the `.PrjMbd` by connector part
@@ -110,6 +115,13 @@ of real documents first; files the user is editing are not ours.
   Altium loads the result, and an Altium re-save keeps every added object (it only renumbers
   system parameters and styles). Then applied to `P42C-1_System.MbsDoc` (MOD_5 J3/J4 swap,
   H_1.Entry_4 -> H_5 inline DTM04-6P / DTM06-6S): 0 errors, all 82 traced nets closed.
+- **Upstream 0.5.1 merged** (`6a76414`, repaired in `0bdbf41`): our Ctrl+F3 recovery,
+  `_blocking_altium_dialogs` and `test_script_recovery.py` are gone; script recovery is upstream's
+  (`server/sandbox.py` for sandbox runs, the `mcp_script_stuck.txt` marker + `EditScript:Stop`
+  for bridge timeouts; see the dev skill §5). `requirements.txt` re-exported from `uv.lock`
+  (olefile was missing).
+- Layout: a connection point may hold a no-connect (`8681502`; the HVSL1200 HVIL pigtail's free
+  wire ends TERM1/TERM2 sit in CP1/CP3).
 
 ### Session 9 (2026-10-22): limitations found while wiring a real harness (no code change)
 Three tool limitations, details in §6 "Multi-part connectors", "Cavity parts and ERC",
@@ -195,7 +207,8 @@ Three tool limitations, details in §6 "Multi-part connectors", "Cavity parts an
   disabled while a modal window is up; closable boxes are dismissed first, then the titles of
   what stays are returned) is checked before the bridge writes a request, before a sandbox run
   and in `_recover_script_executor` (no `X2.EXE` launched; `executor_wedged: true` + "ask the
-  user" text with the titles). Verified live that it returns [] when Altium is free.
+  user" text with the titles). Verified live that it returns [] when Altium is free. (Removed
+  with the upstream 0.5.1 merge, session 10.)
 - Tests: 10 new (`TestViewsAndWireLengths` 7, recovery 3). Docs: `wirdoc-format.md` (view / wire
   data rows + "Connector views"), dev skill §5 (guard).
 - **Verified live on the scratch project** (each read back, no dialog after any call): P1 ->
@@ -252,22 +265,16 @@ lengths":
   `sync_harness_library`, `get_sheet_style`, bridge lock.
 - WirDoc features: `add_harness_wiring(cavity_parts, associated_parts, twists, shields, cables,
   wire_breaks, label_updates, relink, designator_updates)`; `get_harness_data` returns all of them.
-- **Automatic script-engine recovery** (`server/main.py`): `_recover_script_executor()` =
-  `X2.EXE -REditScript:Stop` -> ping -> Ctrl+F3 injected into the Altium main window (scan codes;
-  virtual-key-only input is ignored by Altium) -> ping; `executor_wedged: true` + "ask the user"
-  text only if both fail. Wired into `_run_sandbox` (failure paths; `recover=False` for the ping)
-  and into the production bridge timeout. Sandbox stops waiting ~3 s after an Altium "Error" box.
-  Dialog texts of Win32 `#32770` dialogs reported as `dismissed_dialog_texts` (Altium's themed
-  `TMessageForm` exposes no text). Helpers `_dialog_text`, `_altium_main_window`, `_send_ctrl_f3`,
-  `_script_engine_responds`. Tests `server/tests/test_script_recovery.py`. The user never develops
-  Altium scripts while an agent works, so Ctrl+F3 is OK.
+- Our own script-engine recovery (Ctrl+F3 injection, `_recover_script_executor`) was replaced by
+  upstream's recovery in session 10 (see there).
 - **Layout drawings open/screenshot**: `other_utils.pas` `SchDocumentKind(path)`
   ('HarnessWiringDiagram' / 'HarnessLayoutDrawing' / 'SCH') + `IsHarnessDocumentKind`; used by
   `EnsureDocumentFocused`, the screenshot path in `Altium_API.pas` and the zoom check.
   `get_screenshot(view_type="sch", document_path=<.LdrDoc>)` works.
 - `call_tool.py` saves image results to `%TEMP%\altium_mcp_<tool>_<ns>.png` and prints the path.
-- **Pre-existing test failures (15):** they read a real WirDoc of the development workspace that
-  has since changed. Fix the tests to use synthetic records (`parse_wirdoc_records`).
+- **Pre-existing test failures (13 since session 12, were 15):** they read a real WirDoc of the
+  development workspace that has since changed. Fix the tests to use synthetic records
+  (`parse_wirdoc_records`).
 
 ## 4. Key decisions and why
 - **DB is the single source of truth**; parameters written by `sync_harness_library`, never typed.
@@ -327,8 +334,13 @@ lengths":
     crashes Altium on opening. Keep new views hidden until rendered; split into runs.
   - Shell heredocs for patch scripts: the shell ate backslashes (`'\'` in Pascal anchors,
     `\b` in paths). Write such scripts with the Write tool.
-- Sandbox: only `S1..S3`, `I1..I3`, `B1`, `Obj1..Obj5`, `List1`, `IntMan`, `DbDoc` exist (an
-  `Obj6` = undeclared-identifier runtime pause). `GetFieldFromPipeString` not available.
+- Sandbox (upstream's since session 10): scratch variables `S1..S9`, `I1..I9`, `B1..B3`,
+  `F1..F4`, `Obj1..Obj9`, `List1..List3` (nil until you create them), `IntMan`, `DbDoc`; an
+  undeclared name is refused before Altium runs. `GetFieldFromPipeString` not available.
+- Harness wire `ComponentKind` is no DelphiScript property ("Undeclared identifier"): use
+  `GetState_ComponentKind` / `SetState_ComponentKind` (session 12).
+- Passing a `TList` item straight into a typed routine parameter (`Proc(List[j], ...)`) paused the
+  script; assign it to a variable first (session 12).
 - `pdftoppm` missing; render PDF pages with `uv run --with pymupdf python -I -c "..."`.
 
 ## 6. Gotchas / non-obvious findings
@@ -476,15 +488,24 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
 
 ## 7. Files and purpose
 `server/`:
-- `main.py` - MCP tools (`add_harness_wiring` spec records via `_spec_line`; `_check_harness_links`;
-  `_run_sandbox` + `_recover_script_executor` + `_blocking_altium_dialogs`; `get_harness_data`;
-  `get_screenshot`; `edit_harness_layout` incl. the multi-run render sequence).
+- `main.py` - MCP tools (`add_harness_wiring` spec records via `_spec_line`, `_wire_extra_lines`,
+  `_wire_break_orientation`; `_check_harness_links`; `sync_harness_library` engine
+  `_sync_harness_from_library`; `run_altium_script` via `sandbox.py`; `get_harness_data`;
+  `get_screenshot`; `edit_harness_layout` incl. the multi-run render sequence;
+  `get_multiboard_data`, `edit_multiboard_schematic`).
+- `harness_parser.py` - `.WirDoc` reader `parse_wirdoc` / `parse_wirdoc_records` (connectors per
+  part object with visible pins, cavity / associated parts, wires, twists, shields, cables, wire
+  breaks), `extract_ole_records`.
+- `multiboard.py` / `multiboard_edit.py` - `.MbsDoc` review (`review_multiboard`) and edits.
+- `sandbox.py` - upstream sandbox runner and script recovery.
 - `harness_layout.py` - `.LdrDoc` reader `parse_ldrdoc`, spec builder `build_layout_spec`, check
   `check_layout`, helpers `_follow_end`, `_wire_length`, `_shortest_route`.
 - `harness_check.py` - `check_harness_wiring` and `label_positions`.
 - `AltiumScript/schematic_utils.pas` - `ExecuteAddHarnessWiring` and helpers (`SpecField`,
-  `UpsertSchParameter`, `PlacedDesignator`, `FindPlacedComponent`, `AddCavityPart`,
-  `SetChildDesignator`, `FindHarnessObjectByUid`, ...); at the end the layout part:
+  `UpsertSchParameter`, `SetSchParameterHidden`, `ApplyHarnessWireProperty`, `PlacedDesignator`,
+  `FindPlacedComponent`, `PinOnPart`, `FindComponentWithPin`, `SiblingParts`,
+  `ClearHiddenCavityParts`, `AddCavityPart`, `SetChildDesignator`, `FindHarnessObjectByUid`,
+  `FindWireBreakAt`, ...); at the end the layout part:
   `ChildDesignatorText`, `FindLayoutObject`, `PlaceChildDesignator`, `PlaceChildText`,
   `SetBundleVertices`, `ProjectPathOfDocument`, `UnsavedProjectDocuments`, `RefreshFromLibrary`,
   `ConnectorPinIds`, `SyncConnectionPointPins`, `ExecuteEditHarnessLayout` (records incl. `VIEW`,
@@ -492,9 +513,9 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
 - `AltiumScript/Altium_API.pas` - `case CommandName of` dispatch (`'edit_harness_layout'`);
   `other_utils.pas` - `EnsureDocumentFocused` skip-list, `SchDocumentKind`, `FindOpenDocument`.
   `Altium_API.pas` / `other_utils.pas` are LF in the working tree (others CRLF) - keep each as is.
-- `tests/` (`test_harness_parser.py` fixtures pattern, `test_script_recovery.py`,
-  `test_harness_layout.py` = synthetic layouts + tool with mocked parser/bridge,
-  `test_harness_check.py`).
+- `tests/` (`test_harness_parser.py` fixtures pattern, `test_harness_layout.py` = synthetic
+  layouts + tool with mocked parser/bridge, `test_harness_check.py`, `test_multiboard.py`,
+  `test_multiboard_edit.py`, `test_sandbox.py`).
 - `.agents/skills/altium-mcp-development/` (`scripts/call_tool.py`, `scripts/wirdoc_diff.py`,
   `scripts/r2r_method_at.py` = .NET error dialog address -> method, `references/wirdoc-format.md`
   = file formats incl. layout drawings, views, connection point pins, Draftsman lengths).
@@ -510,7 +531,10 @@ needed)
   layout: pins repaired, all wires routed, J1/P2 physical, W1 600 mm / W2 700 mm fixed, B1 300 mm
   manual). It is open in Altium inside its own project `MCP_Test_Ldr.PrjHar`.
 - `txt\MCP_Test_Txt`, `twist\MCP_Test_Twist.WirDoc` - scratch copies for sessions 7-8.
-- `sb.py <script.pas> [timeout]` runs a sandbox file (`main._run_sandbox`); `probe\*.pas` = the
+- `sb.py <script.pas> [timeout]` runs a sandbox file (written for the old `main._run_sandbox`;
+  session 12's `...\6e56e396-a910-46dd-8442-72b590f81793\scratchpad\sb.py` calls
+  `main.run_altium_script`, plus `t\close.pas` / `t2\zoom.pas` = close a scratch document /
+  zoom to selected objects before a screenshot); `probe\*.pas` = the
   session 3-6 probes (`open.inc` = open scratch project + drawing into `Obj1`/`Obj2`;
   `v2`-`v5` = physical view steps, `w1` = wire length, `prjreload`, `close`, `reload`,
   `pins1`, `route1`-`route3`, `prjclose`, `prjopen`).
@@ -528,9 +552,10 @@ needed)
   `Rt_Schematic.ISch_Harness*` members).
 
 ## 8. Next steps
-Announce "using Altium now" / "Altium free" around live tests; `_blocking_altium_dialogs()`
-(or a desktop screenshot) tells whether an Altium modal window is up. Test each change on a
-scratch copy first.
+Announce "using Altium now" / "Altium free" around live tests; a desktop screenshot tells
+whether an Altium modal window is up ("Altium did not start the command (not executed)" = ask
+the user to clear it). Test each change on a scratch copy first, and close the scratch document
+in Altium before overwriting it on disk (a file-changed prompt blocks the bridge).
 1. Fixes from session 9 (§6); part-aware lookup, parser parts and sync reload done in session 12:
    - `CONNECTOR` (move) and `ASSOCPART` still take the first part object of a multi-part
      connector (no way yet to name the part, e.g. `FH1:B`).
@@ -540,20 +565,25 @@ scratch copy first.
      them).
    - `get_screenshot(view_type="sch")` on a harness sheet: optional zoom (whole sheet via
      `Sch:Zoom Action=Document`, or an area), so the agent can see every part of a large sheet.
-2. Fix the 15 pre-existing test failures (synthetic records instead of a real WirDoc).
+     Session 12 workaround: a sandbox run that selects objects and runs `Sch:Zoom
+     Action=Selected` (it zoomed only a little on the P42C-1 Top sheet), then crop the PNG.
+   - `check_harness_wiring`: a vertical wire's label must start within 120 mils to its right
+     (`beside`); labels left of a vertical run are reported "off its wire".
+2. Fix the 13 pre-existing test failures (synthetic records instead of a real WirDoc).
 3. Open question: should view options (side, zoom) be copied from a template connector?
 4. Not supported yet: LdrDoc notes / text frames; wire `LengthOffset` / user length / manual wire
    paths (no script setter, §5).
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 106 passed, 7 skipped, 15 pre-existing failures (§3)
+# unit tests (altium-mcp root) - 153 passed, 7 skipped, 13 pre-existing failures (§3)
 cd C:\evt_gits\electrical-p42c-1\altium-mcp
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py
+# main.py has ~50 pre-existing ruff findings: compare counts before / after a change
 
 # call working-tree tool code directly (the MCP daemon keeps old code until the IDE restarts)
-$py = "C:\Users\Felix\.altium-mcp\venvs\1459a62ba579\Scripts\python.exe"
+$py = (Get-ChildItem "$env:USERPROFILE\.altium-mcp\venvs\*\Scripts\python.exe" | Select-Object -First 1).FullName
 & $py .agents/skills/altium-mcp-development/scripts/call_tool.py get_screenshot '{"view_type": "sch", "document_path": "<path>.LdrDoc"}'
 & $py .agents/skills/altium-mcp-development/scripts/call_tool.py edit_harness_layout '@kwargs.json'
 # read a layout drawing (get_harness_data on .LdrDoc does the same through the MCP)
