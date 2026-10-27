@@ -134,6 +134,54 @@ class TestHarnessParser(unittest.TestCase):
         self.assertEqual(res["wires"][0]["design_item_id"], "WIRE-1")
         self.assertEqual([n["text"] for n in res["net_labels"]], ["Sheet note"])
 
+    def test_parse_multipart_connector(self):
+        """Each part of a multi-part connector is its own object with all pins;
+        only those of its current part are listed, cavity parts left in the
+        hidden ones are reported, and wires attach to the visible pin even
+        where a hidden pin shares its hot end."""
+        from harness_parser import parse_wirdoc_records
+        def pin(owner, des, part, y, uid):
+            return {"RECORD": "113", "OwnerIndex": str(owner), "Designator": des,
+                    "OwnerPartId": str(part), "Location.X": "100", "Location.Y": str(y),
+                    "PinLength": "20", "UniqueID": uid}
+        recs = [
+            {"HEADER": "Protel for Windows - Harness"},
+            {"RECORD": "106", "LibReference": "FH", "PartCount": "3", "CurrentPartId": "1",
+             "Location.X": "100", "Location.Y": "200", "UniqueID": "A"},
+            {"RECORD": "34", "OwnerIndex": "0", "Name": "Designator", "Text": "FH1"},
+            pin(0, "1", 1, 200, "A1"),
+            pin(0, "11", 2, 200, "A11"),                      # hidden on part A
+            {"RECORD": "131", "OwnerIndex": "3"},
+            {"RECORD": "106", "OwnerIndex": "4", "DesignItemId": "STRAY", "UniqueID": "K1"},
+            {"RECORD": "106", "LibReference": "FH", "PartCount": "3", "CurrentPartId": "2",
+             "Location.X": "100", "Location.Y": "0", "UniqueID": "B"},
+            {"RECORD": "34", "OwnerIndex": "6", "Name": "Designator", "Text": "FH1"},
+            pin(6, "1", 1, 0, "B1"),                          # hidden on part B
+            pin(6, "11", 2, 0, "B11"),
+            {"RECORD": "107", "LocationCount": "2", "X1": "120", "Y1": "200", "X2": "300",
+             "Y2": "200", "UniqueID": "W", "ComponentKind": "5"},
+            {"RECORD": "34", "OwnerIndex": "10", "Name": "Designator", "Text": "W1"},
+            {"RECORD": "41", "OwnerIndex": "10", "Name": "Net", "Text": "*"},
+            {"RECORD": "41", "OwnerIndex": "10", "Name": "Gauge", "Text": "16 AWG",
+             "IsHidden": "T"},
+            {"RECORD": "130", "Location.X": "300", "Location.Y": "200", "Text": "W1",
+             "Style": "1", "Orientation": "2", "UniqueID": "BR"},
+        ]
+        res = parse_wirdoc_records(recs, "sheet.WirDoc")
+        part_a, part_b = sorted(res["connectors"], key=lambda c: c["current_part_id"])
+        self.assertEqual((part_a["part_count"], part_b["current_part_id"]), (2, 2))
+        self.assertEqual([p["designator"] for p in part_a["pins"]], ["1"])
+        self.assertEqual([p["designator"] for p in part_b["pins"]], ["11"])
+        self.assertEqual(part_a["hidden_pin_cavity_parts"],
+                         [{"pin": "11", "part_numbers": ["STRAY"]}])
+        self.assertNotIn("hidden_pin_cavity_parts", part_b)
+        self.assertEqual(part_a["pins"][0]["connected_wire"], "W1")
+        wire = res["wires"][0]
+        self.assertEqual(wire["component_kind"], "standard_no_bom")
+        self.assertEqual(wire["shown_parameters"], ["Net"])
+        brk = res["wire_breaks"][0]
+        self.assertEqual((brk["style"], brk["orientation"]), (1, 2))
+
     def test_parse_harness_objects(self):
         """Seal and associated part (written once, as Altium does for parts
         added by script), twist, shield with drain wire, cable and wire break."""
@@ -676,6 +724,51 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[3], "DESIGNATOR|CONNUID|P%7C1|1")
         # Renames come before records that address the new designators
         self.assertGreater(lines.index("UPDATE_WIREPARAM|W1|PartNumber|X"), 3)
+
+    async def test_add_harness_wiring_kinds_visibility_breaks(self):
+        """Wire component kind and parameter visibility, wire break direction
+        (orientation from the wire ending there), part-only renames and
+        clearing hidden-pin cavity parts serialise as their records."""
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        with patch.object(main, "parse_wirdoc", side_effect=OSError("no file")):
+            await main.add_harness_wiring(
+                None,
+                document_path=r"C:\test\sheet.WirDoc",
+                designator_updates=[{"unique_id": "U", "designator": "FH2", "part_only": True}],
+                clear_hidden_cavity_parts=["FH1"],
+                wires=[{"designator": "W48", "net": "BUS", "points": [100, 900, 100, 500],
+                        "component_kind": "standard_no_bom", "hide_parameters": ["Net"]}],
+                wire_updates=[{"designator": "W9", "component_kind": 0,
+                               "show_parameters": ["Gauge"]}],
+                wire_breaks=[
+                    {"x": 100, "y": 500, "direction": "out"},     # wire runs up: 3
+                    {"x": 7, "y": 8, "style": "left", "orientation": 2},
+                    {"x": 9, "y": 9},
+                ],
+            )
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertEqual(lines[1], "DESIGNATOR|U|FH2||1")
+        self.assertEqual(lines[2], "CLEARHIDDEN|FH1")
+        wire_at = next(i for i, ln in enumerate(lines) if ln.startswith("WIRE|W48"))
+        self.assertEqual(lines[wire_at + 1:wire_at + 3], ["WIREKIND||5", "WIREPARAMVIS||Net|1"])
+        self.assertIn("WIREKIND|W9|0", lines)
+        self.assertIn("WIREPARAMVIS|W9|Gauge|0", lines)
+        self.assertIn("WIREBREAK|100|500|1|3", lines)
+        self.assertIn("WIREBREAK|7|8|0|2", lines)
+        self.assertIn("WIREBREAK|9|9", lines)
+
+    async def test_add_harness_wiring_rejects_unknown_kind_and_style(self):
+        import main
+        for kwargs in (
+            {"wire_updates": [{"designator": "W1", "component_kind": "virtual"}]},
+            {"wire_breaks": [{"x": 0, "y": 0, "direction": "sideways"}]},
+        ):
+            res = json.loads(await main.add_harness_wiring(
+                None, document_path=r"C:\test\sheet.WirDoc", **kwargs))
+            self.assertFalse(res["success"])
+        self.mock_bridge.assert_not_called()
 
     async def test_add_harness_wiring_rejects_unknown_types(self):
         import main

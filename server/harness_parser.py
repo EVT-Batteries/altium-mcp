@@ -100,6 +100,16 @@ def _coord(props: dict[str, str], key: str) -> int | float:
 
 # AssociatedObjectType of a cavity container (RECORD 131); omitted for crimps
 CAVITY_PART_TYPES = {0: "crimp", 1: "seal", 2: "plug", 3: "other"}
+# TComponentKind of a harness wire (RECORD 107 ComponentKind, absent = standard)
+COMPONENT_KIND_NAMES = {
+    0: "standard",
+    1: "mechanical",
+    2: "graphical",
+    3: "net_tie_bom",
+    4: "net_tie_no_bom",
+    5: "standard_no_bom",
+    6: "jumper",
+}
 # Wire-crossing harness objects: RECORD -> output key
 RECT_OBJECTS = {"117": "shields", "118": "twists", "123": "cables"}
 
@@ -113,7 +123,9 @@ def _text(props: dict[str, str], key: str) -> str:
 def _uid_list(props: dict[str, str], count_key: str, item_key: str) -> list[str]:
     count = int(props.get(count_key, 0) or 0)
     return [
-        props[f"{item_key}{i}"] for i in range(1, count + 1) if f"{item_key}{i}" in props
+        props[f"{item_key}{i}"]
+        for i in range(1, count + 1)
+        if f"{item_key}{i}" in props
     ]
 
 
@@ -213,6 +225,11 @@ def parse_wirdoc_records(
                     "designator": props.get("Text", ""),
                     "x": _coord(props, "Location.X"),
                     "y": _coord(props, "Location.Y"),
+                    # style 0 = arrows towards the wire end ("in"), 1 = away
+                    # ("out"); orientation 0 = symbol right of the wire end,
+                    # 1 above, 2 left, 3 below
+                    "style": int(props.get("Style", 0) or 0),
+                    "orientation": int(props.get("Orientation", 0) or 0),
                     "unique_id": props.get("UniqueID", ""),
                     "wire_uid": props.get("ConnectedObjectUniqueId", ""),
                     "wire": None,
@@ -230,6 +247,10 @@ def parse_wirdoc_records(
                     "y": _coord(props, "Location.Y"),
                 },
                 "unique_id": props.get("UniqueID", ""),
+                # Each part of a multi-part connector is its own object with
+                # all pins; only those of its current part are drawn on it
+                "current_part_id": int(props.get("CurrentPartId", 1) or 1),
+                "part_count": max(1, int(props.get("PartCount", 2) or 2) - 1),
                 "pins": [],
                 "parameters": {},
                 "associated_parts": [],
@@ -253,7 +274,12 @@ def parse_wirdoc_records(
                 "end_vertex2_conn_uid": props.get(
                     "EndVertex2ConnectedObjectUniqueID", ""
                 ),
+                "component_kind": COMPONENT_KIND_NAMES.get(
+                    int(props.get("ComponentKind", 0) or 0), "standard"
+                ),
                 "parameters": {},
+                # parameters drawn on the sheet besides designator and comment
+                "shown_parameters": [],
             }
         elif rtype == "108":  # Harness Splice
             sx = _coord(props, "Location.X")
@@ -314,6 +340,8 @@ def parse_wirdoc_records(
                     wires_dict[owner]["net"] = val
                 elif name:
                     wires_dict[owner]["parameters"][name] = val
+                    if rtype == "41" and props.get("IsHidden") != "T":
+                        wires_dict[owner]["shown_parameters"].append(name)
             elif owner in splices_dict and name == "Designator" and val:
                 splices_dict[owner]["designator"] = val
             elif owner in rect_objects and name:
@@ -350,27 +378,28 @@ def parse_wirdoc_records(
                 ]
 
                 pins_by_index[idx] = {
-                        "designator": props.get("Designator", ""),
-                        "name": props.get("Name", ""),
-                        "electrical": int(props.get("Electrical", 0)),
-                        "location": {
-                            "x": x_base,
-                            "y": y_base,
-                        },
-                        "hot_end": {
-                            "x": hx,
-                            "y": hy,
-                        },
-                        "length": length,
-                        "orientation": orient,
-                        "unique_id": props.get("UniqueID", ""),
-                        "connected_wire_uids": conn_wire_uids,
-                        "connected_wire": None,
-                        "net": None,
-                        "is_no_connect": False,
-                        "no_connect_id": None,
-                        "cavity_parts": [],
-                    }
+                    "designator": props.get("Designator", ""),
+                    "name": props.get("Name", ""),
+                    "electrical": int(props.get("Electrical", 0)),
+                    "location": {
+                        "x": x_base,
+                        "y": y_base,
+                    },
+                    "hot_end": {
+                        "x": hx,
+                        "y": hy,
+                    },
+                    "length": length,
+                    "orientation": orient,
+                    "unique_id": props.get("UniqueID", ""),
+                    "connected_wire_uids": conn_wire_uids,
+                    "connected_wire": None,
+                    "net": None,
+                    "is_no_connect": False,
+                    "no_connect_id": None,
+                    "owner_part_id": int(props.get("OwnerPartId", 0) or 0),
+                    "cavity_parts": [],
+                }
                 connectors[owner]["pins"].append(pins_by_index[idx])
         elif rtype in [
             "4",
@@ -430,6 +459,25 @@ def parse_wirdoc_records(
             part = {"type": part_type, **part}
         parts.append(part)
 
+    # Pins not drawn on their part object belong to another part of the
+    # connector (which lists them itself): drop them, but report cavity parts
+    # left in them (written by tools that ignored the part)
+    for c in connectors.values():
+        visible = []
+        for pin in c["pins"]:
+            owner_part = pin.pop("owner_part_id")
+            if owner_part <= 0 or owner_part == c["current_part_id"]:
+                visible.append(pin)
+                continue
+            if pin["cavity_parts"]:
+                c.setdefault("hidden_pin_cavity_parts", []).append(
+                    {
+                        "pin": pin["designator"],
+                        "part_numbers": [p["part_number"] for p in pin["cavity_parts"]],
+                    }
+                )
+        c["pins"] = visible
+
     # Wires linked to twists/shields/cables and wire breaks, by designator
     wire_des_by_uid = {w["unique_id"]: w["designator"] for w in wires_dict.values()}
     rect_lists: dict[str, list[dict[str, Any]]] = {k: [] for k in RECT_OBJECTS.values()}
@@ -447,11 +495,15 @@ def parse_wirdoc_records(
                 w
                 for w in wires_dict.values()
                 if w["unique_id"] == brk["wire_uid"]
-                or brk["unique_id"] in (w["end_vertex1_conn_uid"], w["end_vertex2_conn_uid"])
+                or brk["unique_id"]
+                in (w["end_vertex1_conn_uid"], w["end_vertex2_conn_uid"])
                 or (
                     len(w["points"]) >= 4
                     and (brk["x"], brk["y"])
-                    in ((w["points"][0], w["points"][1]), (w["points"][-2], w["points"][-1]))
+                    in (
+                        (w["points"][0], w["points"][1]),
+                        (w["points"][-2], w["points"][-1]),
+                    )
                 )
             ),
             None,

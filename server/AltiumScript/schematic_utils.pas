@@ -2144,12 +2144,56 @@ begin
     end;
 end;
 
+// Show or hide every parameter named PName of Owner (e.g. a harness wire's
+// 'Net'). Returns how many were found.
+function SetSchParameterHidden(Owner: ISch_BasicContainer; PName: String; Hidden: Boolean): Integer;
+var
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
+begin
+    Result := 0;
+    ChildIter := Owner.SchIterator_Create;
+    ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+    Prim := ChildIter.FirstSchObject;
+    while (Prim <> nil) do
+    begin
+        if (AnsiUpperCase(Prim.Name) = AnsiUpperCase(PName)) then
+        begin
+            SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+            Prim.IsHidden := Hidden;
+            SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+            Result := Result + 1;
+        end;
+        Prim := ChildIter.NextSchObject;
+    end;
+    Owner.SchIterator_Destroy(ChildIter);
+end;
+
 // Mirror the parameters that have a native harness wire property onto it.
+// Altium's own wire properties (the parameters a wire placed in the GUI gets)
+// are marked name-read-only, as Altium does, so wires placed by script and in
+// the GUI carry the same parameters.
 procedure ApplyHarnessWireProperty(Wire: ISch_GraphicalObject; PName: String; PVal: String);
 var
-    U: String;
+    U         : String;
+    ChildIter : ISch_Iterator;
+    Prim      : ISch_GraphicalObject;
 begin
     U := AnsiUpperCase(PName);
+    if (U = 'COLOR') or (U = 'GAUGE') or (U = 'MIN. BENDING RADIUS') or
+       (U = 'THICKNESS') or (U = 'INCLUDE CUT') then
+    begin
+        ChildIter := Wire.SchIterator_Create;
+        ChildIter.AddFilter_ObjectSet(MkSet(eParameter));
+        Prim := ChildIter.FirstSchObject;
+        while (Prim <> nil) do
+        begin
+            if (AnsiUpperCase(Prim.Name) = U) then
+                Prim.ReadOnlyState := 1; // eReadOnly_Name
+            Prim := ChildIter.NextSchObject;
+        end;
+        Wire.SchIterator_Destroy(ChildIter);
+    end;
     if (U = 'COMMENT') and (Wire.Comment <> nil) then
         Wire.Comment.Text := PVal
     else if (U = 'COLOR') then
@@ -2207,6 +2251,131 @@ begin
         Obj := Iter.NextSchObject;
     end;
     Doc.SchIterator_Destroy(Iter);
+end;
+
+// True if Pin is drawn on this part object of Conn. Every part of a
+// multi-part component (e.g. a fuse holder whose sockets 1-10 and 11-20 are
+// parts A and B) is its own placed object carrying ALL pins; only those whose
+// OwnerPartId is the object's CurrentPartID (or 0, shared) are visible there.
+function PinOnPart(Conn, Pin: ISch_GraphicalObject): Boolean;
+begin
+    Result := (Pin.OwnerPartId <= 0) or (Pin.OwnerPartId = Conn.CurrentPartID);
+end;
+
+// The placed part of connector Des on which pin PinDes is visible, or nil.
+function FindComponentWithPin(Doc: ISch_Document; Des, PinDes: String): ISch_GraphicalObject;
+var
+    Iter      : ISch_Iterator;
+    ChildIter : ISch_Iterator;
+    Obj       : ISch_GraphicalObject;
+    Pin       : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) and (Result = nil) do
+    begin
+        if (AnsiUpperCase(PlacedDesignator(Obj)) = AnsiUpperCase(Des)) then
+        begin
+            ChildIter := Obj.SchIterator_Create;
+            ChildIter.AddFilter_ObjectSet(MkSet(88, ePin));
+            Pin := ChildIter.FirstSchObject;
+            while (Pin <> nil) do
+            begin
+                if (Pin.Designator = PinDes) and PinOnPart(Obj, Pin) then
+                begin
+                    Result := Obj;
+                    Break;
+                end;
+                Pin := ChildIter.NextSchObject;
+            end;
+            Obj.SchIterator_Destroy(ChildIter);
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// The other placed parts of the multi-part component Obj belongs to: top-level
+// connectors with designator Des, the same library reference and another
+// part id. Caller frees the list.
+function SiblingParts(Doc: ISch_Document; Obj: ISch_GraphicalObject; Des: String): TList;
+var
+    Iter  : ISch_Iterator;
+    Other : ISch_GraphicalObject;
+begin
+    Result := TList.Create;
+    if (Obj.ObjectId <> 81) then Exit;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(81));
+    Other := Iter.FirstSchObject;
+    while (Other <> nil) do
+    begin
+        if (Other.UniqueId <> Obj.UniqueId) and
+           (AnsiUpperCase(PlacedDesignator(Other)) = AnsiUpperCase(Des)) and
+           (Other.LibReference = Obj.LibReference) and
+           (Other.CurrentPartID <> Obj.CurrentPartID) then
+            Result.Add(Other);
+        Other := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// Empty every cavity slot (and the 'Crimp' parameter) of the pins that are
+// not drawn on their part of connector Des. They hold parts only when a tool
+// once addressed the wrong part of a multi-part connector; Altium never shows
+// them, but they are still in the document. Returns how many pins had parts.
+function ClearHiddenCavityParts(Doc: ISch_Document; Des: String): Integer;
+var
+    Iter      : ISch_Iterator;
+    ChildIter : ISch_Iterator;
+    Obj       : ISch_GraphicalObject;
+    Pin       : ISch_GraphicalObject;
+    Pins      : TList;
+    k, t, n   : Integer;
+begin
+    Result := 0;
+    Pins := TList.Create;
+    try
+        Iter := Doc.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(81));
+        Obj := Iter.FirstSchObject;
+        while (Obj <> nil) do
+        begin
+            if (AnsiUpperCase(PlacedDesignator(Obj)) = AnsiUpperCase(Des)) then
+            begin
+                ChildIter := Obj.SchIterator_Create;
+                ChildIter.AddFilter_ObjectSet(MkSet(88));
+                Pin := ChildIter.FirstSchObject;
+                while (Pin <> nil) do
+                begin
+                    if not PinOnPart(Obj, Pin) then
+                        Pins.Add(Pin);
+                    Pin := ChildIter.NextSchObject;
+                end;
+                Obj.SchIterator_Destroy(ChildIter);
+            end;
+            Obj := Iter.NextSchObject;
+        end;
+        Doc.SchIterator_Destroy(Iter);
+
+        for k := 0 to Pins.Count - 1 do
+        begin
+            Pin := Pins[k];
+            n := 0;
+            for t := 0 to 3 do
+            begin
+                n := n + Pin.GetCount(t);
+                Pin.RemoveAllOfType(t);
+            end;
+            if (n > 0) then
+                Result := Result + 1;
+            RemoveSchParameter(Pin, 'Crimp');
+        end;
+    finally
+        Pins.Free;
+    end;
 end;
 
 // First harness wire (82) on Doc with the given designator, or nil.
@@ -2484,8 +2653,9 @@ begin
     Pin := ChildIter.FirstSchObject;
     while (Pin <> nil) do
     begin
-        // Designator only: a pin NAME can equal another pin's number
-        if (Pin.Designator = PinDes) then Break;
+        // Designator only: a pin NAME can equal another pin's number. Only
+        // a pin drawn on this part (a hidden one is another part's pin).
+        if (Pin.Designator = PinDes) and PinOnPart(Conn, Pin) then Break;
         Pin := ChildIter.NextSchObject;
     end;
     Conn.SchIterator_Destroy(ChildIter);
@@ -2592,6 +2762,11 @@ var
     GeoChanged    : Boolean;
     Relinked      : Boolean;
     DocName       : String;
+    Sibs          : TList;
+    HiddenCleared : Integer;
+    BreaksUpdated : Integer;
+    KindCount     : Integer;
+    ForceReload   : Boolean;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
@@ -2708,6 +2883,10 @@ begin
         UnchangedCount := 0;
         LabelsUpdated := 0;
         DesUpdated := 0;
+        HiddenCleared := 0;
+        BreaksUpdated := 0;
+        KindCount := 0;
+        ForceReload := False;
         // Wire geometry changed: twists, shields, cables and wire breaks
         // must then be linked again (see the reopen below)
         GeoChanged := False;
@@ -3105,6 +3284,14 @@ begin
                 if (Obj <> nil) then
                 begin
                     UpsertSchParameter(Obj, PName, PVal);
+                    // every part of a multi-part connector
+                    Sibs := SiblingParts(TargetDoc, Obj, ConnDes);
+                    for j := 0 to Sibs.Count - 1 do
+                    begin
+                        Prim := Sibs[j];
+                        UpsertSchParameter(Prim, PName, PVal);
+                    end;
+                    Sibs.Free;
                     ParamCount := ParamCount + 1;
                 end;
             end
@@ -3128,7 +3315,16 @@ begin
                         Misses.Add('connector:' + ConnDes);
                 end;
                 if (Obj <> nil) then
+                begin
                     ParamDelCount := ParamDelCount + RemoveSchParameter(Obj, PName);
+                    Sibs := SiblingParts(TargetDoc, Obj, ConnDes);
+                    for j := 0 to Sibs.Count - 1 do
+                    begin
+                        Prim := Sibs[j];
+                        RemoveSchParameter(Prim, PName);
+                    end;
+                    Sibs.Free;
+                end;
             end
             else if (Kind = 'DELETE_WIREPARAM') then
             begin
@@ -3252,6 +3448,47 @@ begin
                 else
                     Obj.Color := StrToInt(SpecField(Rec, 2));
             end
+            else if (Kind = 'WIREKIND') or (Kind = 'WIREPARAMVIS') then
+            begin
+                // WIREKIND|<WireDesignator>|<TComponentKind: 0 standard ... 5 standard no BOM>
+                // WIREPARAMVIS|<WireDesignator>|<ParamName>|<1 hidden, 0 shown>
+                // empty designator = last wire placed
+                WireDes := SpecField(Rec, 1);
+                if (WireDes = '') then
+                    Obj := LastWire
+                else if (CachedWireObj <> nil) and (AnsiUpperCase(CachedWireDes) = AnsiUpperCase(WireDes)) then
+                    Obj := CachedWireObj
+                else
+                begin
+                    Obj := FindHarnessWire(TargetDoc, WireDes);
+                    if (Obj <> nil) then
+                    begin
+                        CachedWireDes := WireDes;
+                        CachedWireObj := Obj;
+                    end;
+                end;
+                if (Obj = nil) then
+                begin
+                    if (Misses.IndexOf('wire:' + WireDes) < 0) then
+                        Misses.Add('wire:' + WireDes);
+                end
+                else if (Kind = 'WIREKIND') then
+                begin
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    // no ComponentKind property in DelphiScript: the setter
+                    Obj.SetState_ComponentKind(StrToInt(SpecField(Rec, 2)));
+                    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    KindCount := KindCount + 1;
+                end
+                else if (SetSchParameterHidden(Obj, SpecField(Rec, 2), SpecField(Rec, 3) = '1') = 0) then
+                    Misses.Add('parameter:' + WireDes + '.' + SpecField(Rec, 2))
+                else
+                    ParamCount := ParamCount + 1;
+            end
+            else if (Kind = 'CLEARHIDDEN') then
+                // CLEARHIDDEN|<ConnDes> - empty the cavities of pins hidden
+                // on their part of a multi-part connector
+                HiddenCleared := HiddenCleared + ClearHiddenCavityParts(TargetDoc, SpecField(Rec, 1))
             else if (Kind = 'CAVITYCRIMP') or (Kind = 'CAVITYPART') then
             begin
                 // CAVITYPART|<ConnDes>|<PinDes>|<Type 0-3>|<PartNumber>|<SourceLibraryName>|<DatabaseTableName>|<Description>[|Name|Value...]
@@ -3278,7 +3515,10 @@ begin
                     PartDesc := '';
                     fld := 6;
                 end;
-                Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                // The part (of a multi-part connector) that shows the pin
+                Obj := FindComponentWithPin(TargetDoc, ConnDes, PName);
+                if (Obj = nil) then
+                    Obj := FindPlacedComponent(TargetDoc, ConnDes);
                 if (Obj = nil) then
                 begin
                     if (Misses.IndexOf('connector:' + ConnDes) < 0) then
@@ -3421,10 +3661,15 @@ begin
                 end;
             end
             else if (Kind = 'RELINK') then
-                // RELINK - recompute twist/shield/cable/wire break links even
-                // without a geometry change (e.g. objects copied in the GUI
-                // keep their source's links until the sheet is reloaded)
-                GeoChanged := True
+                // RELINK - reload the sheet: recomputes twist/shield/cable/
+                // wire break links even without a geometry change (objects
+                // copied in the GUI keep their source's links until then),
+                // and the project compiler only sees changed wire parameters
+                // and cavity parts after a reload
+                begin
+                    GeoChanged := True;
+                    ForceReload := True;
+                end
             else if (Kind = 'LABELTEXT') then
             begin
                 // LABELTEXT|x|y|<old text, empty = any>|<new text>
@@ -3442,14 +3687,31 @@ begin
             end
             else if (Kind = 'DESIGNATOR') then
             begin
-                // DESIGNATOR|<UniqueId>|<new designator>|<show name: '', 0 or 1>
+                // DESIGNATOR|<UniqueId>|<new designator>|<show name: '', 0 or 1>|<part only: '', 1>
                 // Renames a connector, wire or splice (its Designator) or a
-                // no-connect (its name) in place, found by UniqueId.
+                // no-connect (its name) in place, found by UniqueId. The
+                // other parts of a multi-part connector are renamed with it
+                // (they are one component) unless part only is 1.
                 Obj := FindHarnessObjectByUid(TargetDoc, SpecField(Rec, 1));
                 if (Obj = nil) then
                     Misses.Add('unique_id:' + SpecField(Rec, 1))
                 else
                 begin
+                    if (Obj.ObjectId = 81) and (SpecField(Rec, 4) <> '1') then
+                    begin
+                        Sibs := SiblingParts(TargetDoc, Obj, PlacedDesignator(Obj));
+                        for j := 0 to Sibs.Count - 1 do
+                        begin
+                            Prim := Sibs[j];
+                            SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                            if (Prim.Designator <> nil) then
+                                Prim.Designator.Text := SpecField(Rec, 2);
+                            SchServer.RobotManager.SendMessage(Prim.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                            Prim.GraphicallyInvalidate;
+                            DesUpdated := DesUpdated + 1;
+                        end;
+                        Sibs.Free;
+                    end;
                     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
                     if (Obj.ObjectId = 94) then
                     begin
@@ -3468,19 +3730,40 @@ begin
             end
             else if (Kind = 'WIREBREAK') then
             begin
-                // WIREBREAK|x|y - on a free wire end; it takes the wire's
-                // designator, and wires with the same designator on other
-                // sheets of the project become one connection
+                // WIREBREAK|x|y[|<style 0 left, 1 right>|<orientation 0-3>] - on a
+                // free wire end; it takes the wire's designator, and wires
+                // with the same designator on other sheets of the project
+                // become one connection. A break already at x, y gets the
+                // style / orientation given (empty = unchanged).
                 RX1 := StrToInt(SpecField(Rec, 1));
                 RY1 := StrToInt(SpecField(Rec, 2));
-                if (FindWireBreakAt(TargetDoc, RX1, RY1) <> nil) then
-                    UnchangedCount := UnchangedCount + 1
+                Obj := FindWireBreakAt(TargetDoc, RX1, RY1);
+                if (Obj <> nil) then
+                begin
+                    if (SpecField(Rec, 3) = '') and (SpecField(Rec, 4) = '') then
+                        UnchangedCount := UnchangedCount + 1
+                    else
+                    begin
+                        SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                        if (SpecField(Rec, 3) <> '') then
+                            Obj.Style := StrToInt(SpecField(Rec, 3));
+                        if (SpecField(Rec, 4) <> '') then
+                            Obj.Orientation := StrToInt(SpecField(Rec, 4));
+                        SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                        Obj.GraphicallyInvalidate;
+                        BreaksUpdated := BreaksUpdated + 1;
+                    end;
+                end
                 else
                 begin
                     Obj := SchServer.SchObjectFactory(106, eCreate_Default);
                     if (Obj <> nil) then
                     begin
                         Obj.Location := Point(MilsToCoord(RX1), MilsToCoord(RY1));
+                        if (SpecField(Rec, 3) <> '') then
+                            Obj.Style := StrToInt(SpecField(Rec, 3));
+                        if (SpecField(Rec, 4) <> '') then
+                            Obj.Orientation := StrToInt(SpecField(Rec, 4));
                         TargetDoc.RegisterSchObjectInContainer(Obj);
                         SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
                             SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
@@ -3515,7 +3798,7 @@ begin
             Iter.AddFilter_ObjectSet(MkSet(92, 93, 98, 106));
             Obj := Iter.FirstSchObject;
             TargetDoc.SchIterator_Destroy(Iter);
-            if (Obj <> nil) then
+            if (Obj <> nil) or ForceReload then
             begin
                 ResetParameters;
                 AddStringParameter('Action', 'Close');
@@ -3564,6 +3847,9 @@ begin
                   ', "shields": ' + IntToStr(ShieldCount) +
                   ', "cables": ' + IntToStr(CableCount) +
                   ', "wire_breaks": ' + IntToStr(BreakCount) +
+                  ', "wire_breaks_updated": ' + IntToStr(BreaksUpdated) +
+                  ', "wire_kinds_set": ' + IntToStr(KindCount) +
+                  ', "hidden_pins_cleared": ' + IntToStr(HiddenCleared) +
                   ', "already_placed": ' + IntToStr(UnchangedCount) +
                   ', "labels_updated": ' + IntToStr(LabelsUpdated) +
                   ', "designators_updated": ' + IntToStr(DesUpdated) +

@@ -23,6 +23,7 @@ from altium_files import read_altium_text, write_altium_text
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from harness_layout import build_layout_spec, check_layout, parse_ldrdoc
 from harness_parser import (
+    COMPONENT_KIND_NAMES,
     get_harness_component_data,
     get_harness_component_pins,
     get_harness_components,
@@ -2300,6 +2301,67 @@ CAVITY_TYPES = {"crimp": 0, "terminal": 0, "seal": 1, "plug": 2, "other": 3}
 CAVITY_TYPE_NAMES = {0: "crimp", 1: "seal", 2: "plug", 3: "other"}
 # Harness shield styles (ISch_HarnessShield.Style)
 SHIELD_STYLES = {"shield": 0, "plain": 0, "with_connection": 1, "connected": 1}
+# Component kinds of a harness wire (TComponentKind); "standard_no_bom" draws a
+# connection (e.g. a bus bar inside a fuse holder) that is not a BOM wire
+COMPONENT_KINDS = {name: kind for kind, name in COMPONENT_KIND_NAMES.items()}
+# Wire break (cross-sheet connector) styles: the arrows of "right" point away
+# from the wire end, those of "left" towards it, whatever the orientation
+WIRE_BREAK_STYLES = {"left": 0, "in": 0, "right": 1, "out": 1}
+
+
+def _component_kind(value: Any) -> int | None:
+    if isinstance(value, int) and value in COMPONENT_KIND_NAMES:
+        return value
+    return COMPONENT_KINDS.get(str(value).strip().lower().replace(" ", "_"))
+
+
+def _wire_extra_lines(des: str, item: dict) -> list[str]:
+    """WIREKIND / WIREPARAMVIS records for a wire's component_kind,
+    hide_parameters and show_parameters (des "" = the wire just placed).
+    Raises ValueError on an unknown component kind."""
+    lines = []
+    if item.get("component_kind") is not None:
+        kind = _component_kind(item["component_kind"])
+        if kind is None:
+            raise ValueError(
+                f"unknown component_kind {item['component_kind']!r}; "
+                f"use one of {sorted(COMPONENT_KINDS)}"
+            )
+        lines.append(_spec_line("WIREKIND", des, kind))
+    for name in item.get("hide_parameters") or []:
+        lines.append(_spec_line("WIREPARAMVIS", des, str(name), "1"))
+    for name in item.get("show_parameters") or []:
+        lines.append(_spec_line("WIREPARAMVIS", des, str(name), "0"))
+    return lines
+
+
+def _wire_break_orientation(
+    x: int, y: int, document_path: str, new_wires: list | None
+) -> int | None:
+    """Orientation (0-3) that puts a wire break at x, y (mils) on the side
+    away from the wire ending there: 0 when the wire runs off to the left,
+    2 to the right, 1 down, 3 up. Wires of this call first, then the saved
+    sheet; None when no wire ends there."""
+    ends: list[tuple[int, int, int, int]] = []
+    for w in new_wires or []:
+        pts = _wire_points(w)
+        if pts:
+            ends += [(*pts[0:2], *pts[2:4]), (*pts[-2:], *pts[-4:-2])]
+    try:
+        for w in parse_wirdoc(Path(document_path).resolve()).get("wires", []):
+            p = [round(v * 10) for v in w["points"]]
+            if len(p) >= 4:
+                ends += [(*p[0:2], *p[2:4]), (*p[-2:], *p[-4:-2])]
+    except Exception as e:  # noqa: BLE001 - an unreadable sheet only loses the default
+        logger.warning(f"wire break orientation: sheet not read: {e}")
+    for ex, ey, nx, ny in ends:
+        if (ex, ey) == (x, y):
+            if nx < x:
+                return 0
+            if nx > x:
+                return 2
+            return 1 if ny < y else 3
+    return None
 
 
 def _cavity_type(value: Any) -> int | None:
@@ -2381,6 +2443,7 @@ async def add_harness_wiring(
     label_updates: list | None = None,
     relink: bool = False,
     designator_updates: list | None = None,
+    clear_hidden_cavity_parts: list | None = None,
 ) -> str:
     """
     Add or update wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
@@ -2418,6 +2481,10 @@ async def add_harness_wiring(
             points are alternating x, y coordinates in true mils (even length >= 4).
             Omitted label positions default to side-by-side (375 mils apart) at the midpoint of
             the longest horizontal segment.
+            Optional on a wire (and on wire_updates): "component_kind" ("standard",
+            "standard_no_bom" for a drawn connection that is no BOM wire, e.g. a bus bar
+            link; also "mechanical", "graphical", "net_tie_bom", "net_tie_no_bom",
+            "jumper"), "hide_parameters" / "show_parameters" (names, e.g. ["Net"]).
         reroutes (list): Move EXISTING wires in place (keeps UniqueID, parameters, colour and
             library link), e.g. [{"designator": "W1", "points": [...]}] with optional
             designator_pos / comment_pos / label_position as for wires.
@@ -2484,8 +2551,15 @@ async def add_harness_wiring(
             rectangle that links no wire or a break on no wire end is listed in not_found.
             Placing an identical rectangle (or a twist / shield / cable with the same
             designator) or a break at the same point again updates it.
+            A break may give its direction: {"x", "y", "direction": "out"} (arrows away
+            from the wire end) or "in" (arrows towards it); the orientation then follows
+            from the wire ending there (the symbol on the side away from the wire). Or
+            set "style" ("left"/"right") and "orientation" (0-3) explicitly. Sent for an
+            existing break, they update it in place.
         relink (bool): Reopen the document after saving to recompute those links even when
-            no geometry changed (e.g. twists copied in the GUI keep the copied links).
+            no geometry changed (e.g. twists copied in the GUI keep the copied links), and
+            so the project compiler sees changed wire parameters and cavity parts (until
+            the reload it reports "Mismatched parameters in connected wire segments").
         label_updates (list): Change existing sheet texts (eLabel), e.g.
             [{"x": 7400, "y": 8200, "text": "OLD", "new_text": "NEW"}]; x/y in mils, the
             label's location; "text" (optional) must match the current text.
@@ -2496,6 +2570,16 @@ async def add_harness_wiring(
             Use it for unannotated objects ("P?", "*") that no designator can address.
             Applied before every other change of the call, so later entries may use the
             new designators. show_name only applies to no-connects.
+            Multi-part connectors (each part, e.g. sockets 1-10 / 11-20 of a fuse holder,
+            is its own object): renaming one part renames every part of that component
+            (same designator and library reference); "part_only": True renames just it.
+            Cavity parts, parameters and connector lookups by designator always use the
+            part on which the pin is drawn.
+        clear_hidden_cavity_parts (list): Connector designators whose pins hidden on
+            their part (another part's pins, never shown) are emptied of cavity parts,
+            e.g. ["FH1"]: tools that ignored the part used to put terminals there, and
+            they stay in the document. get_harness_data lists them per connector under
+            "hidden_pin_cavity_parts".
         component_updates (list): Parameters to upsert on placed connectors/components, and
             names of parameters to delete from them, e.g.:
             [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"},
@@ -2542,8 +2626,11 @@ async def add_harness_wiring(
                 str(du.get("unique_id", "")).strip(),
                 str(du.get("designator", "")).strip(),
                 "" if show is None else ("1" if show else "0"),
+                *(["1"] if du.get("part_only") else []),
             )
         )
+    for conn in clear_hidden_cavity_parts or []:
+        lines.append(_spec_line("CLEARHIDDEN", str(conn).strip()))
 
     for c in connectors or []:
         lines.append(
@@ -2598,6 +2685,10 @@ async def add_harness_wiring(
             lines.append(_spec_line("WIREPARAM", pk, pv))
         if w.get("tcolor") is not None:
             lines.append(_spec_line("WIRECOLOR", "", int(w["tcolor"])))
+        try:
+            lines.extend(_wire_extra_lines("", w))
+        except ValueError as e:
+            return json.dumps({"success": False, "error": str(e)})
 
     for rr in reroutes or []:
         pts = _wire_points(rr)
@@ -2685,6 +2776,10 @@ async def add_harness_wiring(
             lines.append(_spec_line("DELETE_WIREPARAM", w_des, str(pk)))
         if wu.get("tcolor") is not None:
             lines.append(_spec_line("WIRECOLOR", w_des, int(wu["tcolor"])))
+        try:
+            lines.extend(_wire_extra_lines(w_des, wu))
+        except ValueError as e:
+            return json.dumps({"success": False, "error": str(e)})
 
     crimp_parts = []
     for cc in cavity_crimps or []:
@@ -2766,7 +2861,29 @@ async def add_harness_wiring(
         lines.append(_spec_line(*fields))
 
     for wb in wire_breaks or []:
-        lines.append(_spec_line("WIREBREAK", int(wb.get("x", 0)), int(wb.get("y", 0))))
+        x, y = int(wb.get("x", 0)), int(wb.get("y", 0))
+        style_key = wb.get("style", wb.get("direction"))
+        style: Any = ""
+        if style_key is not None:
+            style = (
+                style_key
+                if style_key in (0, 1)
+                else WIRE_BREAK_STYLES.get(str(style_key).strip().lower())
+            )
+            if style is None:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"unknown wire break style/direction {style_key!r}; "
+                        f"use one of {sorted(WIRE_BREAK_STYLES)}",
+                    }
+                )
+        orientation: Any = wb.get("orientation")
+        if orientation is None and wb.get("direction") is not None:
+            orientation = _wire_break_orientation(x, y, document_path, wires)
+        orientation = "" if orientation is None else int(orientation) % 4
+        extra = [style, orientation] if (style, orientation) != ("", "") else []
+        lines.append(_spec_line("WIREBREAK", x, y, *extra))
 
     for lu in label_updates or []:
         lines.append(
@@ -3597,11 +3714,14 @@ async def _sync_harness_from_library(
     # add parameters Altium did not place.
     component_updates = []
     if sync_connectors:
+        refreshed: set[str] = set()
         for c in doc_data.get("connectors", []):
             current = c.get("parameters", {})
             part_num = current.get("PartNumber")
-            if not part_num:
+            # the parts of a multi-part connector are updated together
+            if not part_num or c["designator"] in refreshed:
                 continue
+            refreshed.add(c["designator"])
             found = library.find(part_num)
             if found is None:
                 unresolved.append(
@@ -3627,12 +3747,26 @@ async def _sync_harness_from_library(
                     }
                 )
 
+    # Cavity parts in pins hidden on their part of a multi-part connector
+    # were put there by tools that ignored the part: never valid, removed
+    hidden_parts = {
+        c["designator"]: c["hidden_pin_cavity_parts"]
+        for c in doc_data.get("connectors", [])
+        if sync_cavities and c.get("hidden_pin_cavity_parts")
+    }
+    if hidden_parts:
+        warnings.append(
+            "cavity parts removed from pins hidden on their part of multi-part "
+            f"connector(s) {sorted(hidden_parts)} (see hidden_pin_cavity_parts_removed)"
+        )
+
     if (
         wire_updates
         or cavity_parts
         or component_updates
         or associated_parts
         or cable_updates
+        or hidden_parts
     ):
         res_str = await add_harness_wiring(
             ctx,
@@ -3642,6 +3776,10 @@ async def _sync_harness_from_library(
             component_updates=component_updates,
             associated_parts=associated_parts,
             cables=cable_updates,
+            clear_hidden_cavity_parts=sorted(hidden_parts),
+            # the project compiler sees changed wire parameters and cavity
+            # parts only after the sheet is reloaded
+            relink=True,
         )
         try:
             res_json = json.loads(res_str)
@@ -3684,6 +3822,7 @@ async def _sync_harness_from_library(
             name: sorted(set(w)) for name, w in sorted(stale_deleted.items())
         },
         "parameters_deleted_count": res_json.get("parameters_deleted", 0),
+        "hidden_pin_cavity_parts_removed": hidden_parts,
         "unresolved": unresolved,
         "warnings": warnings,
         "altium_response": res_json,

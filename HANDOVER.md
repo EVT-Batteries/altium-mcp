@@ -1,6 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-22 (session 9: multi-part connector limitation found) for a fresh agent session.
+Updated 2026-10-27 (session 12: multi-part connectors, wire kinds, wire break direction) for a
+fresh agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -28,6 +29,38 @@ The user commits themselves. **Do not commit or push unless asked.** Test on ren
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 12 (2026-10-27): multi-part connectors, wire kinds, wire break direction (uncommitted)
+- **Multi-part connectors fixed** (§8 item 1 of session 9): `PinOnPart` (pin `OwnerPartId` 0 or the
+  object's `CurrentPartID`), `FindComponentWithPin` (CAVITYPART uses the part showing the pin) and
+  `SiblingParts` (same designator + `LibReference`, other part id): `designator_updates` on one
+  part renames every part (`part_only` for one), `component_updates` reach every part.
+  `get_harness_data` reports `current_part_id` / `part_count` per part object, lists only its
+  visible pins and reports `hidden_pin_cavity_parts`. New `clear_hidden_cavity_parts` (record
+  `CLEARHIDDEN`); `sync_harness_library` uses it automatically and reports
+  `hidden_pin_cavity_parts_removed`. The old FH1 workaround left 64 stray terminals (4 per pin)
+  on part A's hidden pins 11-20 of P42C-1 Top; sync removed them.
+- **Wire component kind**: `component_kind` on `wires` / `wire_updates` (record `WIREKIND`,
+  `SetState_ComponentKind`; the `ComponentKind` property does not exist in DelphiScript);
+  `standard_no_bom` draws a connection that is not a BOM wire (bus bar links). Parser:
+  wire `component_kind`.
+- **Parameter visibility**: `hide_parameters` / `show_parameters` on wires (record `WIREPARAMVIS`).
+  Parser: wire `shown_parameters` (visible parameters besides designator / comment).
+- **Wire break direction**: `wire_breaks` take `direction` (`out` = style 1 `>>` away from the
+  wire end, `in` = style 0 `<<` towards it, verified on screenshots) with the orientation derived
+  from the wire ending there (0 wire runs left, 2 right, 1 down, 3 up), or explicit `style` /
+  `orientation`; an existing break is updated in place. Parser: break `style` / `orientation`.
+- **Altium's built-in wire parameters** (Color, Gauge, Min. Bending Radius, Thickness, Include
+  Cut: what a GUI-placed wire gets, `RegisterDefaultParameters`) are now marked name-read-only
+  (`ReadOnlyState = 1`) when written, like Altium does, so script and GUI wires match.
+- **Compiler sees parameter changes only after a reload**: after a sync, ERC reported
+  "Mismatched parameters in connected wire segments" on wire-break pairs whose saved parameters
+  were identical; `relink=True` (reload) cleared it. `RELINK` now always reloads (also sheets
+  without twists / breaks) and `sync_harness_library` passes `relink=True`.
+- Tests: 3 new (`test_parse_multipart_connector`, `..._kinds_visibility_breaks`,
+  `..._rejects_unknown_kind_and_style`); 153 passed, same 13 old failures. Verified live on
+  scratch copies of P42C-1 Top (`MCP_Test_Multi`, `MCP_Test_TopRun`), then applied to the
+  four P42C-1 Main harness sheets.
 
 ### Session 11 (2026-10-27): harness entry components (uncommitted)
 - `edit_multiboard_schematic` gains `assign_entry_parts` and the tool-level shortcut
@@ -313,22 +346,18 @@ lengths":
 - Bash heredoc + `< /dev/null` on the same python command: stdin goes to /dev/null and python starts
   a REPL (hangs). Write scripts to files in the scratchpad instead.
 - **Multi-part connectors (found session 9 on an MTA 0301640 fuse holder, symbol
-  `FUSE_HOLDER_2x10_MINIVAL`, parts A = sockets 1-10, B = 11-20).** Each placed part is its own
-  component object (own UniqueID) carrying *all 40 pins*; only the pins whose `OwnerPartId` = the
-  part's `CurrentPartId` are visible, the others sit hidden at the same relative positions.
-  Consequences:
-  - `add_harness_wiring` / `sync_harness_library` cavity records (`CAVITYPART`, Pascal
-    `FindPlacedComponent` + `AddCavityPart` in `schematic_utils.pas`) take the **first** object
-    with the designator and the first pin with the designator, ignoring `OwnerPartId`: with both
-    parts named FH1, a terminal for socket 15 lands on part A's hidden pin `15_IN`.
-    **Workaround:** rename part B (`designator_updates` by UniqueID) to a temporary designator,
-    assign its cavities, rename it back.
-  - `get_harness_data` lists every part object as its own connector with all pins (hidden ones
-    with the visible ones' hot ends) and no `owner_part_id`, so pin lists double up.
-- **Cavity parts and ERC:** cavity parts written by `sync_harness_library` are saved, but Altium's
-  compiler (`get_erc_violations`) keeps reporting "Unspecified connector cavities - no part choice
-  for active pins" until the document is reloaded; `add_harness_wiring(relink=True)` on the sheet
-  cleared it. A connector modelled as a single part (ring lugs, PartNumber on the lug itself)
+  `FUSE_HOLDER_2x10_MINIVAL`, parts A = sockets 1-10, B = 11-20; fixed session 12).** Each placed
+  part is its own component object (own UniqueID) carrying *all 40 pins*; only the pins whose
+  `OwnerPartId` = the part's `CurrentPartId` are visible, the others sit hidden at the same
+  relative positions (a hidden pin can share a visible pin's hot end). Every lookup by
+  designator + pin must use the part showing the pin (`FindComponentWithPin`); renaming one part
+  must rename all (`SiblingParts`). Before session 12 cavity parts landed on hidden pins and sync
+  stacked them there (no rename workaround needed any more).
+- **Cavity parts, wire parameters and ERC:** what `sync_harness_library` writes is saved, but
+  Altium's compiler (`get_erc_violations`) keeps the old state ("Unspecified connector cavities -
+  no part choice for active pins", "Mismatched parameters in connected wire segments") until the
+  document is reloaded; `add_harness_wiring(relink=True)` reloads it, and sync now does so
+  itself (session 12). A connector modelled as a single part (ring lugs, PartNumber on the lug itself)
   always gets this warning when wired: its one cavity is empty by design (adding the lug as crimp
   would count it twice in the BOM).
 - **Checker and duplicate designators:** `check_harness_wiring` keys wires by designator, so two
@@ -502,15 +531,9 @@ needed)
 Announce "using Altium now" / "Altium free" around live tests; `_blocking_altium_dialogs()`
 (or a desktop screenshot) tells whether an Altium modal window is up. Test each change on a
 scratch copy first.
-1. Fixes from session 9 (§6), test on a scratch copy with a two-part connector:
-   - Part-aware connector/pin lookup: in `CAVITYPART` (and the other per-pin records), when several
-     placed objects share the designator, use the object whose `CurrentPartId` equals the target
-     pin's `OwnerPartId` (and skip pins of other parts); same in `sync_harness_library`'s cavity
-     matching. Then the rename workaround is no longer needed.
-   - Parser: report `owner_part_id` / `current_part_id` and list only the visible pins per part
-     object (or merge the parts into one connector with `parts`).
-   - `sync_harness_library`: reload the document (`relink`) after writing cavity parts so the
-     compiler sees them, or say in the result that a reload is needed.
+1. Fixes from session 9 (§6); part-aware lookup, parser parts and sync reload done in session 12:
+   - `CONNECTOR` (move) and `ASSOCPART` still take the first part object of a multi-part
+     connector (no way yet to name the part, e.g. `FH1:B`).
    - `check_harness_wiring`: key wires by UniqueID, not designator (unannotated `W?` wires merge).
    - `check_harness_wiring`: parse the sheet rectangles (RECORD 14, the connector frames) and
      report labels and channels inside another connector's frame (today only the screenshot shows
