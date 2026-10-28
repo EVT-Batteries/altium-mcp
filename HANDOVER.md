@@ -1,7 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-28 (session 14: layout text justification, connection point names) for a fresh
-agent session.
+Updated 2026-10-28 (session 14: layout text justification, connection point names, unnamed
+layout objects by UniqueID) for a fresh agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -21,24 +21,28 @@ connection point pin repair, crash-safe view rendering) and the multi-board sche
 (`get_multiboard_data`, `edit_multiboard_schematic`) are done and committed. Since session 13
 `add_harness_wiring` also copies placed connectors, frames, texts, notes and pictures from
 another wiring diagram (`copy_objects`): the way to add a connector by script, since Altium
-cannot place a harness connector from a desktop DbLib. Open work: §8.
+cannot place a harness connector from a desktop DbLib. Since session 14 `edit_harness_layout`
+places texts bottom-left unless given a `justification`, `show_name` really hides a connection
+point's name, and unannotated objects (`B?`, `CP?`) are addressed and checked by UniqueID.
+Open work: §8.
 
 ## 2. State at hand-over
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `a29063e` (sessions 10-13 committed) | session 14: `schematic_utils.pas`, `harness_layout.py`, `main.py`, `tests/test_harness_layout.py`, this file, `references/wirdoc-format.md` |
+| `altium-mcp/` | `feature/harness-support` | `1fa3dfe` (sessions 10-14 committed) | this file (session 14 marked committed) |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
-`a29063e`. Unit tests: 158 passed, 7 skipped, 13 pre-existing failures (§8 item 2).
+`a29063e`, session 14 `1fa3dfe`. Unit tests: 158 passed, 7 skipped, 13 pre-existing failures
+(§8 item 2).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (uncommitted)
+### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (`1fa3dfe`)
 Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
 - **`show_name` on a connection point now hides / shows its name.** Altium draws the name by
   its Designator text's `IsHidden`; `ShowName` is only read when it imports an old drawing
@@ -350,6 +354,12 @@ lengths":
   source. Copying a whole `.WirDoc` on disk would duplicate every UniqueId inside one project.
 - **No automatic router** (session 8): the agent routes by the drawing style, `check_harness_wiring`
   proves it.
+- **Layout objects are tracked by UniqueID, designators only name them** (session 14): an
+  imported layout carries many unannotated `B?` / `CP?` objects, so anything keyed by
+  designator (positions, post-call checks) picks the wrong one. A shared designator in a request
+  is refused rather than guessed.
+- **A placed text is bottom-left unless asked otherwise** (session 14): `[x, y]` must mean the
+  same corner whatever mirroring left on the text, or the agent cannot plan positions.
 - Layout tool design: coordinates in **mils** (as `add_harness_wiring`); lengths in **mm**
   (`length_mm`, offsets `start_offset_mm`/`end_offset_mm`); bundles may be given as `from`/`to`
   connection-point designators + optional `via` points (Python builds the exact end points from CP
@@ -634,10 +644,13 @@ needed)
   `cp\MCP_Test_CopySrc.WirDoc` / `cp\MCP_Test_CopyDst(.orig).WirDoc` (scratch project for
   `copy_objects`; the user closes it in Altium), `cp\copy_test.json` / `cp\wires_test.json`
   (`call_tool.py` kwargs), `cp\uids.py` (UniqueIds shared by two sheets).
-- Session 14, same scratchpad: `hvt\MCP_Test_HV.*` (renamed copy of the HV harness project,
-  `MCP_Test_HV.orig.LdrDoc` untouched; open in Altium, the user closes it), `hvt\t1.json`
-  (`call_tool.py` kwargs), `hvt\readback.py` (raw text records + `parse_ldrdoc` of chosen
-  objects), `raw_texts.py` (texts with a non-default justification).
+- Session 14, same scratchpad: `hvt\MCP_Test_HV.*` (renamed copy of the HV harness project;
+  open in Altium, the user closes it). Its `.LdrDoc` is now the layout before the review after
+  the `t2.json` lug swap; `MCP_Test_HV.pre.LdrDoc` = that layout before (all `B?` / `CP?`),
+  `MCP_Test_HV.orig.LdrDoc` = the reviewed layout, `MCP_Test_HV.t1_after.LdrDoc` = after the
+  `t1.json` text / name test. `hvt\t1.json` / `hvt\t2.json` (`call_tool.py` kwargs),
+  `hvt\readback.py` (raw text records + `parse_ldrdoc` of chosen objects), `raw_texts.py` (texts
+  with a non-default justification).
 
 ## 8. Next steps
 Announce "using Altium now" / "Altium free" around live tests; a desktop screenshot tells
