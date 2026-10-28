@@ -1,7 +1,6 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-27 (session 12: multi-part connectors, wire kinds, wire break direction) for a
-fresh agent session.
+Updated 2026-10-28 (session 13: copy objects between wiring diagrams) for a fresh agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -18,24 +17,27 @@ State: the wiring-diagram tools (`add_harness_wiring`, `sync_harness_library`,
 `check_harness_wiring`, `get_harness_data`), the layout-drawing tool (`edit_harness_layout`:
 connectors, views, connection points, bundles, coverings, labels, texts, fixed wire lengths,
 connection point pin repair, crash-safe view rendering) and the multi-board schematic tools
-(`get_multiboard_data`, `edit_multiboard_schematic`) are done and committed. Open work: §8.
+(`get_multiboard_data`, `edit_multiboard_schematic`) are done and committed. Since session 13
+`add_harness_wiring` also copies placed connectors, frames, texts, notes and pictures from
+another wiring diagram (`copy_objects`): the way to add a connector by script, since Altium
+cannot place a harness connector from a desktop DbLib. Open work: §8.
 
 ## 2. State at hand-over
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `e2e1203` (sessions 10-12 committed) | session 13 (`copy_objects`), this file |
+| `altium-mcp/` | `feature/harness-support` | `a29063e` (sessions 10-13 committed) | this file, `dev/SHEET_DUPLICATION.md`, dev skill |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
-holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`. Unit tests: 153
-passed, 7 skipped, 13 pre-existing failures (§8 item 2).
+holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
+`a29063e`. Unit tests: 155 passed, 7 skipped, 13 pre-existing failures (§8 item 2).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 13 (2026-10-27): copy objects between wiring diagrams (uncommitted)
+### Session 13 (2026-10-27/28): copy objects between wiring diagrams (`a29063e`)
 - **`add_harness_wiring(copy_objects=[...])`**: copies onto the target every object the source
   sheet owns whose bounding box lies inside `region` (mils), moved by `offset`, with
   `designators` renames (connectors, wires, splices) and `replace_text` (texts, notes, text
@@ -51,6 +53,14 @@ of real documents first; files the user is editing are not ours.
   attached to the copied pins, `check_harness_wiring` identical to the source sheet. Unit tests
   `test_add_harness_wiring_copy_objects{,_malformed}`; suite 155 passed, same 13 pre-existing
   failures.
+- Limits: the source must be a wiring diagram of an open harness project (a lone `.WirDoc`
+  opens empty, §6); only sheet-owned objects whose whole bounding box is inside `region` are
+  taken; copied wires (`include_wiring`) keep their Comment (net) and parameters, so rename and
+  re-net them with `wire_updates`; layout drawings are not touched (update the `.LdrDoc` from the
+  wiring diagram in Altium afterwards).
+- Docs (2026-10-28): AGENTS / skill `altium-harness-engineering` (Step 3, troubleshooting),
+  dev skill (§2 scratch project for a `.WirDoc`, §5 `Replicate`), `references/wirdoc-format.md`
+  (ObjectIds: text label is 22, not 4), `dev/SHEET_DUPLICATION.md` (harness sheets).
 
 ### Session 12 (2026-10-27): multi-part connectors, wire kinds, wire break direction (`e2e1203`)
 - **Multi-part connectors fixed** (§8 item 1 of session 9): `PinOnPart` (pin `OwnerPartId` 0 or the
@@ -297,6 +307,10 @@ lengths":
 - **DB is the single source of truth**; parameters written by `sync_harness_library`, never typed.
 - **Edits move objects in place** (keep UniqueIDs): the `.LdrDoc` links every object to its WirDoc
   original by UniqueID (`WiringDiagramOriginUniqueId`). Never recreate WirDoc wires.
+- **New connectors are copied, never placed from the library** (session 13): Altium places a
+  harness connector only from its own picker; `copy_objects` replicates a placed one (with its
+  cavity parts and parameters) and renews every UniqueId, so copies never share ids with the
+  source. Copying a whole `.WirDoc` on disk would duplicate every UniqueId inside one project.
 - **No automatic router** (session 8): the agent routes by the drawing style, `check_harness_wiring`
   proves it.
 - Layout tool design: coordinates in **mils** (as `add_harness_wiring`); lengths in **mm**
@@ -533,7 +547,8 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
   `UpsertSchParameter`, `SetSchParameterHidden`, `ApplyHarnessWireProperty`, `PlacedDesignator`,
   `FindPlacedComponent`, `PinOnPart`, `FindComponentWithPin`, `SiblingParts`,
   `ClearHiddenCavityParts`, `AddCavityPart`, `SetChildDesignator`, `FindHarnessObjectByUid`,
-  `FindWireBreakAt`, ...); at the end the layout part:
+  `FindWireBreakAt`, `NewSchUniqueId`, `RenewUniqueIds`, `CopyHarnessObjects` (record
+  `COPYFROM`), ...); at the end the layout part:
   `ChildDesignatorText`, `FindLayoutObject`, `PlaceChildDesignator`, `PlaceChildText`,
   `SetBundleVertices`, `ProjectPathOfDocument`, `UnsavedProjectDocuments`, `RefreshFromLibrary`,
   `ConnectorPinIds`, `SyncConnectionPointPins`, `ExecuteEditHarnessLayout` (records incl. `VIEW`,
@@ -578,6 +593,10 @@ needed)
   `ldr_test.py <file>` (prints `parse_ldrdoc`), `cpc.py` (stream decode), `uidfind.py`, `ping.py`,
   `err.json`; `re\` (SDK dumps, `dump_meta.ps1`, `params2.ps1`, `sig.ps1`, `rt_harness.txt` = all
   `Rt_Schematic.ISch_Harness*` members).
+- Session 13 `...\3aa743d9-ec13-4f37-94d2-e7f50a027134\scratchpad\`: `MCP_Test_Copy.PrjHar` +
+  `cp\MCP_Test_CopySrc.WirDoc` / `cp\MCP_Test_CopyDst(.orig).WirDoc` (scratch project for
+  `copy_objects`; the user closes it in Altium), `cp\copy_test.json` / `cp\wires_test.json`
+  (`call_tool.py` kwargs), `cp\uids.py` (UniqueIds shared by two sheets).
 
 ## 8. Next steps
 Announce "using Altium now" / "Altium free" around live tests; a desktop screenshot tells
@@ -601,10 +620,13 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
 3. Open question: should view options (side, zoom) be copied from a template connector?
 4. Not supported yet: LdrDoc notes / text frames; wire `LengthOffset` / user length / manual wire
    paths (no script setter, §5).
+5. `copy_objects` was tested within one harness project only: try a source sheet of another open
+   project before relying on it. A `get_harness_data` option listing the objects inside a region
+   would help choose `region` without a screenshot.
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 153 passed, 7 skipped, 13 pre-existing failures (§3)
+# unit tests (altium-mcp root) - 155 passed, 7 skipped, 13 pre-existing failures (§3)
 cd C:\evt_gits\electrical-p42c-1\altium-mcp
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py

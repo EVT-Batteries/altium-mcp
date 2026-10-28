@@ -135,3 +135,21 @@ project is exact and free — it preserves the template link, the sizing mode
 at the same dimensions), and every UniqueId. Re-annotate afterwards. The script
 above is the right tool when you need to copy objects *into* an existing sheet,
 or to duplicate selectively.
+
+## Harness wiring diagrams (.WirDoc)
+
+Measured on Altium Designer 26.7.1 (2026-10-27). The tool for this is
+`add_harness_wiring(copy_objects=[...])` (`CopyHarnessObjects` in
+`server/AltiumScript/schematic_utils.pas`); it copies a region of another
+wiring diagram onto an existing one.
+
+- The document is ObjectId **79**, not 32: sheet-owned objects have
+  `Container.ObjectId = 79`. Texts are 22, rectangles 4, notes 2, images 11,
+  text frames 13, harness connectors 81, wires 82, splices 83, no-connects 94.
+- `Replicate` keeps every UniqueId, pins and parameters included. Unlike a
+  plain schematic, harness wires and layout drawings link to pins by UniqueId,
+  so the copy must get new ones (`RenewUniqueIds`). For the same reason, do
+  not clone a `.WirDoc` on disk into the same project: both sheets would share
+  every id.
+- A `.WirDoc` opened outside its harness project loads as an empty plain
+  schematic. Test in a scratch `.PrjHar`.

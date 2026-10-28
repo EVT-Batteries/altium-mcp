@@ -55,7 +55,9 @@ MCP tool (server/main.py)
    make a "test" land in the real document. For a `.LdrDoc`, copy the **whole harness project**
    under the new name (rename every file; in the `.PrjHar`, replace the old base name) and open
    that project first: a layout drawing needs its wiring diagram, and physical views need a
-   project reload.
+   project reload. A `.WirDoc` needs a project too: opened on its own it loads as an empty
+   plain schematic (document ObjectId 32 instead of 79). Copy the `.PrjHar`, keep only the
+   `[Document*]` sections of the copied sheets and point them at the renamed copies.
 3. **Check the real file is untouched** afterwards (`git status`, file mtime), and close scratch
    documents in Altium when done (see §5).
 4. **Tool results are claims, not evidence.** Results now carry `saved`, `not_found` and counts;
@@ -151,6 +153,12 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   risky statement (`SandboxLog('...')`); the last logged step tells you what died. Create your own
   `TStringList` objects rather than relying on provided ones. No inline variable declarations.
 - Coordinates: `Point(MilsToCoord(mils), MilsToCoord(mils))`; raw integers land in `_Frac` units.
+- `Replicate` keeps every UniqueId (the object, its pins, its parameters). Renew them on a copy
+  (`RenewUniqueIds` in `schematic_utils.pas`) before registering it, or wires and layout
+  drawings cannot tell copy and source apart. `add_harness_wiring(copy_objects=...)` does this;
+  reuse `CopyHarnessObjects` rather than writing another copy loop.
+- Sheet-owned objects are those whose `Container.ObjectId` is the document's own ObjectId (79
+  on a wiring diagram, 32 on a schematic); everything else travels with its parent.
 - Persist explicitly: `ServerDoc.Modified := True; ServerDoc.DoFileSave('')`, then report
   `not ServerDoc.Modified` as the real save status.
 - Keep CRLF line endings in `.pas` files (check: every line should end in `\r`).

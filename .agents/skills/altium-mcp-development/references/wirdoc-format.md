@@ -12,8 +12,10 @@ the API. Read this before treating something odd in a file as a bug.
 
 | RECORD | API ObjectId | What |
 |---|---|---|
-| 4 | 4 (eLabel) | text string; with `OwnerIndex` it belongs to a component (e.g. a connector title) |
-| 14 | - | rectangle (user graphics) |
+| 4 | 22 (eLabel) | text string; with `OwnerIndex` it belongs to a component (e.g. a connector title) |
+| 14 | 4 (eRectangle) | rectangle (user graphics, connector frames) |
+| 30 | 11 (eImage) | picture |
+| 209 | 2 | note (yellow sticky note) |
 | 25 | 25 (eNetLabel) | net label - invalid in harness sheets |
 | 34 / 41 | eParameter | designator / other parameter; `Name`, `Text`, `OwnerIndex` |
 | 106 | 81 | harness connector **or** a cavity component (see ownership) |
@@ -64,6 +66,20 @@ the API. Read this before treating something odd in a file as a bug.
   UniqueID; deleting and recreating a wire changes the UniqueID and breaks `.LdrDoc` links.
 - A new harness wire comes with Altium's own default parameters; adding a parameter by name
   without looking for an existing one creates a duplicate with possibly conflicting value.
+
+## Copying objects between sheets (verified on Altium 26.7, 2026-10-27)
+
+- A harness connector cannot be created from a desktop DbLib by script, but a placed one can be
+  copied: `Replicate` → `RegisterSchObjectInContainer` → `SCHM_PrimitiveRegistration`
+  (`CopyHarnessObjects`, used by `add_harness_wiring(copy_objects=...)`).
+- `Replicate` keeps every UniqueId, pins and parameters included; the copy must get new ones
+  (`SetState_UniqueId`, 8 random capitals like Altium's own). Check with the UniqueIds of both
+  saved files: a correct copy shares none with its source.
+- Sheet-owned objects: `Container.ObjectId` = 79 (the wiring diagram). Skip the template (42)
+  and document parameters (27); connector pins, cavity parts and parameters travel with their
+  connector.
+- Copying a whole `.WirDoc` on disk keeps every UniqueId: two such sheets in one project share
+  pin ids (wires and layout links get confused). Copy objects instead.
 
 ## Harness objects beyond wires (verified on Altium 26.7, 2026-10-21)
 
