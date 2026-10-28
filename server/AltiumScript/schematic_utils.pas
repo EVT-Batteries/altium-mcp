@@ -4321,8 +4321,10 @@ end;
 
 // Place the text child of Obj named Name (its designator, comment, a
 // bundle's length or any parameter): X, Y mils ('' = keep), Hidden '1' / '0'
-// ('' = keep). False when Obj has no such text.
-function PlaceChildText(Obj: ISch_GraphicalObject; Name, X, Y, Hidden: String): Boolean;
+// ('' = keep), Just a TTextJustification ('' = keep; the corner or edge the
+// location names, which mirroring the owner flips). False when Obj has no
+// such text.
+function PlaceChildText(Obj: ISch_GraphicalObject; Name, X, Y, Hidden, Just: String): Boolean;
 var
     ChildIter : ISch_Iterator;
     Prim      : ISch_GraphicalObject;
@@ -4346,6 +4348,8 @@ begin
         Found.Location := Point(MilsToCoord(StrToInt(X)), MilsToCoord(StrToInt(Y)));
     if (Hidden <> '') then
         Found.IsHidden := (Hidden = '1');
+    if (Just <> '') then
+        Found.Justification := StrToInt(Just);
     SchServer.RobotManager.SendMessage(Found.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
     Obj.GraphicallyInvalidate;
     Result := True;
@@ -4778,6 +4782,12 @@ begin
                             Misses.Add('connection_point_designator:' + SpecField(Rec, 2));
                     if (SpecField(Rec, 8) <> '') then
                         PlaceChildDesignator(Obj, StrToInt(SpecField(Rec, 8)), StrToInt(SpecField(Rec, 9)));
+                    // Altium draws the name by its text's IsHidden; ShowName
+                    // is only read when it imports an old drawing
+                    if (SpecField(Rec, 6) = '1') then
+                        PlaceChildText(Obj, 'Designator', '', '', '0', '')
+                    else if (SpecField(Rec, 6) = '0') then
+                        PlaceChildText(Obj, 'Designator', '', '', '1', '');
                     Obj.GraphicallyInvalidate;
                     if IsNew then
                     begin
@@ -5061,7 +5071,8 @@ begin
                 if (Obj = nil) then
                     Misses.Add('text_owner:' + SpecField(Rec, 1))
                 else if not PlaceChildText(Obj, SpecField(Rec, 2), SpecField(Rec, 3),
-                                           SpecField(Rec, 4), SpecField(Rec, 5)) then
+                                           SpecField(Rec, 4), SpecField(Rec, 5),
+                                           SpecField(Rec, 6)) then
                     Misses.Add('text:' + SpecField(Rec, 1) + '.' + SpecField(Rec, 2))
                 else
                     TextsPlaced := TextsPlaced + 1;

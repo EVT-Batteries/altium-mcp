@@ -45,6 +45,19 @@ SYNCED_OBJECTS = {
 }
 # Text names stored differently on disk: file name -> script name
 TEXT_NAMES_ON_DISK = {"LengthParameter": "Length"}
+# TTextJustification by index: the corner or edge a text's location names.
+# Mirroring an object flips its texts' justification (left <-> right).
+TEXT_JUSTIFICATIONS = (
+    "bottom_left",
+    "bottom_center",
+    "bottom_right",
+    "center_left",
+    "center",
+    "center_right",
+    "top_left",
+    "top_center",
+    "top_right",
+)
 
 
 def coord_to_mm(value: float) -> float:
@@ -299,10 +312,14 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 name.startswith("LayoutDrawingSymbolModel")
                 and props.get("IsImageParameter") == "T"
             )
+            just = int(props.get("Justification", 0) or 0)
             text = {
                 "x": _coord(props, "Location.X"),
                 "y": _coord(props, "Location.Y"),
                 "hidden": props.get("IsHidden") == "T",
+                "justification": TEXT_JUSTIFICATIONS[just]
+                if 0 <= just < len(TEXT_JUSTIFICATIONS)
+                else str(just),
             }
             # Texts as the script names them (a bundle's length is stored as
             # LengthParameter); a connector's hidden parameters are left out
@@ -348,6 +365,12 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                         "x": _coord(props, "Location.X"),
                         "y": _coord(props, "Location.Y"),
                     }
+
+    # Altium draws a connection point's name by its text's IsHidden; ShowName
+    # is only read when it imports an old drawing
+    for cp in cps.values():
+        if "Designator" in cp["texts"]:
+            cp["show_name"] = not cp["texts"]["Designator"]["hidden"]
 
     # Which connection point holds each connector / splice / no-connect
     by_uid = {c["unique_id"]: c for c in connectors.values()}
@@ -550,9 +573,12 @@ def _text_records(
     known: dict[str, Any] | None = None,
 ) -> list[list[Any]]:
     """TEXT records placing or hiding texts of one object. texts is {name:
-    [x, y] or {"x", "y", "hidden"}} in mils; names as Altium's script names
-    them (Designator, Comment, Length, or a parameter name), any case. known:
-    the object's texts from parse_ldrdoc, to check the names against."""
+    [x, y] or {"x", "y", "hidden", "justification"}} in mils; names as Altium's
+    script names them (Designator, Comment, Length, or a parameter name), any
+    case. A placed text is justified bottom-left (x, y is its bottom-left
+    corner) unless a justification (TEXT_JUSTIFICATIONS) is given: a text
+    mirrored with its owner is otherwise justified right. known: the object's
+    texts from parse_ldrdoc, to check the names against."""
     if not texts:
         return []
     if not isinstance(texts, dict):
@@ -562,17 +588,33 @@ def _text_records(
     records: list[list[Any]] = []
     for name, pos in texts.items():
         name = str(name).strip()
+        just = None
         if isinstance(pos, dict):
             x, y, hidden = pos.get("x"), pos.get("y"), pos.get("hidden")
+            just = pos.get("justification")
         elif isinstance(pos, (list, tuple)) and len(pos) == 2:
             (x, y), hidden = pos, None
         else:
             x = y = hidden = None
-        if not name or (x is None) != (y is None) or (x is None and hidden is None):
+        if (
+            not name
+            or (x is None) != (y is None)
+            or (x is None and hidden is None and just is None)
+        ):
             errors.append(f"{owner}: text '{name}' needs [x, y] or {{x, y, hidden}}")
             continue
         if known is not None and name.lower() not in names:
             errors.append(f"{owner}: no text '{name}' (has {sorted(known)})")
+            continue
+        if just is None:
+            just_id = "" if x is None else 0
+        elif str(just).lower() in TEXT_JUSTIFICATIONS:
+            just_id = TEXT_JUSTIFICATIONS.index(str(just).lower())
+        else:
+            errors.append(
+                f"{owner}: text '{name}': justification must be one of "
+                f"{list(TEXT_JUSTIFICATIONS)}"
+            )
             continue
         records.append(
             [
@@ -582,6 +624,7 @@ def _text_records(
                 "" if x is None else int(x),
                 "" if y is None else int(y),
                 _flag(hidden),
+                just_id,
             ]
         )
     return records
@@ -619,10 +662,12 @@ def build_layout_spec(
     the saved drawing and the requested changes.
 
     Returns {"records": [[field, ...], ...], "errors": [...], "warnings": [...],
-    "expect": {"bundles": {designator: [from_cp, to_cp]}, "views": {connector:
-    view}, "wire_lengths": {wire: mm or None}}}. Records are only usable when
-    errors is empty. Objects are named by designator (or by unique_id when they
-    have none); coordinates are mils, lengths mm.
+    "expect": {"bundles": {bundle uid (new: designator): [from_cp, to_cp]},
+    "views": {connector: view}, "wire_lengths": {wire: mm or None}}}, connection
+    points by UniqueID (new: DES:<designator>). Records are only usable when
+    errors is empty. Objects are named by designator, or by unique_id when they
+    have none or share it with others (unnamed 'B?' bundles): a shared designator
+    is an error; coordinates are mils, lengths mm.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -630,9 +675,47 @@ def build_layout_spec(
     expect_views: dict[str, str] = {}
 
     conns = {c["designator"]: c for c in layout["connectors"]}
-    cps_by_uid = {cp["unique_id"]: cp for cp in layout["connection_points"]}
-    cps = {cp["designator"]: cp for cp in layout["connection_points"]}
-    cps.update({uid: cp for uid, cp in cps_by_uid.items()})
+
+    def shared(items: list[dict[str, Any]]) -> set[str]:
+        """Designators several objects carry (unnamed ones, e.g. 'B?')."""
+        seen: set[str] = set()
+        dup: set[str] = set()
+        for o in items:
+            if o.get("designator"):
+                (dup if o["designator"] in seen else seen).add(o["designator"])
+        return dup
+
+    def keyed(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Objects by UniqueID and by designator, except shared designators."""
+        dup = shared(items)
+        table = {o["unique_id"]: o for o in items}
+        table.update(
+            {
+                o["designator"]: o
+                for o in items
+                if o.get("designator") and o["designator"] not in dup
+            }
+        )
+        return table
+
+    shared_names = set().union(
+        *(
+            shared(layout[kind])
+            for kind in ("connection_points", "bundles", "coverings", "layout_labels")
+        )
+    )
+
+    def ambiguous(name: Any) -> bool:
+        """True, with an error, when name is a designator several objects share."""
+        name = str(name or "").strip()
+        if name in shared_names:
+            errors.append(
+                f"'{name}' names several objects; give the one meant by its unique_id"
+            )
+            return True
+        return False
+
+    cps = keyed(layout["connection_points"])
     # A no-connect at a wire end (a free end, e.g. a loose contact) is held like a splice
     held = {
         o["designator"]: o
@@ -646,23 +729,24 @@ def build_layout_spec(
         obj: cp for cp in layout["connection_points"] for obj in cp.get("objects", [])
     }
 
-    def keyed(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        table = {o["unique_id"]: o for o in items}
-        table.update({o["designator"]: o for o in items if o.get("designator")})
-        return table
-
     existing_bundles = keyed(layout["bundles"])
     existing_coverings = keyed(layout["coverings"])
     existing_labels = keyed(layout["layout_labels"])
 
     def item_key(item: dict[str, Any]) -> str:
-        return str(item.get("designator") or item.get("unique_id") or "").strip()
+        """The designator, or the unique_id when there is none or the
+        designator is shared."""
+        des = str(item.get("designator") or "").strip()
+        uid = str(item.get("unique_id") or "").strip()
+        return uid if uid and (not des or des in shared_names) else des or uid
 
     # Deletions first: what they remove cannot be edited or followed
     deleted: set[str] = set()  # unique ids
     delete_records: list[list[Any]] = []
     for ref in delete or []:
         ref = str(ref).strip()
+        if ambiguous(ref):
+            continue
         obj = (
             existing_bundles.get(ref)
             or existing_coverings.get(ref)
@@ -683,13 +767,13 @@ def build_layout_spec(
         deleted.add(obj["unique_id"])
         delete_records.append(["DELETE", obj["unique_id"]])
 
-    # Final position (mils) of every connection point, by designator
+    # Final position (mils) of every connection point, by UniqueID (new ones:
+    # DES:<designator>, as the script finds them)
     cp_pos: dict[str, tuple[int, int]] = {}
     for cp in layout["connection_points"]:
         if cp["unique_id"] not in deleted:
-            cp_pos[cp["designator"]] = _mils(cp["location"])
+            cp_pos[cp["unique_id"]] = _mils(cp["location"])
     cp_moves: dict[str, dict[str, Any]] = {}  # cp uid -> {x, y, des_x, des_y}
-    renamed: dict[str, str] = {}  # cp designator -> new designator
 
     def move_cp(cp: dict[str, Any], x: int, y: int, des_pos: Any = None) -> None:
         old_x, old_y = _mils(cp["location"])
@@ -704,7 +788,7 @@ def build_layout_spec(
         else:
             dx, dy = x + CP_DESIGNATOR_OFFSET[0], y + CP_DESIGNATOR_OFFSET[1]
         cp_moves[cp["unique_id"]] = {"x": x, "y": y, "des_x": dx, "des_y": dy}
-        cp_pos[cp["designator"]] = (x, y)
+        cp_pos[cp["unique_id"]] = (x, y)
 
     connector_records: list[list[Any]] = []
     text_records: list[list[Any]] = []
@@ -783,6 +867,8 @@ def build_layout_spec(
 
     for item in connection_points or []:
         des = item_key(item)
+        if ambiguous(des):
+            continue
         cp = cps.get(des)
         if cp is not None and cp["unique_id"] in deleted:
             errors.append(f"connection point '{des}' is both edited and deleted")
@@ -818,17 +904,15 @@ def build_layout_spec(
             )
             show = _flag(item.get("show_name"))
             cp_records.append(["CPOINT", "", des, x, y, style_id, show, ori, dx, dy])
-            cp_pos[des] = (x, y)
             ref = f"DES:{des}"
+            cp_pos[ref] = (x, y)
         else:
             if "x" in item or "y" in item or des_pos:
-                cur_x, cur_y = cp_pos[cp["designator"]]
+                cur_x, cur_y = cp_pos[cp["unique_id"]]
                 x, y = int(item.get("x", cur_x)), int(item.get("y", cur_y))
                 move_cp(cp, x, y, des_pos)
             mv = cp_moves.get(cp["unique_id"])
             new_des = str(item.get("new_designator") or "").strip()
-            if new_des:
-                renamed[cp["designator"]] = new_des
             cp_records.append(
                 [
                     "CPOINT",
@@ -903,17 +987,20 @@ def build_layout_spec(
             )
 
     def cp_ref(name: Any) -> str | None:
-        """Designator of the connection point named by a CP designator or
+        """Key in cp_pos of the connection point named by a CP designator or
         UniqueID, or of a connector's own connection point."""
         name = str(name or "").strip()
+        if ambiguous(name):
+            return None
         cp = cps.get(name)
-        if cp is not None:
-            name = cp["designator"]
-        elif name in conns:
-            name = conns[name].get("connection_point") or ""
-        return name if name in cp_pos else None
+        if cp is None and name in conns:
+            cp = cps.get(conns[name].get("connection_point") or "")
+        key = cp["unique_id"] if cp is not None else f"DES:{name}"
+        return key if key in cp_pos else None
 
     bundle_records: list[list[Any]] = []
+    # Ends (connection point keys as in cp_pos) of the bundles the call draws
+    # or moves, by bundle UniqueID (new bundles: designator)
     expect: dict[str, list[str]] = {}
     redrawn: set[str] = set()
     used_names = {b["designator"] for b in layout["bundles"] if b["designator"]}
@@ -921,6 +1008,8 @@ def build_layout_spec(
 
     for item in bundles or []:
         key = item_key(item)
+        if ambiguous(key):
+            continue
         bundle = existing_bundles.get(key) if key else None
         if bundle is not None and bundle["unique_id"] in deleted:
             errors.append(f"bundle '{key}' is both edited and deleted")
@@ -1006,7 +1095,7 @@ def build_layout_spec(
         elif points is not None:
             redrawn.add(bundle["unique_id"])
         if ends:
-            expect[new_des or bundle["designator"] or bundle["unique_id"]] = ends
+            expect[des if bundle is None else bundle["unique_id"]] = ends
         if (
             points is not None
             and len(points) == 4
@@ -1030,15 +1119,13 @@ def build_layout_spec(
                 changed = True
         if changed:
             bundle_records.append(["BUNDLE", uid, "", "", "", "", "", *pts])
-            name = bundle["designator"] or uid
-            expect[name] = [
-                bundle.get("end1_connection_point") or "",
-                bundle.get("end2_connection_point") or "",
-            ]
+            expect[uid] = [bundle.get("end1_uid") or "", bundle.get("end2_uid") or ""]
 
     covering_records: list[list[Any]] = []
     for item in coverings or []:
         key = item_key(item)
+        if ambiguous(key):
+            continue
         cov = existing_coverings.get(key) if key else None
         if cov is not None and cov["unique_id"] in deleted:
             errors.append(f"covering '{key}' is both edited and deleted")
@@ -1047,6 +1134,8 @@ def build_layout_spec(
         if item.get("bundles") is not None:
             refs = []
             for name in item["bundles"]:
+                if ambiguous(name):
+                    continue
                 b = existing_bundles.get(name)
                 if b is not None and b["unique_id"] not in deleted:
                     refs.append(b["unique_id"])
@@ -1088,6 +1177,8 @@ def build_layout_spec(
     label_records: list[list[Any]] = []
     for item in layout_labels or []:
         key = item_key(item)
+        if ambiguous(key):
+            continue
         lbl = existing_labels.get(key) if key else None
         if lbl is not None and lbl["unique_id"] in deleted:
             errors.append(f"layout label '{key}' is both edited and deleted")
@@ -1172,9 +1263,7 @@ def build_layout_spec(
         "errors": errors,
         "warnings": warnings,
         "expect": {
-            "bundles": {
-                name: [renamed.get(e, e) for e in ends] for name, ends in expect.items()
-            },
+            "bundles": expect,
             "views": expect_views,
             "wire_lengths": expect_lengths,
         },
@@ -1189,22 +1278,47 @@ def check_layout(
     """Problems and the state of the expected bundles in a re-read drawing:
     every expected bundle must exist with both ends on the expected connection
     points, and no bundle connected at both ends before the edit (before =
-    parse_ldrdoc output of the drawing then) may have lost an end."""
+    parse_ldrdoc output of the drawing then) may have lost an end.
+
+    expect["bundles"] maps a bundle's UniqueID (or designator) to its ends:
+    connection point UniqueIDs, or DES:<designator> / a designator."""
     problems: list[str] = []
     found: list[dict[str, Any]] = []
+    expected = expect.get("bundles", {})
+    names = [b["designator"] for b in layout["bundles"] if b["designator"]]
+    # Unnamed bundles share a designator ('B?'): name them by UniqueID too
+    dup = {n for n in names if names.count(n) > 1}
     bundles = {b["unique_id"]: b for b in layout["bundles"]}
-    bundles.update({b["designator"]: b for b in layout["bundles"] if b["designator"]})
+    bundles.update(
+        {b["designator"]: b for b in layout["bundles"] if b["designator"] not in dup}
+    )
+    cp_names = {
+        cp["unique_id"]: cp["designator"] for cp in layout.get("connection_points", [])
+    }
+
+    def label(b: dict[str, Any]) -> str:
+        des = b["designator"]
+        return f"{des} ({b['unique_id']})" if not des or des in dup else des
+
+    def end_name(ref: str) -> str:
+        return cp_names.get(ref) or ref.removeprefix("DES:")
+
+    def same_end(ref: str, uid: Any, name: Any) -> bool:
+        return ref == uid or ref.removeprefix("DES:") == name
+
     for old in (before or {}).get("bundles", []):
         b = bundles.get(old["unique_id"])
-        name = old["designator"] or old["unique_id"]
         if (
             b is not None
-            and name not in expect.get("bundles", {})
+            and old["unique_id"] not in expected
+            and (old["designator"] in dup or old["designator"] not in expected)
             and old.get("end1_connection_point")
             and old.get("end2_connection_point")
             and not (b.get("end1_connection_point") and b.get("end2_connection_point"))
         ):
-            problems.append(f"bundle {name}: lost its connection to a connection point")
+            problems.append(
+                f"bundle {label(b)}: lost its connection to a connection point"
+            )
     wired = {w.get(end) for w in layout.get("wires", []) for end in ("end1", "end2")}
     for c in layout["connectors"]:
         loose = [
@@ -1215,21 +1329,29 @@ def check_layout(
                 f"connector {c['designator']}: wired pins {', '.join(loose)} are held "
                 "by no connection point (their wires cannot be routed)"
             )
-    for name, ends in expect.get("bundles", {}).items():
-        b = bundles.get(name)
+    for key, ends in expected.items():
+        b = bundles.get(key)
         if b is None:
-            problems.append(f"bundle {name}: not in the saved drawing")
+            problems.append(f"bundle {key}: not in the saved drawing")
             continue
         got = [b.get("end1_connection_point"), b.get("end2_connection_point")]
+        uids = [b.get("end1_uid"), b.get("end2_uid")]
         if None in got:
             problems.append(
-                f"bundle {name}: end not connected to a connection point ({got})"
+                f"bundle {label(b)}: end not connected to a connection point ({got})"
             )
-        elif all(ends) and sorted(got) != sorted(ends):
-            problems.append(f"bundle {name}: connects {got}, expected {ends}")
+        elif all(ends) and not any(
+            same_end(ends[0], uids[i], got[i])
+            and same_end(ends[1], uids[1 - i], got[1 - i])
+            for i in (0, 1)
+        ):
+            problems.append(
+                f"bundle {label(b)}: connects {got}, "
+                f"expected {[end_name(e) for e in ends]}"
+            )
         found.append(
             {
-                "designator": b["designator"] or b["unique_id"],
+                "designator": label(b),
                 "from": got[0],
                 "to": got[1],
                 "length_mm": b["length"]["mm"],

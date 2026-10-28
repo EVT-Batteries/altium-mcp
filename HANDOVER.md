@@ -1,6 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-28 (session 13: copy objects between wiring diagrams) for a fresh agent session.
+Updated 2026-10-28 (session 14: layout text justification, connection point names) for a fresh
+agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -26,16 +27,52 @@ cannot place a harness connector from a desktop DbLib. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `a29063e` (sessions 10-13 committed) | this file, `dev/SHEET_DUPLICATION.md`, dev skill |
+| `altium-mcp/` | `feature/harness-support` | `a29063e` (sessions 10-13 committed) | session 14: `schematic_utils.pas`, `harness_layout.py`, `main.py`, `tests/test_harness_layout.py`, this file, `references/wirdoc-format.md` |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
-`a29063e`. Unit tests: 155 passed, 7 skipped, 13 pre-existing failures (§8 item 2).
+`a29063e`. Unit tests: 158 passed, 7 skipped, 13 pre-existing failures (§8 item 2).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (uncommitted)
+Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
+- **`show_name` on a connection point now hides / shows its name.** Altium draws the name by
+  its Designator text's `IsHidden`; `ShowName` is only read when it imports an old drawing
+  (decompiled `SchHarnessLayoutConnectionPoint.HandleAfterImportEvent`). `CPOINT` sets both;
+  `parse_ldrdoc` reports `show_name` from the text (it reported `ShowName`, so a shown name
+  read as hidden).
+- **Texts keep a justification, and mirroring flips it** (`SchLabel.Mirror` ->
+  `MirrorJustification`): a bundle length placed while a mirrored lug sat on its connection point
+  became bottom-right, so `[x, y]` named its right end and the text overlapped its neighbour.
+  A placed text is now set bottom-left (what the docs promised) unless `texts` gives
+  `"justification"` (9 names, `TEXT_JUSTIFICATIONS`); `TEXT` record field 6, Pascal
+  `PlaceChildText(..., Just)`. `get_harness_data` reports each text's `justification`.
+  `IsMirrored` alone does not flip the glyphs and is left as it is.
+- Verified on the renamed scratch copy `hvt\MCP_Test_HV` (§7) with `call_tool.py`: raw records
+  and `parse_ldrdoc` read back as intended (CP_X1 shown, CP1 hidden, B14 length J 2 -> 0, B15
+  kept bottom-right on request, B13 name centred), no wire unrouted, real files untouched. Not
+  re-checked by screenshot then (the user was working in Altium); after the IDE restart the
+  MCP daemon reported `justification` / `show_name` from the new code and a screenshot showed
+  B14's length starting at its anchor, B15's ending there, CP_X1 named and CP1 not.
+- **Unnamed objects sharing a designator ('B?', 'CP?') are told apart by UniqueID.**
+  `edit_harness_layout` keyed connection point positions and the bundles it checks after the
+  call by designator, so of 22 bundles all named `B?` it checked one arbitrary bundle against
+  another's ends (false `problems`, `success: false` on the HV layout), and naming a 'CP?'
+  by unique_id in `from` / `to` or moving one could use another 'CP?''s position. Now
+  `cp_pos` and `expect["bundles"]` are keyed by UniqueID (new objects: `DES:<designator>`),
+  `check_layout` compares bundle ends by UniqueID and labels shared names `B? (<uid>)`, and an
+  item, `from` / `to`, covering bundle or delete naming a shared designator is an error
+  ("give the one meant by its unique_id"); with `unique_id` given too the uid is used.
+  Re-ran the HV lug swap on the scratch copy (`hvt\MCP_Test_HV.pre.LdrDoc` = the layout
+  before, `hvt\t2.json`): `success: true`, 12 bundles checked one by one, no problems, no
+  unrouted wire (the same call had reported a false problem). Test
+  `test_unnamed_objects_sharing_a_designator`; `expect` assertions now by UniqueID.
+- Tests `test_justification`, `TestParseTexts`, `test_unnamed_objects_sharing_a_designator`;
+  suite 158 passed, same 13 pre-existing failures.
 
 ### Session 13 (2026-10-27/28): copy objects between wiring diagrams (`a29063e`)
 - **`add_harness_wiring(copy_objects=[...])`**: copies onto the target every object the source
@@ -597,6 +634,10 @@ needed)
   `cp\MCP_Test_CopySrc.WirDoc` / `cp\MCP_Test_CopyDst(.orig).WirDoc` (scratch project for
   `copy_objects`; the user closes it in Altium), `cp\copy_test.json` / `cp\wires_test.json`
   (`call_tool.py` kwargs), `cp\uids.py` (UniqueIds shared by two sheets).
+- Session 14, same scratchpad: `hvt\MCP_Test_HV.*` (renamed copy of the HV harness project,
+  `MCP_Test_HV.orig.LdrDoc` untouched; open in Altium, the user closes it), `hvt\t1.json`
+  (`call_tool.py` kwargs), `hvt\readback.py` (raw text records + `parse_ldrdoc` of chosen
+  objects), `raw_texts.py` (texts with a non-default justification).
 
 ## 8. Next steps
 Announce "using Altium now" / "Altium free" around live tests; a desktop screenshot tells
@@ -626,7 +667,7 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 155 passed, 7 skipped, 13 pre-existing failures (§3)
+# unit tests (altium-mcp root) - 158 passed, 7 skipped, 13 pre-existing failures (§3)
 cd C:\evt_gits\electrical-p42c-1\altium-mcp
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py

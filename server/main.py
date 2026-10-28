@@ -3082,7 +3082,9 @@ async def edit_harness_layout(
     labels and wire lengths.
 
     Objects are named by designator (unnamed ones by the unique_id get_harness_data reports)
-    and edited in place, so their links to the wiring diagram survive. Coordinates are true
+    and edited in place, so their links to the wiring diagram survive. A designator several
+    objects share (unannotated "B?" bundles, "CP?" points) is refused: give "unique_id"
+    (with or without the designator). Coordinates are true
     mils (get_harness_data reports DXP units: x 10), lengths mm, orientations degrees
     (0, 90, 180, 270). Omitted fields keep their value.
 
@@ -3117,7 +3119,8 @@ async def edit_harness_layout(
             [{"designator": "CP1", "x": 12000, "y": 12000, "style": "circle",
               "show_name": True, "orientation": 0, "objects": ["SP1"],
               "designator_pos": [12200, 12400]}].
-            style is "circle", "square" or "insulator". "objects" are connectors, splices or
+            style is "circle", "square" or "insulator". show_name shows or hides the
+            name (its Designator text). "objects" are connectors, splices or
             no-connects (a free wire end) to hold here (taken from the connection point holding
             them); "release" removes held ones; "new_designator" renames. A wire is routed
             through the bundles between the connection points holding its two ends, so every
@@ -3153,10 +3156,14 @@ async def edit_harness_layout(
     Texts: every connector, connection point, bundle, covering and layout label takes
     "texts" to place or hide its texts, e.g. {"designator": "B1", "texts": {"designator":
     [3500, 15030], "length": [3380, 14880], "comment": {"hidden": True}}}: name -> [x, y]
-    (mils, the text's bottom-left corner) or {"x", "y", "hidden"}. Names are Altium's
-    (Designator, Comment, a bundle's Length, or a parameter name such as a connector's
-    PartNumber, shown with "hidden": False), any case. Positions are absolute and applied
-    after the call's moves. get_harness_data reports each object's texts (DXP units).
+    (mils, the text's bottom-left corner) or {"x", "y", "hidden", "justification"}. Names
+    are Altium's (Designator, Comment, a bundle's Length, or a parameter name such as a
+    connector's PartNumber, shown with "hidden": False), any case. Positions are absolute
+    and applied after the call's moves. A placed text is justified bottom-left, so x, y is
+    its bottom-left corner, unless "justification" names the corner or edge x, y is:
+    bottom_left, bottom_center, bottom_right, center_left, center, center_right, top_left,
+    top_center or top_right (mirroring an object turns its texts' left into right).
+    get_harness_data reports each object's texts (DXP units) with their justification.
 
     Altium routes a wire through the bundles only from pins a connection point holds by
     UniqueID. An update from the library, and Altium's own import, give pins new UniqueIDs
@@ -5552,7 +5559,9 @@ async def get_harness_data(
     points of the two ends, routed_length), unrouted_wires, splices, twists and
     no_connects. Every connector, connection point, bundle, covering and label lists its
     texts (designator, comment, a bundle's length; a connector's shown parameters) with
-    position and hidden flag. Edit it with edit_harness_layout.
+    position, hidden flag and justification (the corner or edge the position names); a
+    connection point's show_name is whether its Designator text is shown. Edit it with
+    edit_harness_layout.
 
     A full wiring diagram can be very large; use summary_only or designators to keep
     the answer small.

@@ -23,6 +23,7 @@ from harness_layout import (
     check_layout,
     coord_to_mm,
     mm_to_coord,
+    parse_ldrdoc,
 )
 
 
@@ -216,8 +217,10 @@ class TestBuildLayoutSpec(unittest.TestCase):
         # unnamed new bundle gets the next free B<n>; a connector means its CP
         self.assertEqual(b3[2], "B3")
         self.assertEqual(b3[7:], [16000, 12000, 16000, 12000, 20000, 12000])
+        # ends by UniqueID; a connection point created in the call by DES:<name>
         self.assertEqual(
-            spec["expect"]["bundles"], {"B2": ["CP1", "CP2"], "B3": ["CP2", "CP_P1"]}
+            spec["expect"]["bundles"],
+            {"B2": ["UCP1", "DES:CP2"], "B3": ["DES:CP2", "UCPP1"]},
         )
 
     def test_moving_a_connection_point_moves_its_bundle_ends(self):
@@ -233,7 +236,7 @@ class TestBuildLayoutSpec(unittest.TestCase):
         (b1,) = records_of(spec, "BUNDLE")
         self.assertEqual(b1[1], "UB1")
         self.assertEqual(b1[7:], [10000, 10000, 13000, 10000, 13000, 12000])
-        self.assertEqual(spec["expect"]["bundles"], {"B1": ["CP_J1", "CP1"]})
+        self.assertEqual(spec["expect"]["bundles"], {"UB1": ["UCPJ1", "UCP1"]})
 
     def test_property_edit_still_follows_moved_ends(self):
         # A bundle named only for a property change must still follow its
@@ -378,6 +381,64 @@ class TestBuildLayoutSpec(unittest.TestCase):
             "'XYZ'",
         ):
             self.assertIn(part, text)
+
+    def test_unnamed_objects_sharing_a_designator(self):
+        # Two unannotated bundles 'B?' between two unannotated points 'CP?'
+        layout = make_layout()
+        layout["connection_points"] += [
+            _cp("CP?", "UQ1", 3000, 1000, bundles=["B?"]),
+            _cp("CP?", "UQ2", 3000, 2000, bundles=["B?"]),
+        ]
+        layout["bundles"] += [
+            _bundle("B?", "UX1", [3000, 1000, 3000, 2000], "UQ1", "UQ2", "CP?", "CP?"),
+            _bundle("B?", "UX2", [3000, 2000, 1200, 1200], "UQ2", "UCP1", "CP?", "CP1"),
+        ]
+        # by designator: refused, nothing guessed
+        spec = build_layout_spec(
+            layout,
+            bundles=[{"designator": "B?", "new_designator": "B7"}],
+            connection_points=[{"designator": "CP?", "x": 1}],
+        )
+        self.assertEqual(len(spec["errors"]), 2)
+        text = " ".join(spec["errors"])
+        self.assertIn("'B?' names several objects", text)
+        self.assertIn("'CP?' names several objects", text)
+        self.assertEqual(records_of(spec, "BUNDLE") + records_of(spec, "CPOINT"), [])
+        # by unique_id: each one, at its own position; expectations by UniqueID
+        spec = build_layout_spec(
+            layout,
+            connection_points=[{"unique_id": "UQ2", "designator": "CP?", "x": 31000}],
+            bundles=[{"unique_id": "UX1", "new_designator": "B7"}],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(
+            records_of(spec, "CPOINT")[0][:5], ["CPOINT", "UQ2", "", 31000, 20000]
+        )
+        moved = {r[1]: r[7:] for r in records_of(spec, "BUNDLE") if r[7:]}
+        # both bundles on the moved point follow it (it used to move CP?'s last)
+        self.assertEqual(
+            moved,
+            {
+                "UX1": [30000, 10000, 31000, 20000],
+                "UX2": [31000, 20000, 12000, 12000],
+            },
+        )
+        self.assertEqual(
+            spec["expect"]["bundles"], {"UX1": ["UQ1", "UQ2"], "UX2": ["UQ2", "UCP1"]}
+        )
+        # the re-read check tells the two 'B?' apart (it compared the wrong one)
+        problems, found = check_layout(layout, spec["expect"])
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            sorted(f["designator"] for f in found), ["B? (UX1)", "B? (UX2)"]
+        )
+        layout["bundles"][-1]["end2_uid"] = "UCPJ1"
+        layout["bundles"][-1]["end2_connection_point"] = "CP_J1"
+        problems, _ = check_layout(layout, spec["expect"])
+        self.assertEqual(
+            problems,
+            ["bundle B? (UX2): connects ['CP?', 'CP_J1'], expected ['CP?', 'CP1']"],
+        )
 
     def test_orientation_must_be_quarter_turns(self):
         spec = build_layout_spec(
@@ -555,16 +616,17 @@ class TestTexts(unittest.TestCase):
         )
         self.assertEqual(spec["errors"], [])
         texts = records_of(spec, "TEXT")
+        # placed texts are justified bottom-left (0): x, y is that corner
         self.assertEqual(
             texts,
             [
-                ["TEXT", "UJ1", "designator", 8000, 11000, ""],
-                ["TEXT", "UCP1", "Designator", 12000, 12500, ""],
-                ["TEXT", "UB1", "Length", 11000, 9800, ""],
-                ["TEXT", "UB1", "Comment", "", "", "1"],
-                ["TEXT", "UB1", "Designator", 11000, 10050, "0"],
+                ["TEXT", "UJ1", "designator", 8000, 11000, "", 0],
+                ["TEXT", "UCP1", "Designator", 12000, 12500, "", 0],
+                ["TEXT", "UB1", "Length", 11000, 9800, "", 0],
+                ["TEXT", "UB1", "Comment", "", "", "1", ""],
+                ["TEXT", "UB1", "Designator", 11000, 10050, "0", 0],
                 # a bundle created in the same call is found by its designator
-                ["TEXT", "DES:B2", "designator", 15000, 10050, ""],
+                ["TEXT", "DES:B2", "designator", 15000, 10050, "", 0],
             ],
         )
         # after the connector move (which carries its texts along)
@@ -585,6 +647,77 @@ class TestTexts(unittest.TestCase):
         self.assertIn("needs [x, y]", spec["errors"][1])
         self.assertIn("needs [x, y]", spec["errors"][2])
         self.assertIn("texts must be", spec["errors"][3])
+
+    def test_justification(self):
+        spec = build_layout_spec(
+            self.layout,
+            bundles=[
+                {
+                    "designator": "B1",
+                    "texts": {
+                        "Length": {"x": 1, "y": 2, "justification": "Bottom_Right"},
+                        "Comment": {"justification": "center"},
+                    },
+                }
+            ],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(
+            records_of(spec, "TEXT"),
+            [
+                ["TEXT", "UB1", "Length", 1, 2, "", 2],
+                ["TEXT", "UB1", "Comment", "", "", "", 4],
+            ],
+        )
+        spec = build_layout_spec(
+            self.layout,
+            bundles=[
+                {"designator": "B1", "texts": {"Length": {"justification": "up"}}}
+            ],
+        )
+        self.assertEqual(len(spec["errors"]), 1)
+        self.assertIn("justification must be one of", spec["errors"][0])
+
+
+class TestParseTexts(unittest.TestCase):
+    """parse_ldrdoc reports text justification, and a connection point's
+    show_name as Altium draws it (its Designator text), not its ShowName."""
+
+    def parse(self, records):
+        with (
+            patch("harness_layout.extract_ole_records", return_value=[{}, *records]),
+            patch("harness_layout.read_connection_point_streams", return_value={}),
+        ):
+            return parse_ldrdoc("x.LdrDoc")
+
+    def test_justification_and_show_name(self):
+        layout = self.parse(
+            [
+                {"RECORD": "110", "UniqueID": "UCP1", "ShowName": "F"},
+                {
+                    "RECORD": "34",
+                    "OwnerIndex": "0",
+                    "Name": "Designator",
+                    "Text": "CP1",
+                    "Location.X": "10",
+                    "Location.Y": "20",
+                },
+                {"RECORD": "110", "UniqueID": "UCP2", "ShowName": "T"},
+                {
+                    "RECORD": "34",
+                    "OwnerIndex": "2",
+                    "Name": "Designator",
+                    "Text": "CP2",
+                    "IsHidden": "T",
+                    "Justification": "2",
+                },
+            ]
+        )
+        cp1, cp2 = layout["connection_points"]
+        self.assertTrue(cp1["show_name"])
+        self.assertFalse(cp2["show_name"])
+        self.assertEqual(cp1["texts"]["Designator"]["justification"], "bottom_left")
+        self.assertEqual(cp2["texts"]["Designator"]["justification"], "bottom_right")
 
 
 class TestCheckLayout(unittest.TestCase):

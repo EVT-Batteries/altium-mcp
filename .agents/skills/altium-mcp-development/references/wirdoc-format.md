@@ -110,7 +110,7 @@ harness project first so the drawing has its wiring diagram. Document ObjectId 8
 |---|---|---|---|
 | 106 (top-level) | 81 | connector | `Location`, `Orientation` (0-3), `IsMirrored`, `WiringDiagramOriginUniqueId`; child 41 `LayoutDrawingSymbolModel<n>` (`IsImageParameter=T`, `Text` = `ViewName=..\|ViewType=ePhysicalView\|ViewSide\|Rotation\|Zoom\|MainModel=True..`) + child 30 image |
 | 113 | - | pin | `WiringDiagramOriginUniqueId`, `ConnectedWireUniqueId<n>` |
-| 110 | 85 | connection point | `Location`, `Orientation`, `Style` (0 circle, 1 square, 2 insulator), `ShowName`, `ConnectedBundleUniqueId<n>`; designator = child 34 |
+| 110 | 85 | connection point | `Location`, `Orientation`, `Style` (0 circle, 1 square, 2 insulator), `ShowName` (only read when Altium imports an old drawing; the name shows by the designator's `IsHidden`), `ConnectedBundleUniqueId<n>`; designator = child 34 |
 | 111 | 86 | bundle | `LocationCount`, `X<i>`/`Y<i>`, `LineWidth`, `LengthLong`, `DrawnLength`, `IsLengthSetManually`, `ShowBreakSymbol`, `EndVertex1/2ConnectedObjectUniqueID` (CP uids); children 34 designator, 41 Comment, 41 `LengthParameter` (the length text, "58.42mm" on the sheet; `Text` = length in coords; script name `Length`), 41 Description (hidden) |
 | 128 | 104 | covering | `Thickness`, `PhysicalStartDistance`, `PhysicalEndDistance`, `PhysicalLength`, `CoveredItemsCount`, `CoveredItemId<i>` (0-based), `DesignItemId`, `SourceLibraryName`; child 34 |
 | 109 | 84 | layout label | `Location`, `Text`, `Alignment`, `Orientation`, `ShowOnlyFirstLine`, `DesignItemId`; child 34 |
@@ -146,6 +146,13 @@ its first vertex, so after a fresh draw the lengths pile up on the connection po
 connector's designator and comment can come in far outside the sheet (J1 at -1694, 2354 after
 the import). Sheet font 1 (Times New Roman 10) is about 5 DXP units wide per character and 7
 tall.
+
+`Location` is the corner or edge named by the text's `Justification` (0 bottom-left ... 8
+top-right, written only when not 0). Mirroring an object flips its texts' `IsMirrored` and
+their justification left <-> right (`SchLabel.Mirror`), so a text placed while its owner (or a
+mirrored lug on a bundle's connection point) was mirrored can be bottom-right: its location is
+then its right end. `IsMirrored` alone does not mirror the glyphs. `edit_harness_layout` sets a
+placed text bottom-left unless told otherwise (session 14).
 
 Gotchas found:
 - **Bundle ends connect to connection points by position, and only when Altium loads the
