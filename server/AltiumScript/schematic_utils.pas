@@ -2678,6 +2678,149 @@ begin
     Pin.AddItem(CavType, Part);
 end;
 
+// A fresh UniqueId in the 8-letter form Altium gives new objects.
+function NewSchUniqueId: String;
+var
+    k : Integer;
+begin
+    Result := '';
+    for k := 1 to 8 do
+        Result := Result + Chr(Ord('A') + Random(26));
+end;
+
+// Gives Obj and every object it holds (pins, parameters, texts) fresh
+// UniqueIds. Replicate keeps the originals, so a copy would share its pins'
+// ids with the source sheet (wires and layout drawings link pins by them).
+procedure RenewUniqueIds(Obj: ISch_BasicContainer);
+var
+    Queue : TList;
+    Cur   : ISch_BasicContainer;
+    Child : ISch_BasicContainer;
+    Iter  : ISch_Iterator;
+begin
+    Queue := TList.Create;
+    try
+        Queue.Add(Obj);
+        while (Queue.Count > 0) do
+        begin
+            Cur := Queue[0];
+            Queue.Delete(0);
+            Cur.SetState_UniqueId(NewSchUniqueId);
+            Iter := Cur.SchIterator_Create;
+            Child := Iter.FirstSchObject;
+            while (Child <> nil) do
+            begin
+                if (Queue.IndexOf(Child) < 0) then
+                    Queue.Add(Child);
+                Child := Iter.NextSchObject;
+            end;
+            Cur.SchIterator_Destroy(Iter);
+        end;
+    finally
+        Queue.Free;
+    end;
+end;
+
+// Copies onto Doc every object the sheet SrcPath owns whose bounding box lies
+// inside X1, Y1 - X2, Y2 (mils), moved by DX, DY (mils), as copy / paste in
+// Altium would. Exclude lists ObjectIds to leave out (',82,83,'). Copied
+// connectors, wires and splices named in DesOld get the DesNew name at the
+// same index; texts and notes get TxtOld -> TxtNew replaced. The source must
+// be a wiring diagram of an open harness project (alone it opens empty).
+// Returns the number of objects copied.
+function CopyHarnessObjects(Doc: ISch_Document; SrcPath: String;
+    X1, Y1, X2, Y2, DX, DY: Integer; Exclude: String;
+    DesOld, DesNew, TxtOld, TxtNew, Misses: TStringList): Integer;
+var
+    SrcServer : IServerDocument;
+    Src       : ISch_Document;
+    Iter      : ISch_Iterator;
+    Obj       : ISch_GraphicalObject;
+    Rep       : ISch_GraphicalObject;
+    Owner     : ISch_BasicContainer;
+    Objs      : TList;
+    R         : TCoordRect;
+    j, k      : Integer;
+    OwnerId   : Integer;
+    T         : String;
+begin
+    Result := 0;
+    Src := nil;
+    SrcServer := FindOpenDocument(SrcPath);
+    if (SrcServer = nil) then
+        SrcServer := Client.OpenDocument('HarnessWiringDiagram', SrcPath);
+    if (SrcServer <> nil) then
+        Src := SchServer.GetSchDocumentByPath(SrcPath);
+    if (Src = nil) or (NormalizedPath(Src.DocumentName) <> NormalizedPath(SrcPath)) then
+    begin
+        Misses.Add('copy_source:' + SrcPath);
+        Exit;
+    end;
+
+    Randomize;
+    Objs := TList.Create;
+    try
+        // Collect first: the source may be Doc itself
+        Iter := Src.SchIterator_Create;
+        Obj := Iter.FirstSchObject;
+        while (Obj <> nil) do
+        begin
+            Owner := Obj.Container;
+            OwnerId := -1;
+            if (Owner <> nil) then OwnerId := Owner.ObjectId;
+            // Only what the sheet itself owns (the iterator recurses into
+            // components); never its template (42) or document parameters (27)
+            if (OwnerId = Src.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) and
+               (Pos(',' + IntToStr(Obj.ObjectId) + ',', ',' + Exclude + ',') = 0) then
+            begin
+                R := Obj.BoundingRectangle;
+                if (R.Left >= MilsToCoord(X1)) and (R.Bottom >= MilsToCoord(Y1)) and
+                   (R.Right <= MilsToCoord(X2)) and (R.Top <= MilsToCoord(Y2)) then
+                    Objs.Add(Obj);
+            end;
+            Obj := Iter.NextSchObject;
+        end;
+        Src.SchIterator_Destroy(Iter);
+
+        for j := 0 to Objs.Count - 1 do
+        begin
+            Obj := Objs[j];
+            Rep := Obj.Replicate;
+            if (Rep = nil) then
+                Misses.Add('copy:' + Obj.UniqueId)
+            else
+            begin
+                RenewUniqueIds(Rep);
+                Rep.MoveByXY(MilsToCoord(DX), MilsToCoord(DY));
+                if (Rep.ObjectId = 81) or (Rep.ObjectId = 82) or (Rep.ObjectId = 83) then
+                begin
+                    if (Rep.Designator <> nil) then
+                    begin
+                        k := DesOld.IndexOf(Rep.Designator.Text);
+                        if (k >= 0) then
+                            Rep.Designator.Text := DesNew[k];
+                    end;
+                end
+                else if (Rep.ObjectId = 22) or (Rep.ObjectId = 2) or (Rep.ObjectId = 13) then
+                begin
+                    T := Rep.Text;
+                    for k := 0 to TxtOld.Count - 1 do
+                        T := StringReplace(T, TxtOld[k], TxtNew[k], REPLACEALL);
+                    if (T <> Rep.Text) then
+                        Rep.Text := T;
+                end;
+                Doc.RegisterSchObjectInContainer(Rep);
+                SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+                    SCHM_PrimitiveRegistration, Rep.I_ObjectAddress);
+                Rep.GraphicallyInvalidate;
+                Result := Result + 1;
+            end;
+        end;
+    finally
+        Objs.Free;
+    end;
+end;
+
 // Add wires, splices, no-connect directives, and net labels to the current wiring diagram or schematic
 function ExecuteAddHarnessWiring(ROOT_DIR: String; SpecPath: String): String;
 var
@@ -2767,6 +2910,11 @@ var
     BreaksUpdated : Integer;
     KindCount     : Integer;
     ForceReload   : Boolean;
+    CopyCount     : Integer;
+    CopyDesOld    : TStringList;
+    CopyDesNew    : TStringList;
+    CopyTxtOld    : TStringList;
+    CopyTxtNew    : TStringList;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
@@ -2779,12 +2927,17 @@ begin
     Spec := TStringList.Create;
     Misses := TStringList.Create;
     Cleared := TStringList.Create;
+    CopyDesOld := TStringList.Create;
+    CopyDesNew := TStringList.Create;
+    CopyTxtOld := TStringList.Create;
+    CopyTxtNew := TStringList.Create;
     try
         Spec.LoadFromFile(SpecPath);
         TargetDoc := nil;
         ServerDoc := nil;
         TargetDocPath := '';
         ClearExisting := False;
+        CopyCount := 0;
 
         for i := 0 to Spec.Count - 1 do
         begin
@@ -2903,6 +3056,37 @@ begin
                 TargetDoc.SheetStyle := StrToInt(SpecField(Rec, 1));
                 SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
                 TargetDoc.GraphicallyInvalidate;
+            end
+            else if (Kind = 'COPYDES') then
+            begin
+                // COPYDES|<old designator>|<new designator> - for the next COPYFROM
+                CopyDesOld.Add(SpecField(Rec, 1));
+                CopyDesNew.Add(SpecField(Rec, 2));
+            end
+            else if (Kind = 'COPYTEXT') then
+            begin
+                // COPYTEXT|<old text>|<new text> - for the next COPYFROM
+                CopyTxtOld.Add(SpecField(Rec, 1));
+                CopyTxtNew.Add(SpecField(Rec, 2));
+            end
+            else if (Kind = 'COPYFROM') then
+            begin
+                // COPYFROM|<source path>|x1|y1|x2|y2|dx|dy|<excluded ObjectIds, comma-separated>
+                j := CopyHarnessObjects(TargetDoc,
+                    StringReplace(SpecField(Rec, 1), '/', '\', REPLACEALL),
+                    StrToInt(SpecField(Rec, 2)), StrToInt(SpecField(Rec, 3)),
+                    StrToInt(SpecField(Rec, 4)), StrToInt(SpecField(Rec, 5)),
+                    StrToInt(SpecField(Rec, 6)), StrToInt(SpecField(Rec, 7)),
+                    SpecField(Rec, 8), CopyDesOld, CopyDesNew, CopyTxtOld, CopyTxtNew, Misses);
+                if (j = 0) then
+                    Misses.Add('copy_region:' + SpecField(Rec, 1))
+                else
+                    GeoChanged := True;
+                CopyCount := CopyCount + j;
+                CopyDesOld.Clear;
+                CopyDesNew.Clear;
+                CopyTxtOld.Clear;
+                CopyTxtNew.Clear;
             end
             else if (Kind = 'CONNECTOR') then
             begin
@@ -3861,8 +4045,13 @@ begin
                   ', "labels": ' + IntToStr(NetCount) +
                   ', "parts": ' + IntToStr(PartCount) +
                   ', "rectangles": ' + IntToStr(RectCount) +
+                  ', "copied": ' + IntToStr(CopyCount) +
                   ', "not_found": [' + InfoStr + ']}';
     finally
+        CopyTxtNew.Free;
+        CopyTxtOld.Free;
+        CopyDesNew.Free;
+        CopyDesOld.Free;
         Cleared.Free;
         Misses.Free;
         Spec.Free;

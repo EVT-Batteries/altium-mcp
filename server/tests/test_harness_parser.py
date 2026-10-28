@@ -725,6 +725,49 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         # Renames come before records that address the new designators
         self.assertGreater(lines.index("UPDATE_WIREPARAM|W1|PartNumber|X"), 3)
 
+    async def test_add_harness_wiring_copy_objects(self):
+        """A copy serialises its renames and text replacements before its
+        COPYFROM (normalised region, wiring excluded by default), and comes
+        before connector moves and wires, which may use the copies."""
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        src = str(Path(r"C:\test\src.WirDoc").resolve())
+        await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            connectors=[{"designator": "X7", "x": 100, "y": 200}],
+            wires=[{"designator": "W8", "net": "N", "points": [0, 0, 100, 0]}],
+            copy_objects=[
+                {"source": r"C:\test\src.WirDoc", "region": [900, 800, 100, 50],
+                 "offset": [-10, 20], "designators": {"X1": "X7"},
+                 "replace_text": {"#1": "#2|", "": "ignored"}},
+                {"source": r"C:\test\src.WirDoc", "region": [0, 0, 10, 10],
+                 "include_wiring": True},
+            ],
+        )
+        lines = read_altium_text(self.spec_file).splitlines()
+        first = lines.index("COPYDES|X1|X7")
+        self.assertEqual(lines[first + 1], "COPYTEXT|#1|#2%7C")
+        self.assertEqual(
+            lines[first + 2], f"COPYFROM|{src}|100|50|900|800|-10|20|82,83,94,92,93,98,106"
+        )
+        self.assertEqual(lines[first + 3], f"COPYFROM|{src}|0|0|10|10|0|0|")
+        self.assertLess(first + 3, lines.index("CONNECTOR|X7|100|200"))
+        self.assertLess(first + 3, next(i for i, ln in enumerate(lines) if ln.startswith("WIRE|")))
+
+    async def test_add_harness_wiring_copy_objects_malformed(self):
+        import main
+        raw = await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            copy_objects=[{"source": r"C:\test\src.WirDoc", "region": [0, 0, 10]}],
+        )
+        data = json.loads(raw)
+        self.assertFalse(data["success"])
+        self.assertIn("region", data["error"])
+        self.mock_bridge.assert_not_called()
+
     async def test_add_harness_wiring_kinds_visibility_breaks(self):
         """Wire component kind and parameter visibility, wire break direction
         (orientation from the wire ending there), part-only renames and

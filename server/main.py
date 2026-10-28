@@ -2335,6 +2335,49 @@ def _wire_extra_lines(des: str, item: dict) -> list[str]:
     return lines
 
 
+# ObjectIds of the harness connectivity objects copy_objects leaves out unless
+# include_wiring is set: wires, splices, no-connects, twists, shields, cables
+# and wire breaks
+WIRING_OBJECT_IDS = (82, 83, 94, 92, 93, 98, 106)
+
+
+def _copy_object_lines(copies: list | None) -> list[str]:
+    """COPYDES / COPYTEXT / COPYFROM records for copy_objects. The renames and
+    text replacements of a copy come before its COPYFROM, which uses them up.
+    Raises ValueError on a malformed entry."""
+    lines = []
+    for c in copies or []:
+        source = str(c.get("source", "")).strip()
+        region = c.get("region") or []
+        offset = c.get("offset") or [0, 0]
+        if not source or len(region) != 4 or len(offset) != 2:
+            raise ValueError(
+                "copy_objects entries need source, region [x1, y1, x2, y2] and "
+                f"offset [dx, dy] (mils): {c}"
+            )
+        x1, y1, x2, y2 = (int(v) for v in region)
+        for old, new in (c.get("designators") or {}).items():
+            lines.append(_spec_line("COPYDES", str(old).strip(), str(new).strip()))
+        for old, new in (c.get("replace_text") or {}).items():
+            if str(old):
+                lines.append(_spec_line("COPYTEXT", str(old), str(new)))
+        exclude = "" if c.get("include_wiring") else ",".join(map(str, WIRING_OBJECT_IDS))
+        lines.append(
+            _spec_line(
+                "COPYFROM",
+                Path(source).resolve(),
+                min(x1, x2),
+                min(y1, y2),
+                max(x1, x2),
+                max(y1, y2),
+                int(offset[0]),
+                int(offset[1]),
+                exclude,
+            )
+        )
+    return lines
+
+
 def _wire_break_orientation(
     x: int, y: int, document_path: str, new_wires: list | None
 ) -> int | None:
@@ -2444,6 +2487,7 @@ async def add_harness_wiring(
     relink: bool = False,
     designator_updates: list | None = None,
     clear_hidden_cavity_parts: list | None = None,
+    copy_objects: list | None = None,
 ) -> str:
     """
     Add or update wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
@@ -2580,6 +2624,20 @@ async def add_harness_wiring(
             e.g. ["FH1"]: tools that ignored the part used to put terminals there, and
             they stay in the document. get_harness_data lists them per connector under
             "hidden_pin_cavity_parts".
+        copy_objects (list): Copy objects from another wiring diagram of an open harness
+            project (or from this one), as Altium's copy / paste would: harness
+            connectors (with pins, cavity parts and parameters), frames, texts, notes and
+            pictures. Every object the source sheet owns whose bounding box lies inside
+            region (mils) is copied and moved by offset (mils), e.g.
+            [{"source": r"C:/.../Sheet1.WirDoc", "region": [7900, 4200, 15400, 12300],
+              "offset": [-1050, 4950], "designators": {"X1": "X7", "X2": "X8"},
+              "replace_text": {"#1": "#2"}}]
+            designators renames copied connectors (and copied wires / splices);
+            replace_text replaces text in copied texts and notes. Harness wiring
+            (wires, splices, no-connects, twists, shields, cables, wire breaks) is left
+            out unless "include_wiring": True. Copies get new UniqueIds (pins included)
+            and are placed before the call's connector moves and wires, so those can
+            use them. The result counts them under "copied".
         component_updates (list): Parameters to upsert on placed connectors/components, and
             names of parameters to delete from them, e.g.:
             [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"},
@@ -2631,6 +2689,11 @@ async def add_harness_wiring(
         )
     for conn in clear_hidden_cavity_parts or []:
         lines.append(_spec_line("CLEARHIDDEN", str(conn).strip()))
+    # Copies come before connector moves and wires, which may then use them
+    try:
+        lines.extend(_copy_object_lines(copy_objects))
+    except ValueError as e:
+        return json.dumps({"success": False, "error": str(e)})
 
     for c in connectors or []:
         lines.append(

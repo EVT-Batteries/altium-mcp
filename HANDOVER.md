@@ -24,7 +24,7 @@ connection point pin repair, crash-safe view rendering) and the multi-board sche
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `e2e1203` (sessions 10-12 committed) | this file |
+| `altium-mcp/` | `feature/harness-support` | `e2e1203` (sessions 10-12 committed) | session 13 (`copy_objects`), this file |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`. Unit tests: 153
@@ -34,6 +34,23 @@ The user commits themselves. **Do not commit or push unless asked.** Test on ren
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 13 (2026-10-27): copy objects between wiring diagrams (uncommitted)
+- **`add_harness_wiring(copy_objects=[...])`**: copies onto the target every object the source
+  sheet owns whose bounding box lies inside `region` (mils), moved by `offset`, with
+  `designators` renames (connectors, wires, splices) and `replace_text` (texts, notes, text
+  frames). Harness wiring (82, 83, 94, 92, 93, 98, 106) is left out unless `include_wiring`.
+  Spec: `COPYDES` / `COPYTEXT` records before their `COPYFROM` (Pascal `CopyHarnessObjects`,
+  `RenewUniqueIds`, `NewSchUniqueId` in `schematic_utils.pas`); emitted before connector moves
+  and wires, so a call can copy lugs and wire them. Result: `"copied"`; an empty region or
+  unopenable source goes to `not_found` (`copy_region:` / `copy_source:`).
+- Why: Altium harness connectors cannot be placed from a desktop DbLib by script; copying a
+  placed one (Replicate) is how a sheet is replicated (HV harness Master1 -> Master2, 23 objects).
+- Verified on renamed scratch copies in a scratch project, then on the real sheet: record counts
+  per type exact, 0 UniqueIds shared with the source (377 new), wires drawn in the same call
+  attached to the copied pins, `check_harness_wiring` identical to the source sheet. Unit tests
+  `test_add_harness_wiring_copy_objects{,_malformed}`; suite 155 passed, same 13 pre-existing
+  failures.
 
 ### Session 12 (2026-10-27): multi-part connectors, wire kinds, wire break direction (`e2e1203`)
 - **Multi-part connectors fixed** (§8 item 1 of session 9): `PinOnPart` (pin `OwnerPartId` 0 or the
@@ -374,7 +391,18 @@ lengths":
   would count it twice in the BOM).
 - **Checker and duplicate designators:** `check_harness_wiring` keys wires by designator, so two
   unannotated `W?` wires merge: a twist on such a pair reports wrong hook positions and a label
-  "off its wire". Annotate the wires before trusting those warnings.
+  "off its wire". Annotate the wires before trusting those warnings. Identical `X?` connectors
+  also gave a false `through_connector` error (session 13; gone once annotated).
+- **In-memory ObjectIds on a wiring diagram (probed session 13):** the document is 79 (a plain
+  schematic is 32), text label 22, rectangle 4, note 2, image 11, text frame 13, template 42,
+  document parameter 27, harness connector 81, wire 82. (File RECORD numbers differ: label 4,
+  rectangle 14, image 30, note 209.) Sheet-owned objects have `Container.ObjectId` = 79.
+- **`Replicate` keeps every UniqueId** (object, pins, parameters): a copy must renew them
+  (`RenewUniqueIds`, `SetState_UniqueId`), or pins share ids across sheets.
+- **A `.WirDoc` opened outside its harness project** (`Client.OpenDocument` on a free file) loads
+  as an empty plain schematic (ObjectId 32, only document parameters). Test on scratch copies
+  inside a scratch `.PrjHar` (copy the project file, keep `[Document*]` of the copied sheets,
+  rename their paths), and ask the user to close that project afterwards.
 
 ### `.LdrDoc` format and API (verified 2026-10-21 on a scratch copy, Altium 26.7.1)
 - Open kind: `Client.OpenDocument('HarnessLayoutDrawing', path)`; `SchServer.GetSchDocumentByPath`
