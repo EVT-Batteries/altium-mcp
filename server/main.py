@@ -6133,6 +6133,17 @@ async def edit_harness_drawing(
           Drop stored projections so Draftsman computes them again on update.
       copy_item {item_id, x_mm?, y_mm?, designator?, view_side?, scale?}
           Copy an item on its page under a new id (e.g. a second view).
+      add_callout {item_id, text, point_mm, leader_mm?}
+          Custom-text callout on a component view (e.g. "Pin 1"), snapped
+          to point_mm [x, y] of its projection (same frame as the lines);
+          leader_mm [dx, dy] places the text on the page (default [10, 10]).
+          Draftsman keeps it on the point when the view moves or rescales.
+      copy_table_format {from_item_id, from_document?, item_ids?}
+          Copy a connection table's / wiring list's columns or a BOM's
+          shown columns (set, order, visibility, sort, widths) onto the
+          other tables of that type (or item_ids); from_document takes the
+          reference table from another .HarDwf. Tables keep their content
+          and position; check widths and overlaps on a screenshot.
       move_item {item_id, x_mm, y_mm}
       set_text {item_id, text}           Text items
       delete_item {item_id}              not template items

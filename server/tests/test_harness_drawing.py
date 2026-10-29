@@ -271,6 +271,94 @@ class DrawingTests(unittest.TestCase):
                 doc, [{"op": "set_view_title", "item_id": 21, "title": "x"}]
             )
 
+    def test_callout_snaps_to_projection_point(self):
+        doc = hd.HarnessDrawing(self.path)
+        hd.apply_operations(
+            doc,
+            [
+                {
+                    "op": "set_component_view",
+                    "item_id": 20,
+                    "view_side": "Back",
+                    "scale": 2,
+                },
+                {
+                    "op": "set_component_projection",
+                    "designator": "P1",
+                    "view_side": "Back",
+                    "lines_mm": SQUARE,
+                },
+            ],
+        )
+        res = hd.apply_operations(
+            doc,
+            [
+                {
+                    "op": "add_callout",
+                    "item_id": 20,
+                    "text": "Pin 1",
+                    "point_mm": [10, 20],
+                    "leader_mm": [-5, 3],
+                }
+            ],
+        )[0]
+        # view at (500, 500) units; point (10, 20) mm of a 10 x 20 mm projection
+        # is its top-right corner: 20 mm right, 40 mm up at 2:1
+        self.assertAlmostEqual(res["x_mm"], hd._mm(500) + 20, places=2)
+        self.assertAlmostEqual(res["y_mm"], hd._mm(500) + 40, places=2)
+        callout = doc.item(res["new_item_id"])
+        self.assertEqual(callout.type, "Callout")
+        self.assertEqual(callout.page, 2)
+        s = callout.summary()
+        self.assertEqual(
+            (s["text"], s["target"], s["target_item"]), ("Pin 1", "P1", "20")
+        )
+        self.assertIn("<ElbowPosition>Left</ElbowPosition>", doc.xml)
+        with self.assertRaises(hd.DrawingEditError):  # no projection for P1 Top
+            hd.apply_operations(
+                doc,
+                [
+                    {"op": "copy_item", "item_id": 20, "view_side": "Top"},
+                    {
+                        "op": "add_callout",
+                        "item_id": 24,
+                        "text": "x",
+                        "point_mm": [0, 0],
+                    },
+                ],
+            )
+
+    def test_copy_table_format(self):
+        def table(item_id, component, part_visible):
+            return (
+                f'<Item i:type="ConnectionTableData"><Id>{item_id}</Id>'
+                "<OriginatedFromTemplate>false</OriginatedFromTemplate><Columns><Items>"
+                "<DataTableColumnData><Name>Pin</Name><Visible>true</Visible>"
+                "</DataTableColumnData><DataTableColumnData><Name>Part</Name>"
+                f"<Visible>{part_visible}</Visible></DataTableColumnData></Items>"
+                f"</Columns><Component>{component}</Component><Location><X>0</X>"
+                "<Y>0</Y></Location></Item>"
+            )
+
+        xml = hd.read_drawing_xml(self.path).decode()
+        doc = hd.HarnessDrawing(self.path)
+        end = xml.index("</Items>", xml.index("<Id>2</Id>"))
+        doc.xml = (
+            xml[:end] + table(30, "P1", "false") + table(31, "P5", "true") + xml[end:]
+        )
+        res = hd.apply_operations(
+            doc, [{"op": "copy_table_format", "from_item_id": 30}]
+        )[0]
+        self.assertEqual(res["changed"], ["31"])
+        t = doc.item(31)
+        self.assertIn("<Component>P5</Component>", doc.xml[t.start : t.end])
+        self.assertNotIn(
+            "<Visible>true</Visible></DataTableColumnData></Items>",
+            doc.xml[t.start : t.end],
+        )
+        with self.assertRaises(hd.DrawingEditError):  # not a table
+            hd.apply_operations(doc, [{"op": "copy_table_format", "from_item_id": 20}])
+
     def test_refusals(self):
         doc = hd.HarnessDrawing(self.path)
         for op in (

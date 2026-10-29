@@ -75,9 +75,16 @@ harness component view, which showed nothing (wanted: connector front / back pin
   `HarnessDrawing`; `multiboard_document` opens with `SchDocumentKind` (was `SdDoc` only) and
   serves both editors. Live-tested status -> close -> write -> reopen on an open scratch drawing.
 - Applied to `P42C-1_Slave_Sense_Harness.HarDwf` (workspace HANDOVER). Tests
-  `tests/test_harness_drawing.py` (14); suite 172 passed, same 13 pre-existing failures. The
-  running MCP daemon still has the old Python until the IDE restarts; everything was run with
-  `call_tool.py`.
+  `tests/test_harness_drawing.py` (14); suite 172 passed, same 13 pre-existing failures.
+- Second part (after an IDE restart, tools tested through the MCP): `add_callout` (custom-text
+  callout snapped to a projection point; page point = view Location + (point - bound min) x
+  scale, matched the user's GUI callout exactly; `Leader` = text offset from the anchor; Draftsman
+  re-places snapped callouts when the view moves / rescales), `copy_table_format` (`Columns` of
+  connection tables / wiring lists, `ShowedColumns` of BOMs; also from another drawing),
+  callout text / target in the review. Verified live on page-only scratch copies
+  (`dwftest\MCP_Prev_*.HarDwf`, `PcbDrawing:FitSheet` / `Zoom Action=Out`): the JAE MX84 rear view
+  (staggered rows) showed Draftsman draws projections unmirrored. Draftsman stores a table's new
+  size only when it saves, so the review reads old table sizes until then. Tests 16.
 
 ### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (`1fa3dfe`)
 Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):

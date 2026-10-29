@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -385,6 +386,10 @@ class DrawingItem:
                 if side and side.isdigit() and int(side) < len(VIEW_SIDES)
                 else side
             )
+        if self.type == "Callout":
+            out["text"] = _child_text(e, "Sources", "CalloutSource", "CustomText")
+            out["target_item"] = _child_text(e, "TargetAnchor", "SnapTargetItemId")
+            out["target"] = _child_text(e, "TargetAnchor", "Snap", "ItemId")
         source = _child_text(e, "BoardSourceName")
         if source:
             out["source"] = source
@@ -910,6 +915,167 @@ def _op_copy_item(doc: HarnessDrawing, op: dict) -> dict:
     return out
 
 
+def _snap_number(value: float) -> str:
+    """A double as .NET writes it in a snap id (shortest round-trip)."""
+    text = repr(float(value))
+    return text.removesuffix(".0")
+
+
+def _op_add_callout(doc: HarnessDrawing, op: dict) -> dict:
+    """A callout with custom text on a component view, snapped to a point of its
+    projection: point_mm [x, y] in the projection frame (the frame of
+    set_component_projection, mm, y up), leader_mm [dx, dy] the text's offset
+    on the page from that point (mm, y up). Draftsman keeps the callout on the
+    point when the view moves or is rescaled (it stores the snap)."""
+    view = doc.item(op.get("item_id"))
+    if view.type != "HarnessComponentViewData":
+        raise DrawingEditError(f"item {view.id} is a {view.type}, not a component view")
+    text = str(op.get("text", "")).strip()
+    if not text:
+        raise DrawingEditError("text is required")
+    point = op.get("point_mm")
+    leader = op.get("leader_mm", [10, 10])
+    if not (isinstance(point, (list, tuple)) and len(point) == 2):
+        raise DrawingEditError("point_mm is [x, y] in the projection frame (mm)")
+    designator = _child_text(view.element, "Designator") or ""
+    side = _side_name(_child_text(view.element, "ViewSide") or "0")
+    proj = next(
+        (
+            p
+            for p in doc.projections()
+            if p["designator"] == designator and p["view_side"] == side
+        ),
+        None,
+    )
+    if proj is None or not proj["lines"]:
+        raise DrawingEditError(f"no projection stored for {designator} {side}")
+    seg = doc.xml[proj["start"] : proj["end"]]
+    bound = {k: float(v) for k, v in re.findall(r"<a:_(\w+)>([^<]+)</a:_\w+>", seg)}
+    scale = 1.0
+    if _child_text(view.element, "UseCustomScale") == "true":
+        scale = _float(_child_text(view.element, "CustomScale")) or 1.0
+    else:
+        num = _float(_child_text(view.element, "Scale", "Numenator")) or 1.0
+        den = _float(_child_text(view.element, "Scale", "Denominator")) or 1.0
+        scale = num / den
+    box = view.box() or (0.0, 0.0, 0.0, 0.0)
+    # stored projection: x as given, y negated (see _projection_xml)
+    sx, sy = _units(float(point[0])), -_units(float(point[1]))
+    page_x = box[0] + (sx - bound["x"]) * scale
+    page_y = box[1] + (bound["y"] + bound["height"] - sy) * scale
+    lx, ly = _units(float(leader[0])), _units(float(leader[1]))
+    ids = [int(i.id) for i in doc.items()] + [int(p["id"]) for p in doc.pages()]
+    new_id = str(max(ids) + 1)
+    snap_id = f"GI|{designator}|Point: {_snap_number(sx)}, {_snap_number(sy)}"
+    anchor = (
+        "<AnchorType>Snap</AnchorType><AnchorType2>Snap</AnchorType2>"
+        "<AnchorTypeV3>2</AnchorTypeV3>"
+        f"<ContentPoint><X>{_fmt(page_x)}</X><Y>{_fmt(page_y)}</Y></ContentPoint>"
+        f"<PointOnPage><X>{_fmt(page_x)}</X><Y>{_fmt(page_y)}</Y></PointOnPage>"
+        f'<Snap><Arc i:nil="true"/><GroupId>GI</GroupId><ItemId>{_escape(designator)}'
+        f"</ItemId><Points><PointData><X>{_fmt(sx)}</X><Y>{_fmt(sy)}</Y></PointData>"
+        '</Points><PointsZ xmlns:a="http://schemas.microsoft.com/2003/10/'
+        'Serialization/Arrays"><a:double>0</a:double></PointsZ>'
+        "<SnapDesignation>0</SnapDesignation><SnapType>0</SnapType></Snap>"
+        "<SnapDesignationData>None</SnapDesignationData>"
+        "<SnapDesignationDataV2>0</SnapDesignationDataV2>"
+        f"<SnapId>{_escape(snap_id)}</SnapId><SnapIdV2>{_escape(snap_id)}</SnapIdV2>"
+        "<SnapPointOffset><X>0</X><Y>0</Y></SnapPointOffset>"
+        f"<SnapTargetItemId>{view.id}</SnapTargetItemId>"
+    )
+    source = (
+        "<CalloutSource><BorderStyle>Underline</BorderStyle>"
+        "<BorderStyleV2>4</BorderStyleV2><ComponentParameter><BomColumnType>"
+        "Designator</BomColumnType><BomColumnTypeV2>2</BomColumnTypeV2><DataType>0"
+        '</DataType><ParameterSource i:nil="true"/><ParameterSourceV2 i:nil="true"/>'
+        f"<SchematicParameter/></ComponentParameter><CustomText>{_escape(text)}"
+        f"</CustomText><NoteElementId>{uuid.uuid4().hex}</NoteElementId>"
+        "<SourceType>CustomText</SourceType><SourceTypeV2>0</SourceTypeV2>"
+        "<SymbolReference>0.5</SymbolReference><TextAboveLine/>"
+        "<TextAboveReference>0.5</TextAboveReference><TextBelowLine/>"
+        "<TextBelowReference>0.5</TextBelowReference></CalloutSource>"
+    )
+    elbow = "Left" if float(leader[0]) < 0 else "Right"
+    item = (
+        f'<Item i:type="Callout"><Id>{new_id}</Id><Anchor>Top Left</Anchor>'
+        "<OriginatedFromTemplate>false</OriginatedFromTemplate>"
+        "<ArrowStyleId>1</ArrowStyleId><BackgroundColor><A>0</A><B>255</B><G>255</G>"
+        "<R>255</R></BackgroundColor><BorderAutoSize>true</BorderAutoSize>"
+        "<BorderHeight>37.79527559055118</BorderHeight><BorderLineStyleId>2"
+        "</BorderLineStyleId><BorderWidth>37.79527559055118</BorderWidth>"
+        "<ElbowLength>7.559055118110236</ElbowLength>"
+        f"<ElbowPosition>{elbow}</ElbowPosition>"
+        f"<ElbowPositionV2>{0 if elbow == 'Right' else 1}</ElbowPositionV2>"
+        "<ElbowStyle>ElbowBeforeTag</ElbowStyle><ElbowStyleV2>1</ElbowStyleV2>"
+        "<FontStyleId>1</FontStyleId><ForegroundTextColor><A>255</A><B>0</B><G>0</G>"
+        f"<R>192</R></ForegroundTextColor><Leader><X>{_fmt(lx)}</X><Y>{_fmt(ly)}</Y>"
+        "</Leader><LineStyleId>2</LineStyleId><Prefix/>"
+        f"<Sources>{source}</Sources><Symbol>0</Symbol>"
+        "<SymbolContour>false</SymbolContour><SymbolReference>0.5</SymbolReference>"
+        f"<TargetAnchor>{anchor}</TargetAnchor><TargetAnchors><Anchors>"
+        f"<DimensionAnchor>{anchor}</DimensionAnchor></Anchors>"
+        f"<Sources>{source}</Sources></TargetAnchors>"
+        "<UseDocumentFont>true</UseDocumentFont></Item>"
+    )
+    page = next(p for p in doc.pages() if p["index"] == view.page)
+    items = _child_span(doc.xml, page["start"], page["end"], "Items")
+    close = items[1] - len("</Items>")
+    doc._replace(close, close, item)
+    return {
+        "item_id": view.id,
+        "new_item_id": new_id,
+        "text": text,
+        "x_mm": _mm(page_x),
+        "y_mm": _mm(page_y),
+    }
+
+
+# What a table's "format" is: the column set, order, visibility and sorting.
+_TABLE_FORMAT = {
+    "ConnectionTableData": "Columns",
+    "WiringListData": "Columns",
+    "BillOfMaterialsView": "ShowedColumns",
+}
+
+
+def _op_copy_table_format(doc: HarnessDrawing, op: dict) -> dict:
+    """Copy a table's columns (set, order, visibility, sort, widths) onto other
+    tables of its type: from_item_id in this drawing, or in from_document (a
+    .HarDwf); targets item_ids, or every table of that type in this drawing."""
+    source_doc = doc
+    if op.get("from_document"):
+        source_doc = HarnessDrawing(Path(op["from_document"]))
+    source = source_doc.item(op.get("from_item_id"))
+    tag = _TABLE_FORMAT.get(source.type)
+    if not tag:
+        raise DrawingEditError(
+            f"item {source.id} is a {source.type}; tables are {sorted(_TABLE_FORMAT)}"
+        )
+    span = _child_span(source_doc.xml, source.start, source.end, tag)
+    if not span:
+        raise DrawingEditError(f"item {source.id} has no {tag}")
+    columns = source_doc.xml[span[0] : span[1]]
+    wanted = [str(i) for i in op["item_ids"]] if op.get("item_ids") else None
+    changed = []
+    for item in doc.items():
+        if item.type != source.type or item.from_template:
+            continue
+        if wanted is not None and item.id not in wanted:
+            continue
+        if source_doc is doc and item.id == source.id:
+            continue
+        target = _child_span(doc.xml, item.start, item.end, tag)
+        if not target:
+            raise DrawingEditError(f"item {item.id} has no {tag}")
+        if doc.xml[target[0] : target[1]] != columns:
+            doc._replace(target[0], target[1], columns)
+            changed.append(item.id)
+    missing = sorted(set(wanted or []) - {i.id for i in doc.items()})
+    if missing:
+        raise DrawingEditError(f"no item with id {', '.join(missing)}")
+    return {"from_item_id": source.id, "type": source.type, "changed": changed}
+
+
 def _op_set_text(doc: HarnessDrawing, op: dict) -> dict:
     item = doc.item(op.get("item_id"))
     if item.type != "Text":
@@ -964,6 +1130,8 @@ OPERATIONS = {
     "set_view_title": _op_set_view_title,
     "move_item": _op_move_item,
     "copy_item": _op_copy_item,
+    "add_callout": _op_add_callout,
+    "copy_table_format": _op_copy_table_format,
     "set_text": _op_set_text,
     "delete_item": _op_delete_item,
     "set_template": _op_set_template,
