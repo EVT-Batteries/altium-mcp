@@ -212,7 +212,8 @@ begin
         Result := 'HarnessLayoutDrawing'
     else if (AnsiUpperCase(ExtractFileExt(Path)) = '.MBSDOC') then
         Result := 'SdDoc'
-    else if (AnsiUpperCase(ExtractFileExt(Path)) = '.HARDWF') then
+    else if (AnsiUpperCase(ExtractFileExt(Path)) = '.HARDWF') or
+            (AnsiUpperCase(ExtractFileExt(Path)) = '.HARDOT') then
         Result := 'HarnessDrawing'
     else
         Result := 'SCH';

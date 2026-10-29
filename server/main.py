@@ -6072,11 +6072,11 @@ async def get_harness_drawing_data(
     from harness_drawing import review_drawing
 
     p = Path(document_path).resolve() if document_path else None
-    if not p or p.suffix.lower() != ".hardwf" or not p.exists():
+    if not p or p.suffix.lower() not in (".hardwf", ".hardot") or not p.exists():
         return json.dumps(
             {
                 "success": False,
-                "error": f"document_path to a .HarDwf is required: {document_path!r}",
+                "error": f"document_path to a .HarDwf (or .HarDot template) is required: {document_path!r}",
             }
         )
     try:
@@ -6094,7 +6094,8 @@ async def edit_harness_drawing(
     dry_run: bool = False,
 ) -> str:
     """
-    Edit an Altium Draftsman harness drawing (.HarDwf) on the saved file:
+    Edit an Altium Draftsman harness drawing (.HarDwf, or a .HarDot template) on
+    the saved file:
     component views and their projections, item positions and texts, sheet
     templates.
 
@@ -6123,6 +6124,7 @@ async def edit_harness_drawing(
     Operations (dicts with "op"):
       set_component_view {item_id, designator?, view_side?, scale?}
           view_side Top|Bottom|Left|Right|Front|Back; scale e.g. 4 (4:1)
+      set_view_scale {item_id, scale}    any view: 2 (2:1), 0.5 (1:2), 0.75
       set_view_title {item_id, title?, title_position?}
           any view; title may use =ComponentName, =ViewScale; title_position
           "auto" (Draftsman centres it above the view) or [dx_mm, dy_mm]
@@ -6138,6 +6140,8 @@ async def edit_harness_drawing(
           to point_mm [x, y] of its projection (same frame as the lines);
           leader_mm [dx, dy] places the text on the page (default [10, 10]).
           Draftsman keeps it on the point when the view moves or rescales.
+          Adds Draftsman's default arrow style when the document has none
+          (a callout without it is not drawn).
       copy_table_format {from_item_id, from_document?, item_ids?}
           Copy a connection table's / wiring list's columns or a BOM's
           shown columns (set, order, visibility, sort, widths) onto the
@@ -6170,11 +6174,11 @@ async def edit_harness_drawing(
     )
 
     p = Path(document_path).resolve() if document_path else None
-    if not p or p.suffix.lower() != ".hardwf" or not p.exists():
+    if not p or p.suffix.lower() not in (".hardwf", ".hardot") or not p.exists():
         return json.dumps(
             {
                 "success": False,
-                "error": f"document_path to a .HarDwf is required: {document_path!r}",
+                "error": f"document_path to a .HarDwf (or .HarDot template) is required: {document_path!r}",
             }
         )
     if not isinstance(operations, list) or not operations:

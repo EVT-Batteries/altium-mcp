@@ -11,6 +11,7 @@ import random
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -76,7 +77,7 @@ def _document(template_ok, template_missing, projections=""):
         ),
     ]
     return (
-        f"<Document {NS}><Id>0</Id><BoardProjectionInformation><BoardOrigin><X>0</X>"
+        f"<Document {NS}><Id>0</Id><ArrowStyles/><BoardProjectionInformation><BoardOrigin><X>0</X>"
         "<Y>0</Y></BoardOrigin><ComponentProjections>"
         f"{projections}</ComponentProjections><LastUpdate>x</LastUpdate>"
         "</BoardProjectionInformation>"
@@ -245,6 +246,25 @@ class DrawingTests(unittest.TestCase):
         self.assertEqual(r["pages"][0]["items"][0]["text"], "Notes & <done>")
         self.assertTrue(all(p["template_exists"] for p in r["pages"]))
 
+    def test_view_scale(self):
+        doc = hd.HarnessDrawing(self.path)
+        res = hd.apply_operations(
+            doc, [{"op": "set_view_scale", "item_id": 20, "scale": 0.75}]
+        )
+        self.assertEqual(res[0]["scale"], 0.75)
+        item = doc.item(20)
+        text = doc.xml[item.start : item.end]
+        self.assertIn("<UseCustomScale>true</UseCustomScale>", text)
+        self.assertIn("<CustomScale>0.75</CustomScale>", text)
+        res = hd.apply_operations(
+            doc, [{"op": "set_view_scale", "item_id": 20, "scale": 0.5}]
+        )
+        self.assertEqual(res[0]["scale"], "1:2")
+        with self.assertRaises(hd.DrawingEditError):  # a text is no view
+            hd.apply_operations(
+                doc, [{"op": "set_view_scale", "item_id": 21, "scale": 2}]
+            )
+
     def test_view_title(self):
         doc = hd.HarnessDrawing(self.path)
         hd.apply_operations(
@@ -314,6 +334,8 @@ class DrawingTests(unittest.TestCase):
             (s["text"], s["target"], s["target_item"]), ("Pin 1", "P1", "20")
         )
         self.assertIn("<ElbowPosition>Left</ElbowPosition>", doc.xml)
+        # the document had no arrow style: the default one was added, once
+        self.assertEqual(doc.xml.count("<ArrowStyleData>"), 1)
         with self.assertRaises(hd.DrawingEditError):  # no projection for P1 Top
             hd.apply_operations(
                 doc,
@@ -343,19 +365,29 @@ class DrawingTests(unittest.TestCase):
         xml = hd.read_drawing_xml(self.path).decode()
         doc = hd.HarnessDrawing(self.path)
         end = xml.index("</Items>", xml.index("<Id>2</Id>"))
+        # targets whose columns differ in length: later items must not be
+        # edited at stale offsets
         doc.xml = (
-            xml[:end] + table(30, "P1", "false") + table(31, "P5", "true") + xml[end:]
+            xml[:end]
+            + table(30, "P1", "false")
+            + table(31, "P5", "true")
+            + table(32, "P6", "true-and-long")
+            + xml[end:]
         )
         res = hd.apply_operations(
             doc, [{"op": "copy_table_format", "from_item_id": 30}]
         )[0]
-        self.assertEqual(res["changed"], ["31"])
-        t = doc.item(31)
-        self.assertIn("<Component>P5</Component>", doc.xml[t.start : t.end])
-        self.assertNotIn(
-            "<Visible>true</Visible></DataTableColumnData></Items>",
-            doc.xml[t.start : t.end],
-        )
+        self.assertEqual(res["changed"], ["31", "32"])
+        ET.fromstring(doc.xml.encode())
+        for item_id, component in (("31", "P5"), ("32", "P6")):
+            t = doc.item(item_id)
+            self.assertIn(
+                f"<Component>{component}</Component>", doc.xml[t.start : t.end]
+            )
+            self.assertIn(
+                "<Visible>false</Visible></DataTableColumnData></Items>",
+                doc.xml[t.start : t.end],
+            )
         with self.assertRaises(hd.DrawingEditError):  # not a table
             hd.apply_operations(doc, [{"op": "copy_table_format", "from_item_id": 20}])
 

@@ -85,6 +85,15 @@ harness component view, which showed nothing (wanted: connector front / back pin
   (`dwftest\MCP_Prev_*.HarDwf`, `PcbDrawing:FitSheet` / `Zoom Action=Out`): the JAE MX84 rear view
   (staggered rows) showed Draftsman draws projections unmirrored. Draftsman stores a table's new
   size only when it saves, so the review reads old table sizes until then. Tests 16.
+- Third part (rollout to all P42C-1 drawings + template project): fixed `copy_table_format`
+  editing several tables at stale offsets (it worked on Slave sense only because all column
+  blocks had the same length; now from the end of the document; regression test); `add_callout`
+  adds Draftsman's default arrow style (`ArrowStyles/ArrowStyleData Id 1`) when the drawing has
+  none - callouts referencing a missing arrow style are not drawn (found on HVIL HVSL1200);
+  `set_view_scale` (any view, e.g. a layout at 0.75); `.HarDot` accepted by both drawing tools
+  and mapped to `HarnessDrawing` in `SchDocumentKind`. Tests 17; suite 175 passed, same 13
+  pre-existing failures. Per-part rear sides / numbering: workspace skill
+  `altium-harness-engineering/references/connector-rear-views.md`.
 
 ### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (`1fa3dfe`)
 Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):

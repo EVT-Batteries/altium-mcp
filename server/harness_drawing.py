@@ -787,21 +787,34 @@ def _op_set_component_view(doc: HarnessDrawing, op: dict) -> dict:
         out["view_side"] = side
         item = doc.item(item.id)
     if op.get("scale") is not None:
-        # EffectiveScaleValue: UseCustomScale ? CustomScale : Numenator / Denominator
-        scale = float(op["scale"])
-        if scale <= 0:
-            raise DrawingEditError(f"scale must be positive: {scale}")
-        num, den = (round(scale), 1) if scale >= 1 else (1, round(1 / scale))
-        exact = abs(num / den - scale) < 1e-9
-        if exact:
-            doc._set_child(item, ["Scale", "Numenator"], str(num))
-            doc._set_child(doc.item(item.id), ["Scale", "Denominator"], str(den))
-        doc._set_child(
-            doc.item(item.id), ["UseCustomScale"], "false" if exact else "true"
-        )
-        doc._set_child(doc.item(item.id), ["CustomScale"], _fmt(scale))
-        out["scale"] = f"{num}:{den}" if exact else scale
+        out["scale"] = _set_scale(doc, item, op["scale"])
     return out
+
+
+def _set_scale(doc: HarnessDrawing, item: DrawingItem, value) -> str | float:
+    # EffectiveScaleValue: UseCustomScale ? CustomScale : Numenator / Denominator
+    scale = float(value)
+    if scale <= 0:
+        raise DrawingEditError(f"scale must be positive: {scale}")
+    num, den = (round(scale), 1) if scale >= 1 else (1, round(1 / scale))
+    exact = abs(num / den - scale) < 1e-9
+    if exact:
+        doc._set_child(item, ["Scale", "Numenator"], str(num))
+        doc._set_child(doc.item(item.id), ["Scale", "Denominator"], str(den))
+    doc._set_child(doc.item(item.id), ["UseCustomScale"], "false" if exact else "true")
+    doc._set_child(doc.item(item.id), ["CustomScale"], _fmt(scale))
+    return f"{num}:{den}" if exact else scale
+
+
+def _op_set_view_scale(doc: HarnessDrawing, op: dict) -> dict:
+    """Scale of any view (layout, wiring diagram, component): e.g. 2 (2:1),
+    0.5 (1:2), 0.75 (custom)."""
+    item = doc.item(op.get("item_id"))
+    if item.type not in _VIEW_TYPES:
+        raise DrawingEditError(f"item {item.id} is a {item.type}, not a view")
+    if op.get("scale") is None:
+        raise DrawingEditError("scale is required")
+    return {"item_id": item.id, "scale": _set_scale(doc, item, op["scale"])}
 
 
 def _title_element(doc: HarnessDrawing, item: DrawingItem) -> tuple[int, int]:
@@ -921,6 +934,29 @@ def _snap_number(value: float) -> str:
     return text.removesuffix(".0")
 
 
+# Draftsman's default arrow (what the GUI adds with the document's first
+# callout); a callout whose ArrowStyleId is not defined is not drawn.
+_ARROW_STYLE_1 = (
+    "<ArrowStyleData><FullLength>24</FullLength><HeadStyle>FilledArrow</HeadStyle>"
+    "<HeadStyleV2>1</HeadStyleV2><Id>1</Id><Length>12.47244094488189</Length>"
+    "<Width>4.1574803149606305</Width></ArrowStyleData>"
+)
+
+
+def _ensure_arrow_style(doc: HarnessDrawing) -> None:
+    start = doc.xml.find("<ArrowStyles")
+    if start < 0:
+        raise DrawingEditError("the document has no ArrowStyles list")
+    end = _element_end(doc.xml, start, "ArrowStyles")
+    if re.search(r"<ArrowStyleData>.*?<Id>1</Id>", doc.xml[start:end], re.DOTALL):
+        return
+    if doc.xml[start:end].endswith("/>"):
+        doc._replace(start, end, f"<ArrowStyles>{_ARROW_STYLE_1}</ArrowStyles>")
+    else:
+        close = end - len("</ArrowStyles>")
+        doc._replace(close, close, _ARROW_STYLE_1)
+
+
 def _op_add_callout(doc: HarnessDrawing, op: dict) -> dict:
     """A callout with custom text on a component view, snapped to a point of its
     projection: point_mm [x, y] in the projection frame (the frame of
@@ -995,6 +1031,7 @@ def _op_add_callout(doc: HarnessDrawing, op: dict) -> dict:
         "<TextAboveReference>0.5</TextAboveReference><TextBelowLine/>"
         "<TextBelowReference>0.5</TextBelowReference></CalloutSource>"
     )
+    _ensure_arrow_style(doc)
     elbow = "Left" if float(leader[0]) < 0 else "Right"
     item = (
         f'<Item i:type="Callout"><Id>{new_id}</Id><Anchor>Top Left</Anchor>'
@@ -1057,7 +1094,8 @@ def _op_copy_table_format(doc: HarnessDrawing, op: dict) -> dict:
     columns = source_doc.xml[span[0] : span[1]]
     wanted = [str(i) for i in op["item_ids"]] if op.get("item_ids") else None
     changed = []
-    for item in doc.items():
+    # from the end, so a replacement does not move the items still to do
+    for item in reversed(doc.items()):
         if item.type != source.type or item.from_template:
             continue
         if wanted is not None and item.id not in wanted:
@@ -1073,7 +1111,7 @@ def _op_copy_table_format(doc: HarnessDrawing, op: dict) -> dict:
     missing = sorted(set(wanted or []) - {i.id for i in doc.items()})
     if missing:
         raise DrawingEditError(f"no item with id {', '.join(missing)}")
-    return {"from_item_id": source.id, "type": source.type, "changed": changed}
+    return {"from_item_id": source.id, "type": source.type, "changed": changed[::-1]}
 
 
 def _op_set_text(doc: HarnessDrawing, op: dict) -> dict:
@@ -1128,6 +1166,7 @@ OPERATIONS = {
     "remove_component_projection": _op_remove_component_projection,
     "set_component_view": _op_set_component_view,
     "set_view_title": _op_set_view_title,
+    "set_view_scale": _op_set_view_scale,
     "move_item": _op_move_item,
     "copy_item": _op_copy_item,
     "add_callout": _op_add_callout,
