@@ -6252,6 +6252,424 @@ async def edit_harness_drawing(
     )
 
 
+def _harness_import_targets(path: Path) -> list[Path]:
+    """The documents import_harness_changes updates for path: the document
+    itself, or a harness project's layout drawings followed by its Draftsman
+    drawings (a drawing shows its layout, so the layout goes first)."""
+    if path.suffix.lower() != ".prjhar":
+        return [path]
+    docs = [
+        (path.parent / line.split("=", 1)[1].strip()).resolve()
+        for line in read_altium_text(path).splitlines()
+        if line.startswith("DocumentPath=")
+    ]
+    return [d for d in docs if d.suffix.lower() == ".ldrdoc"] + [
+        d for d in docs if d.suffix.lower() == ".hardwf"
+    ]
+
+
+def _layout_import_report(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    """What a layout import changed: wires whose part or description changed,
+    wires added / removed, and the routing state afterwards."""
+    old = {w["designator"]: w for w in before["wires"]}
+    new = {w["designator"]: w for w in after["wires"]}
+    updated = [
+        {
+            "designator": name,
+            "part_before": old[name].get("part_number", ""),
+            "part_after": w.get("part_number", ""),
+            "description": w.get("description", ""),
+        }
+        for name, w in new.items()
+        if name in old
+        and (
+            old[name].get("part_number") != w.get("part_number")
+            or old[name].get("description") != w.get("description")
+        )
+    ]
+    return {
+        "wires_updated": updated,
+        "wires_added": sorted(set(new) - set(old)),
+        "wires_removed": sorted(set(old) - set(new)),
+        "wires_without_part": sorted(
+            name for name, w in new.items() if not w.get("part_number")
+        ),
+        "unrouted_wires": after["unrouted_wires"],
+        "newly_unrouted_wires": sorted(
+            set(after["unrouted_wires"]) - set(before["unrouted_wires"])
+        ),
+        "unassigned_pins": {
+            c["designator"]: c["unassigned_pins"]
+            for c in after["connectors"]
+            if c.get("unassigned_pins")
+        },
+    }
+
+
+def _drawing_import_report(
+    before: dict[str, Any], after: dict[str, Any]
+) -> dict[str, Any]:
+    """What a Draftsman update changed: items moved, resized, added or
+    removed, and component projections it emptied."""
+
+    def items(review: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {it["id"]: it for page in review["pages"] for it in page["items"]}
+
+    def lines(review: dict[str, Any]) -> dict[tuple[str, str], int]:
+        return {
+            (p["designator"], p["view_side"]): p["lines"] for p in review["projections"]
+        }
+
+    def top_left(it: dict[str, Any]) -> tuple[float, float]:
+        # Positions are bottom-left corners; a table that grows keeps its top
+        y = (it.get("y_mm") or 0) + (it.get("height_mm") or 0)
+        return it.get("x_mm") or 0, y
+
+    old, new = items(before), items(after)
+    moved, resized = [], []
+    for item_id, it in new.items():
+        prev = old.get(item_id)
+        if prev is None:
+            continue
+        if any(abs(a - b) > 0.01 for a, b in zip(top_left(prev), top_left(it))):
+            moved.append(item_id)
+        if (prev.get("width_mm"), prev.get("height_mm")) != (
+            it.get("width_mm"),
+            it.get("height_mm"),
+        ):
+            resized.append(item_id)
+    old_lines, new_lines = lines(before), lines(after)
+    return {
+        "items_moved": moved,
+        "items_resized": resized,
+        "items_added": sorted(set(new) - set(old)),
+        "items_removed": sorted(set(old) - set(new)),
+        "projections_emptied": [
+            f"{des} {side}"
+            for (des, side), n in old_lines.items()
+            if n and not new_lines.get((des, side))
+        ],
+        "issues": after["issues"],
+    }
+
+
+@mcp.tool()
+async def import_harness_changes(ctx: Context, document_path: str) -> str:
+    """
+    Run Altium's "Import Changes From ..." on a harness project's layout drawing
+    (.LdrDoc) or Draftsman fabrication drawing (.HarDwf), and save it.
+
+    A layout drawing takes the changes of the project's wiring diagrams (Design >
+    Import Changes From <project>: wire parts and parameters, new / removed wires,
+    connectors, splices...; applied at once, no ECO dialog). Altium's import leaves
+    connection points naming pins that no longer exist, so the tool then runs the
+    pin repair of edit_harness_layout when a connector has unassigned pins. A
+    Draftsman drawing re-reads its layout drawing (Tools > Import Changes From
+    <layout>): BOM, wiring list, connection tables, layout view; the component
+    projections stored with edit_harness_drawing are kept.
+
+    document_path may be a .PrjHar: its layout drawings are imported first, then its
+    Draftsman drawings. The harness project must be open in Altium with no
+    unsaved changes in any of its documents (only the import is saved; a layout
+    is checked against the saved wiring diagrams afterwards and imported again
+    while they differ). A document that was not open is closed again afterwards.
+    The import and the save run as standalone scripts (run_altium_script), so a
+    sandbox recovery may follow a script error.
+
+    Args:
+        document_path: Full path to a .LdrDoc, .HarDwf or .PrjHar.
+
+    Returns:
+        JSON with success and, per document, changed / saved and a report: for a
+        layout wires_updated (part before / after), wires_added, wires_removed,
+        wires_without_part, unrouted_wires, newly_unrouted_wires, unassigned_pins and
+        pin_repair; for a drawing items_moved, items_resized, items_added,
+        items_removed, projections_emptied and the review's issues.
+    """
+    from harness_drawing import review_drawing
+
+    path = Path(document_path).resolve() if document_path else None
+    if (
+        not path
+        or not path.exists()
+        or path.suffix.lower() not in (".ldrdoc", ".hardwf", ".prjhar")
+    ):
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"document_path to a .LdrDoc, .HarDwf or .PrjHar is required: {document_path!r}",
+            }
+        )
+    targets = _harness_import_targets(path)
+    if not targets:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"{path.name} has no layout or Draftsman drawing",
+            }
+        )
+
+    documents = []
+    for doc in targets:
+        is_layout = doc.suffix.lower() == ".ldrdoc"
+        entry: dict[str, Any] = {"document": str(doc)}
+        documents.append(entry)
+        if not doc.exists():
+            entry.update(success=False, error="file not found")
+            continue
+        try:
+            before = parse_ldrdoc(doc) if is_layout else review_drawing(doc)
+        except Exception as e:  # noqa: BLE001 - report per document
+            entry.update(success=False, error=f"could not read the saved file: {e}")
+            continue
+        run = await _run_harness_import(doc)
+        opened = run["open"] or {}
+        entry.update(opened)
+        entry.update(run["result"])
+        entry["document"] = str(doc)
+        entry["attempts"] = run["attempts"]
+        if run["sync_gaps"]:
+            entry["sync_gaps"] = run["sync_gaps"]
+        if entry.get("success") and entry.get("changed"):
+            await _report_harness_import(ctx, doc, is_layout, before, entry)
+        if opened.get("success") and not opened.get("was_open"):
+            closed = await _multiboard_document("close", doc)
+            entry["closed"] = bool(
+                closed and closed.get("success") and not closed.get("open")
+            )
+    return json.dumps(
+        {
+            "success": all(d.get("success") for d in documents),
+            "documents": documents,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def _layout_sync_gaps(layout: dict[str, Any], project: Path) -> list[str]:
+    """Wires of the project's wiring diagrams the saved layout does not carry
+    as they are: missing, or with another part number. Empty when in sync."""
+    source = {
+        w["unique_id"]: w
+        for wirdoc in get_harness_wiring_docs(project)
+        for w in parse_wirdoc(wirdoc)["wires"]
+    }
+    in_layout = {w["designator"] for w in layout["wires"]}
+    gaps = [
+        f"{name}: not in the layout"
+        for name in sorted({w["designator"] for w in source.values()} - in_layout)
+    ]
+    for w in layout["wires"]:
+        src = source.get(w.get("origin_uid"))
+        if src and (src.get("design_item_id") or "") != (w.get("part_number") or ""):
+            gaps.append(
+                f"{w['designator']}: part {w.get('part_number') or '(none)'}, "
+                f"wiring diagram {src.get('design_item_id') or '(none)'}"
+            )
+    return gaps
+
+
+# Seconds to wait before each import attempt; a layout still differing from its
+# wiring diagrams after the first is imported again after the longer wait.
+HARNESS_IMPORT_WAITS = (1.0, 5.0)
+
+# Standalone scripts (run_altium_script) that open, import and save, each a run
+# of its own. Not from the bridge: a save in a bridge run wrote the layout
+# without the import Altium held in memory (2026-10-29, cause not found; the
+# bridge runs as a script project, which takes the project focus), while the
+# same save as a standalone script wrote it. Every script first focuses the
+# document as the Projects panel does - a closed one is opened through its
+# project (IDocument.DM_OpenAndFocusDocument), an open one only shown: on an
+# open document DM_OpenAndFocusDocument reloads it from disk once the run
+# returns, discarding its unsaved changes - and checks that the document and
+# its project are focused; S2 holds the error if not.
+_FOCUS_PRELUDE = """S1 := '{path}';
+S2 := '';
+S4 := '';
+Obj3 := nil;
+for I1 := 0 to GetWorkspace.DM_ProjectCount - 1 do
+begin
+    Obj1 := GetWorkspace.DM_Projects(I1);
+    for I2 := 0 to Obj1.DM_LogicalDocumentCount - 1 do
+        if UpperCase(Obj1.DM_LogicalDocuments(I2).DM_FullPath) = UpperCase(S1) then
+        begin
+            Obj3 := Obj1.DM_LogicalDocuments(I2);
+            S4 := Obj1.DM_ProjectFullPath;
+        end;
+end;
+if Obj3 = nil then
+    S2 := 'error: no open project holds the document'
+else
+begin
+    Obj5 := Client.GetDocumentByPath(S1);
+    if Obj5 = nil then
+    begin
+        SandboxLog('open');
+        Obj3.DM_OpenAndFocusDocument;
+    end
+    else
+        Client.ShowDocument(Obj5);
+    Obj4 := Client.GetCurrentView;
+    if (Obj4 = nil) or (UpperCase(Obj4.OwnerDocument.FileName) <> UpperCase(S1)) then
+        S2 := 'error: Altium did not focus the document'
+    else if (UpperCase(GetWorkspace.DM_FocusedProject.DM_ProjectFullPath) <> UpperCase(S4)) then
+        S2 := 'error: Altium did not focus the project of the document';
+end;
+"""
+
+_OPEN_SCRIPT = (
+    _FOCUS_PRELUDE
+    + """if S2 <> '' then
+    ResultText := S2
+else
+    ResultText := 'opened';"""
+)
+
+_IMPORT_SCRIPT = (
+    _FOCUS_PRELUDE
+    + """if S2 <> '' then
+    ResultText := S2 + '; nothing was imported'
+else
+begin
+    SandboxLog('{process}');
+    ResetParameters;
+    RunProcess('{process}');
+    ResultText := 'imported';
+end;"""
+)
+
+_SAVE_SCRIPT = (
+    _FOCUS_PRELUDE
+    + """if S2 <> '' then
+    ResultText := S2 + '; nothing was saved'
+else if Obj5 = nil then
+    ResultText := 'error: the document is not open in Altium'
+else
+begin
+    // Obj5 is late bound: 'if Obj5.Modified then' always reads False
+    B1 := 0;
+    if BoolToStr(Obj5.Modified, True) = 'True' then
+    begin
+        B1 := 1;
+        SandboxLog('save');
+        Obj5.DoFileSave('');
+    end;
+    if BoolToStr(Obj5.Modified, True) = 'True' then
+        ResultText := 'error: the document was not saved'
+    else
+        ResultText := 'saved ' + IntToStr(B1);
+end;"""
+)
+
+
+async def _harness_import_script(template: str, doc: Path, process: str = "") -> dict:
+    """Run one of the import scripts on doc: {"success", "text"} or an error."""
+    script = template.format(path=str(doc).replace("'", "''"), process=process)
+    out = json.loads(await run_altium_script(None, script, 180))
+    text = str(out.get("result", ""))
+    if not out.get("success"):
+        return {
+            "success": False,
+            "error": out.get("altium_message") or out.get("error", "script failed"),
+            "executor_wedged": out.get("executor_wedged", False),
+        }
+    if text.startswith("error: "):
+        return {"success": False, "error": text[len("error: ") :]}
+    return {"success": True, "text": text}
+
+
+async def _run_harness_import(doc: Path) -> dict[str, Any]:
+    """Check (bridge command import_harness_changes), then open, import and
+    save one document, each a standalone script run (_FOCUS_PRELUDE). A layout
+    is checked against the wiring diagrams after the save, and imported again
+    after a longer wait while they differ. Returns {"open": the check's result
+    or None, "result": {success, saved, changed} or the failed step's error,
+    "attempts", "sync_gaps"}."""
+    try:
+        response = await altium_bridge.execute_command(
+            "import_harness_changes", {"document_path": str(doc)}
+        )
+    except TimeoutError as e:
+        response = {"success": False, "error": str(e)}
+    if not response.get("success", False):
+        error = {"success": False, "error": response.get("error", "unknown error")}
+        return {"open": None, "result": error, "attempts": 0, "sync_gaps": []}
+    opened = response.get("result", {})
+    if isinstance(opened, str):
+        try:
+            opened = json.loads(opened)
+        except ValueError:
+            opened = {
+                "success": False,
+                "error": f"unexpected Altium reply: {opened[:200]!r}",
+            }
+    if not opened.get("success"):
+        return {"open": opened, "result": opened, "attempts": 0, "sync_gaps": []}
+    shown = await _harness_import_script(_OPEN_SCRIPT, doc)
+    if not shown.get("success"):
+        return {"open": opened, "result": shown, "attempts": 0, "sync_gaps": []}
+
+    attempts = 0
+    gaps: list[str] = []
+    changed = False
+    result: dict[str, Any] = {}
+    for wait in HARNESS_IMPORT_WAITS:
+        attempts += 1
+        await asyncio.sleep(wait)
+        result = await _harness_import_script(
+            _IMPORT_SCRIPT, doc, opened.get("process", "")
+        )
+        if not result.get("success"):
+            break
+        result = await _harness_import_script(_SAVE_SCRIPT, doc)
+        if not result.get("success"):
+            break
+        changed = changed or result.pop("text") == "saved 1"
+        result.update(saved=True, changed=changed)
+        if doc.suffix.lower() != ".ldrdoc":
+            break
+        gaps = _layout_sync_gaps(parse_ldrdoc(doc), Path(opened.get("project") or ""))
+        if not gaps:
+            break
+    if gaps and result.get("success"):
+        result.update(
+            success=False, error="the layout still differs from the wiring diagrams"
+        )
+    return {"open": opened, "result": result, "attempts": attempts, "sync_gaps": gaps}
+
+
+async def _report_harness_import(
+    ctx: Context, doc: Path, is_layout: bool, before: dict[str, Any], entry: dict
+) -> None:
+    """After an import: repair a layout's connection point pins, and add what
+    changed to entry (success False when wires lost their route or a drawing
+    lost a component projection)."""
+    from harness_drawing import review_drawing
+
+    if not is_layout:
+        entry.update(_drawing_import_report(before, review_drawing(doc)))
+        if entry["projections_emptied"]:
+            entry["success"] = False
+        return
+    after = parse_ldrdoc(doc)
+    if any(c.get("unassigned_pins") for c in after["connectors"]):
+        repair = json.loads(await edit_harness_layout(ctx, str(doc)))
+        entry["pin_repair"] = {
+            k: repair.get(k)
+            for k in ("success", "saved", "connection_point_pins_synced", "error")
+            if k in repair
+        }
+        if not repair.get("success"):
+            entry["success"] = False
+        after = parse_ldrdoc(doc)
+    entry.update(_layout_import_report(before, after))
+    if entry["newly_unrouted_wires"]:
+        entry["success"] = False
+
+
 async def _simple_command(command: str, params: dict, what: str) -> str:
     """Run a bridge command and return its result as JSON text."""
     response = await altium_bridge.execute_command(command, params)

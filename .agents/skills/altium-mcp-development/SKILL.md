@@ -153,6 +153,20 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   risky statement (`SandboxLog('...')`); the last logged step tells you what died. Create your own
   `TStringList` objects rather than relying on provided ones. No inline variable declarations.
 - Coordinates: `Point(MilsToCoord(mils), MilsToCoord(mils))`; raw integers land in `_Frac` units.
+- In the sandbox the `Obj1..Obj9` scratch variables are `IDispatch` (late bound):
+  `if Obj1.Modified then` always reads False, while `BoolToStr(Obj1.Modified, True)` reads
+  the real value. Test a late-bound Boolean property as `BoolToStr(..., True) = 'True'`, or
+  declare a typed variable. This hid a working import for a whole session (2026-10-29).
+- `IDocument.DM_OpenAndFocusDocument` (open a document through its project, as the Projects
+  panel does) on a document that is already open reloads it from disk once the run returns,
+  discarding unsaved changes: call it only for a closed document, `Client.ShowDocument`
+  otherwise.
+- A save from a bridge run (the `Altium_API.PrjScr` script project) wrote a layout without
+  the import (`Sch:ImportChangesFromWiringDiagram`) Altium held in memory; the same save
+  from a standalone sandbox script wrote it (cause not found). `import_harness_changes`
+  therefore opens, imports and saves through `run_altium_script` and only checks through
+  the bridge. Verify any process-driven change (`RunProcess`) on the saved file, not by the
+  `Modified` flag.
 - `Replicate` keeps every UniqueId (the object, its pins, its parameters). Renew them on a copy
   (`RenewUniqueIds` in `schematic_utils.pas`) before registering it, or wires and layout
   drawings cannot tell copy and source apart. `add_harness_wiring(copy_objects=...)` does this;

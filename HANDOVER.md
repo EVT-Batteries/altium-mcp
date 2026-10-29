@@ -32,7 +32,7 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `3c0d247` (sessions 10-14 committed) | session 15: `server/harness_drawing.py`, `server/tests/test_harness_drawing.py`, `server/main.py`, `server/AltiumScript/other_utils.pas`, README, this file, `references/wirdoc-format.md` |
+| `altium-mcp/` | `feature/harness-support` | `5b1f71e` (sessions 10-15 committed) | session 16: `server/main.py`, `server/AltiumScript/{Altium_API,other_utils,schematic_utils}.pas`, `server/tests/test_harness_import.py`, skill `altium-mcp-development`, this file |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
@@ -44,7 +44,37 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 15 (2026-10-29): Draftsman harness drawings (uncommitted)
+### Session 16 (2026-10-29): `import_harness_changes` (uncommitted)
+Asked: run Altium's "Import Changes From ..." for layout and Draftsman drawings (the three HVIL
+layouts had been imported before their wires were synced: no wire part in the layout, so none
+in the drawings' BOM / wiring list).
+- **Altium's commands** (decompiled `Altium.Har.LayoutDrawing` / `Altium.Har.Core`, Draftsman
+  `.rcs`): layout `Sch:ImportChangesFromWiringDiagram` (`HarnessLayoutDrawingServerDocument.
+  ImportChangesFromWiringDiagram` -> `HarnessChangesWatcher.SynchroniseWiringDiagramToLayoutDrawing`
+  -> `WiringLayoutSynchronizer`, applied directly, no ECO dialog; updates wires in place, same
+  UniqueIDs); Draftsman `PcbDrawing:UpdateBoard` ("Import Changes From <layout>", self-closing
+  progress form; stored component projections survive, tables grow down from their top edge).
+- **Tool** `import_harness_changes(document_path)`: `.LdrDoc`, `.HarDwf` or `.PrjHar` (layouts
+  then drawings). Bridge command `import_harness_changes` = read-only check (kind, open project,
+  no unsaved document in the project, was_open); then three standalone scripts through
+  `run_altium_script` (`_OPEN_SCRIPT` / `_IMPORT_SCRIPT` / `_SAVE_SCRIPT` on `_FOCUS_PRELUDE`:
+  open a closed document with `DM_OpenAndFocusDocument`, show an open one, check document and
+  project focus). A layout is then compared with the saved wiring diagrams
+  (`_layout_sync_gaps`: missing wires, other part) and imported again after a longer wait while
+  they differ (`HARNESS_IMPORT_WAITS`); pin repair via `edit_harness_layout` when a connector
+  has unassigned pins; documents that were not open are closed again. Report:
+  `_layout_import_report` / `_drawing_import_report`.
+- **Findings** (also in the dev skill, §5): a save from a bridge run wrote the layout without
+  the in-memory import (cause not found; typed `IServerDocument`, focus on the doc did not
+  help); sandbox `if Obj.Modified then` on the IDispatch scratch variables always reads False
+  (use `BoolToStr`); `DM_OpenAndFocusDocument` on an open document reloads it after the run.
+- Verified on 15 renamed scratch copies of `HVIL_Harness_HVSL1200` (scratchpad `imp*`), then on
+  the real HVSL1200, Mini MSD and P42C-1 HVIL projects: all 7 wires got 5876 BR005, layout
+  connectors / CPs / bundles / routes unchanged against HEAD, drawings carry the wire data,
+  projections kept. 17 unit tests (`test_harness_import.py`); suite 192 passed, 13 pre-existing
+  failures. The running MCP daemon has the old code until the IDE restarts.
+
+### Session 15 (2026-10-29): Draftsman harness drawings
 Asked: can the MCP review / modify `.HarDwf`, clean up the Slave sense drawing, and fix its
 harness component view, which showed nothing (wanted: connector front / back pin views).
 - **Format** (`references/wirdoc-format.md`, "Draftsman drawings"): LZ4Stream-framed

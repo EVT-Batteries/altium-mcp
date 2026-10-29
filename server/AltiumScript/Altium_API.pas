@@ -1171,6 +1171,24 @@ begin
     Result := ExecuteMultiboardDocument(Action, DocPath);
 end;
 
+// import_harness_changes: "document_path" (.LdrDoc or .HarDwf)
+function ExecuteImportHarnessChangesCommand(RequestData: TStringList): String;
+var
+    i: Integer;
+    DocPath: String;
+begin
+    DocPath := '';
+    if (RequestData <> nil) then
+    begin
+        for i := 0 to RequestData.Count - 1 do
+        begin
+            if (Pos('"document_path"', RequestData[i]) > 0) then
+                DocPath := JSONLineValue(RequestData[i]);
+        end;
+    end;
+    Result := ExecuteImportHarnessChanges(DocPath);
+end;
+
 // Function to execute a command with parameters
 function ExecuteCommand(CommandName: String): String;
 var
@@ -1294,6 +1312,8 @@ begin
             Result := ExecuteGetSheetStyleCommand(RequestData);
         'multiboard_document':
             Result := ExecuteMultiboardDocumentCommand(RequestData);
+        'import_harness_changes':
+            Result := ExecuteImportHarnessChangesCommand(RequestData);
         'get_active_document':
             Result := GetActiveDocument(ROOT_DIR);
     else

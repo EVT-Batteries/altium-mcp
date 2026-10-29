@@ -336,6 +336,7 @@ begin
        (CommandName = 'convert_netlabels_to_text') or
        (CommandName = 'get_sheet_style') or
        (CommandName = 'multiboard_document') or
+       (CommandName = 'import_harness_changes') or
        (CommandName = 'take_view_screenshot') or
        (CommandName = 'get_symbol_primitives') or
        (CommandName = 'create_symbols_batch') or

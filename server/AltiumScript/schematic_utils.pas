@@ -5185,3 +5185,58 @@ begin
     end;
 end;
 
+// import_harness_changes: read-only check before Altium's "Import Changes
+// From ..." on a document of an open harness project: a layout drawing
+// (.LdrDoc) takes the wiring diagrams' changes (Design menu, process
+// Sch:ImportChangesFromWiringDiagram, no ECO dialog), a Draftsman drawing
+// (.HarDwf) re-reads its layout drawing (Tools menu, PcbDrawing:UpdateBoard).
+// Refused while a document of the project has unsaved changes, so only the
+// import is saved. The server opens, imports and saves afterwards as
+// standalone scripts (sandbox) that focus the document through its project,
+// not from this script project: a save here wrote the layout without the
+// import Altium held in memory, while the same save as a standalone script
+// wrote it (2026-10-29).
+function ExecuteImportHarnessChanges(DocPath: String): String;
+var
+    PrjPath   : String;
+    Kind      : String;
+    Process   : String;
+    Unsaved   : String;
+    WasOpen   : Boolean;
+begin
+    Result := '';
+    DocPath := StringReplace(DocPath, '/', '\', REPLACEALL);
+    Kind := SchDocumentKind(DocPath);
+    if (Kind = 'HarnessLayoutDrawing') then
+        Process := 'Sch:ImportChangesFromWiringDiagram'
+    else if (Kind = 'HarnessDrawing') then
+        Process := 'PcbDrawing:UpdateBoard'
+    else
+    begin
+        Result := '{"success": false, "error": "document_path must be a .LdrDoc or .HarDwf: ' +
+                  JSONEscapeString(DocPath) + '"}';
+        Exit;
+    end;
+    PrjPath := ProjectPathOfDocument(DocPath);
+    if (PrjPath = '') then
+    begin
+        Result := '{"success": false, "error": "no open harness project holds ' +
+                  JSONEscapeString(ExtractFileName(DocPath)) + '; open its project in Altium first"}';
+        Exit;
+    end;
+    // The import reads the documents in memory and the result is checked
+    // against the saved wiring diagrams, so everything must be saved
+    Unsaved := UnsavedProjectDocuments(PrjPath);
+    if (Unsaved <> '') then
+    begin
+        Result := '{"success": false, "error": "unsaved changes in Altium (' +
+                  JSONEscapeString(Unsaved) + '); save or discard them first", "modified": true}';
+        Exit;
+    end;
+    WasOpen := (FindOpenDocument(DocPath) <> nil);
+    Result := '{"success": true, "document": "' + JSONEscapeString(DocPath) +
+              '", "project": "' + JSONEscapeString(PrjPath) +
+              '", "process": "' + Process +
+              '", "was_open": ' + LowerCase(BoolToStr(WasOpen, True)) + '}';
+end;
+
