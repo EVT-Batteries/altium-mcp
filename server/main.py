@@ -4860,14 +4860,14 @@ async def get_screenshot(
     Take a screenshot of the Altium window, returned as viewable image content.
 
     Args:
-        view_type (str): Type of view to capture - 'pcb', 'sch' or 'mbs' (multi-board
-            schematic, .MbsDoc)
+        view_type (str): Type of view to capture - 'pcb', 'sch', 'mbs' (multi-board
+            schematic, .MbsDoc) or 'dwf' (Draftsman harness drawing, .HarDwf)
         zoom_to (list, optional): List of component designators (e.g. ["U12", "R42"]).
             PCB view only: Altium zooms to the bounding box of these components
             (plus a margin) before the capture, so the components fill the frame.
             Omit to capture at the current zoom level.
         document_path (str, optional): Absolute or relative path to a schematic,
-            harness or multi-board document to focus and capture.
+            harness, multi-board or Draftsman document to focus and capture.
 
     Returns:
         Image content of the captured window plus a JSON metadata text block
@@ -4905,9 +4905,12 @@ async def get_screenshot(
             focus_info = focus_info if isinstance(focus_info, dict) else {}
             focused_kind = str(focus_info.get("focused_kind", "") or "").upper()
             focused_document = focus_info.get("focused_document", "")
-            wanted_kind = {"pcb": "PCB", "sch": "SCH", "mbs": "SDDOC"}.get(
-                view_type.lower()
-            )
+            wanted_kind = {
+                "pcb": "PCB",
+                "sch": "SCH",
+                "mbs": "SDDOC",
+                "dwf": "HARNESSDRAWING",
+            }.get(view_type.lower())
             is_sch_match = wanted_kind == "SCH" and focused_kind in (
                 "SCH",
                 "HARNESSWIRINGDIAGRAM",
@@ -4915,10 +4918,13 @@ async def get_screenshot(
             )
             is_pcb_match = wanted_kind == "PCB" and focused_kind in ("PCB", "PCBLIB")
             is_mbs_match = wanted_kind == "SDDOC" and focused_kind == "SDDOC"
+            is_dwf_match = (
+                wanted_kind == "HARNESSDRAWING" and focused_kind == "HARNESSDRAWING"
+            )
             if (
                 wanted_kind
                 and focused_kind
-                and not (is_sch_match or is_pcb_match or is_mbs_match)
+                and not (is_sch_match or is_pcb_match or is_mbs_match or is_dwf_match)
             ):
                 logger.error(
                     f"Requested {view_type} view but {focused_kind} document is focused"
@@ -5762,8 +5768,9 @@ async def get_multiboard_data(
 
 
 async def _multiboard_document(action: str, path: Path) -> dict | None:
-    """Altium's hold on a multi-board document: {open, modified} after the
-    action (status / close / open), or None when Altium could not be asked."""
+    """Altium's hold on a document the server edits on disk (.MbsDoc, .HarDwf):
+    {open, modified} after the action (status / close / open), or None when
+    Altium could not be asked."""
     try:
         response = await altium_bridge.execute_command(
             "multiboard_document", {"action": action, "document_path": str(path)}
@@ -6027,6 +6034,202 @@ async def edit_multiboard_schematic(
             "was_open": was_open,
             "reopened": reopened,
             "summary": review["summary"],
+            "issues": review["issues"],
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+async def get_harness_drawing_data(
+    ctx: Context,
+    document_path: str,
+    include_template_items: bool = False,
+) -> str:
+    """
+    Review an Altium Draftsman harness drawing (.HarDwf, the fabrication drawing
+    of a harness project) from the saved file. Read-only; Altium is not used.
+
+    Reports every page (size, sheet template and whether its file exists, the
+    page's own items: id, type, title / text, position and size in mm from the
+    sheet's bottom-left corner, y up), every harness component view
+    (designator, view side, stored projection lines) and the stored component
+    projections, and lists issues: missing_template, empty_component_view (an
+    empty projection is stored, which Draftsman never recomputes),
+    outside_page, overlap (between the page's own items other than layout /
+    wiring views), todo_text.
+
+    Args:
+        document_path: Path to the .HarDwf.
+        include_template_items: Also list the items that come from the sheet
+            template (frame, title block).
+
+    Returns:
+        JSON with document, source (the layout drawing it shows), pages,
+        component_views, projections and issues.
+    """
+    from harness_drawing import review_drawing
+
+    p = Path(document_path).resolve() if document_path else None
+    if not p or p.suffix.lower() != ".hardwf" or not p.exists():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"document_path to a .HarDwf is required: {document_path!r}",
+            }
+        )
+    try:
+        review = review_drawing(p, include_template_items=include_template_items)
+    except (OSError, ValueError) as e:
+        return json.dumps({"success": False, "error": f"drawing not read: {e}"})
+    return json.dumps({"success": True, **review}, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+async def edit_harness_drawing(
+    ctx: Context,
+    document_path: str,
+    operations: list,
+    dry_run: bool = False,
+) -> str:
+    """
+    Edit an Altium Draftsman harness drawing (.HarDwf) on the saved file:
+    component views and their projections, item positions and texts, sheet
+    templates.
+
+    Draftsman has no script interface, so the tool edits the saved file: if
+    Altium holds the document it must have no unsaved changes (save it first);
+    the tool closes it, writes the file (backup in
+    C:/Users/Public/altium_mcp/backups) and opens it again. Operations apply in
+    order; if one fails nothing is written. Positions are mm from the sheet's
+    bottom-left corner, y up (a view's position is its bottom-left corner).
+    Review with get_harness_drawing_data and look with
+    get_screenshot(view_type="dwf", document_path=...).
+
+    Component views: Draftsman draws the projection stored for the view's
+    designator and side, and computes one only when none is stored, from the
+    connector footprint's 3D body found through the database library (the
+    lookup passes no table name). When that fails, as it has for every
+    connector of this workspace's DbLib, an empty projection is stored and
+    never recomputed. Compute the visible edges of the footprint's 3D
+    model yourself (extract the STEP with altium-society extract_step_model;
+    build123d shape.project_to_viewport(dir * 1000, up, (0, 0, 0)) with
+    Draftsman's frame per side, dir / up: Top (0,0,1)/(0,1,0), Bottom
+    (0,0,-1)/(0,1,0), Front (0,-1,0)/(0,0,1), Back (0,1,0)/(0,0,1), Left
+    (-1,0,0)/(0,0,1), Right (1,0,0)/(0,0,1); curves split into short lines)
+    and store them with set_component_projection; Draftsman keeps them.
+
+    Operations (dicts with "op"):
+      set_component_view {item_id, designator?, view_side?, scale?}
+          view_side Top|Bottom|Left|Right|Front|Back; scale e.g. 4 (4:1)
+      set_view_title {item_id, title?, title_position?}
+          any view; title may use =ComponentName, =ViewScale; title_position
+          "auto" (Draftsman centres it above the view) or [dx_mm, dy_mm]
+      set_component_projection {designator, view_side, lines_mm | lines_file}
+          lines [[x1, y1, x2, y2], ...] in mm, view frame, y up; lines_file a
+          JSON file with that list or {side: list}. Replaces the stored one.
+      remove_component_projection {designator, view_side?}
+          Drop stored projections so Draftsman computes them again on update.
+      copy_item {item_id, x_mm?, y_mm?, designator?, view_side?, scale?}
+          Copy an item on its page under a new id (e.g. a second view).
+      move_item {item_id, x_mm, y_mm}
+      set_text {item_id, text}           Text items
+      delete_item {item_id}              not template items
+      set_template {to, pages? | from?}  point pages (1-based) or every page
+          using template path "from" at an existing sheet template file
+
+    Args:
+        document_path: Path to the .HarDwf.
+        operations: List of operations.
+        dry_run: Apply in memory and report, write nothing.
+
+    Returns:
+        JSON with success, results per operation, saved, backup, was_open,
+        reopened and the review's issues after the edit.
+    """
+    import shutil
+    from datetime import datetime
+
+    from harness_drawing import (
+        DrawingEditError,
+        HarnessDrawing,
+        apply_operations,
+        review_drawing,
+    )
+
+    p = Path(document_path).resolve() if document_path else None
+    if not p or p.suffix.lower() != ".hardwf" or not p.exists():
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"document_path to a .HarDwf is required: {document_path!r}",
+            }
+        )
+    if not isinstance(operations, list) or not operations:
+        return json.dumps(
+            {"success": False, "error": "operations must be a non-empty list"}
+        )
+    try:
+        doc = HarnessDrawing(p)
+        results = apply_operations(doc, operations)
+    except (DrawingEditError, OSError, ValueError) as e:
+        return json.dumps({"success": False, "error": str(e), "saved": False})
+    if dry_run:
+        return json.dumps(
+            {"success": True, "dry_run": True, "saved": False, "results": results},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    status = await _multiboard_document("status", p)
+    was_open = bool(status and status.get("success") and status.get("open"))
+    if status and status.get("success") and status.get("modified"):
+        return json.dumps(
+            {
+                "success": False,
+                "saved": False,
+                "error": "Altium has unsaved changes in the document; save or discard them first",
+            }
+        )
+    if was_open:
+        closed = await _multiboard_document("close", p)
+        if not closed or not closed.get("success") or closed.get("open"):
+            return json.dumps(
+                {
+                    "success": False,
+                    "saved": False,
+                    "error": f"could not close the document in Altium: {closed}",
+                }
+            )
+    backup_dir = EXCHANGE_DIR / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    backup = backup_dir / f"{p.stem}.{datetime.now():%Y%m%d_%H%M%S}{p.suffix}"
+    shutil.copy2(p, backup)
+    try:
+        doc.save()
+    except OSError as e:
+        return json.dumps(
+            {
+                "success": False,
+                "saved": False,
+                "error": f"write failed: {e}",
+                "backup": str(backup),
+            }
+        )
+    reopened = None
+    if was_open:
+        opened = await _multiboard_document("open", p)
+        reopened = bool(opened and opened.get("success") and opened.get("open"))
+    review = review_drawing(p)
+    return json.dumps(
+        {
+            "success": True,
+            "saved": True,
+            "results": results,
+            "backup": str(backup),
+            "was_open": was_open,
+            "reopened": reopened,
             "issues": review["issues"],
         },
         indent=2,

@@ -212,6 +212,8 @@ begin
         Result := 'HarnessLayoutDrawing'
     else if (AnsiUpperCase(ExtractFileExt(Path)) = '.MBSDOC') then
         Result := 'SdDoc'
+    else if (AnsiUpperCase(ExtractFileExt(Path)) = '.HARDWF') then
+        Result := 'HarnessDrawing'
     else
         Result := 'SCH';
 end;
@@ -248,8 +250,9 @@ begin
     end;
 end;
 
-// multiboard_document: whether Altium holds a multi-board schematic (.MbsDoc,
-// kind SdDoc) and has unsaved edits in it, so the server can edit the saved
+// multiboard_document: whether Altium holds a document the server edits on
+// disk (multi-board schematic .MbsDoc, kind SdDoc; Draftsman harness drawing
+// .HarDwf, kind HarnessDrawing) and has unsaved edits in it, so the server can edit the saved
 // file while Altium does not hold it. Action "close" closes the document
 // only when it has no unsaved edits (never its project); "open" opens it, or
 // shows it when it is open already (no reload); "status" changes nothing.
@@ -281,7 +284,7 @@ begin
         else if (Action = 'open') then
         begin
             if (ServerDoc = nil) then
-                ServerDoc := Client.OpenDocument('SdDoc', DocPath);
+                ServerDoc := Client.OpenDocument(SchDocumentKind(DocPath), DocPath);
             if (ServerDoc <> nil) then
                 Client.ShowDocument(ServerDoc);
         end;
@@ -713,9 +716,14 @@ begin
         DocType := 'MBS';
         ClassName := '';
     end
+    else if LowerCase(ViewType) = 'dwf' then
+    begin
+        DocType := 'DWF';
+        ClassName := '';
+    end
     else
     begin
-        Result := '{"success": false, "error": "Invalid view type: ' + ViewType + '. Must be ''pcb'', ''sch'' or ''mbs''"}';
+        Result := '{"success": false, "error": "Invalid view type: ' + ViewType + '. Must be ''pcb'', ''sch'', ''mbs'' or ''dwf''"}';
         Exit;
     end;
 

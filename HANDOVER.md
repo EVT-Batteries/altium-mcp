@@ -1,7 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-28 (session 14: layout text justification, connection point names, unnamed
-layout objects by UniqueID) for a fresh agent session.
+Updated 2026-10-29 (session 15: Draftsman harness drawings, `.HarDwf`) for a fresh agent
+session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -24,13 +24,15 @@ another wiring diagram (`copy_objects`): the way to add a connector by script, s
 cannot place a harness connector from a desktop DbLib. Since session 14 `edit_harness_layout`
 places texts bottom-left unless given a `justification`, `show_name` really hides a connection
 point's name, and unannotated objects (`B?`, `CP?`) are addressed and checked by UniqueID.
-Open work: §8.
+Since session 15 (uncommitted) `get_harness_drawing_data` / `edit_harness_drawing` review and
+edit Draftsman harness drawings (`.HarDwf`) on the saved file, including the stored
+projections that harness component views draw. Open work: §8.
 
 ## 2. State at hand-over
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `1fa3dfe` (sessions 10-14 committed) | this file (session 14 marked committed) |
+| `altium-mcp/` | `feature/harness-support` | `3c0d247` (sessions 10-14 committed) | session 15: `server/harness_drawing.py`, `server/tests/test_harness_drawing.py`, `server/main.py`, `server/AltiumScript/other_utils.pas`, README, this file, `references/wirdoc-format.md` |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
@@ -41,6 +43,41 @@ The user commits themselves. **Do not commit or push unless asked.** Test on ren
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 15 (2026-10-29): Draftsman harness drawings (uncommitted)
+Asked: can the MCP review / modify `.HarDwf`, clean up the Slave sense drawing, and fix its
+harness component view, which showed nothing (wanted: connector front / back pin views).
+- **Format** (`references/wirdoc-format.md`, "Draftsman drawings"): LZ4Stream-framed
+  DataContract XML; pure-Python LZ4 block codec in `server/harness_drawing.py` (no new
+  dependency; ~1.5 s to write a 19 MB document, output ~ Altium's size). Geometry 1/96 in,
+  bottom-left origin, y up.
+- **Why component views were empty** (decompiled `Altium.Designer.PcbDrawing.dll`, Draftsman
+  extension; `Altium.Sch.Core` `ComponentServiceProvider`; `Altium.Edp.Classes`
+  `ComponentServiceByLibraryId`): Draftsman finds the connector's PCB library through the DbLib
+  with an empty table name and needs the footprint's 3D body exported to BREP; it computes a
+  projection only when none is stored and keeps the old lines on failure. All eight P42C-1
+  drawings held an empty P1/J1 Top entry, so no update could ever fill them. The failing step of
+  the native lookup was not isolated (live call of `GetLocalComponentPCBLibraryPath` from
+  DelphiScript not tried on an open harness project); removing the stale entry lets Draftsman
+  retry.
+- **Fix**: `set_component_projection` stores lines computed outside Altium (build123d
+  `project_to_viewport` of the STEP extracted with altium-society `extract_step_model`, in
+  Draftsman's frame); Draftsman keeps them. Calibrated live on renamed scratch copies
+  (`dwftest\MCP_Test_Dwf*.HarDwf`, opened as free documents with a non-existent source path):
+  lines stored y-up rendered upside down, so the tool stores -y; a view moved to (100, 100) mm
+  sat 100 mm from the sheet's bottom-left corner.
+- **Tools**: `get_harness_drawing_data` (pages, templates, items, component views, projections,
+  issues), `edit_harness_drawing` (ops `set_component_view`, `set_view_title`,
+  `set_component_projection`, `remove_component_projection`, `copy_item`, `move_item`,
+  `set_text`, `delete_item`, `set_template`; closes / writes / reopens like
+  `edit_multiboard_schematic`, backup in `C:\Users\Public\altium_mcp\backups`).
+  `get_screenshot(view_type="dwf")`. Bridge: `SchDocumentKind` maps `.HarDwf` ->
+  `HarnessDrawing`; `multiboard_document` opens with `SchDocumentKind` (was `SdDoc` only) and
+  serves both editors. Live-tested status -> close -> write -> reopen on an open scratch drawing.
+- Applied to `P42C-1_Slave_Sense_Harness.HarDwf` (workspace HANDOVER). Tests
+  `tests/test_harness_drawing.py` (14); suite 172 passed, same 13 pre-existing failures. The
+  running MCP daemon still has the old Python until the IDE restarts; everything was run with
+  `call_tool.py`.
 
 ### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (`1fa3dfe`)
 Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
@@ -677,6 +714,13 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
 5. `copy_objects` was tested within one harness project only: try a source sheet of another open
    project before relying on it. A `get_harness_data` option listing the objects inside a region
    would help choose `region` without a screenshot.
+6. Draftsman (session 15): isolate why the native component-view lookup fails (probe
+   `GetLocalComponentPCBLibraryPath` on the open harness document with and without the table
+   name; test a `Footprint Path` DbLib field) - if a library change fixes it, removing the
+   stored projections lets Draftsman draw them itself. Projection computation is the agent's
+   job today (build123d session); a helper that takes footprint + side and returns the lines
+   would save steps. Cavity numbers on face views would need Text items (no op yet); page
+   navigation / zoom to a view for screenshots (only `ViewFit`, all sheets).
 
 ## 9. How to verify
 ```powershell
