@@ -106,6 +106,14 @@ Read with `harness_layout.parse_ldrdoc`; written by `edit_harness_layout`
 (`ExecuteEditHarnessLayout` in `schematic_utils.pas`). Open kind `HarnessLayoutDrawing`; open the
 harness project first so the drawing has its wiring diagram. Document ObjectId 80.
 
+The layout's copies of the wiring-diagram objects (connectors, pins, wire data, splices,
+no-connects, each with `WiringDiagramOriginUniqueId`) carry what they had at the last import:
+a wire synced to the library after the import keeps `DesignItemId` empty and `Description` `*`
+in the layout (and so in the Draftsman BOM / wiring list) until the next import. Altium's
+import (Design > Import Changes From, process `Sch:ImportChangesFromWiringDiagram`,
+`WiringLayoutSynchronizer`, 2026-10-29) updates them in place (same UniqueIDs, geometry
+untouched); `import_harness_changes` runs it and saves through standalone scripts.
+
 | RECORD | ObjectId | Object | Key fields |
 |---|---|---|---|
 | 106 (top-level) | 81 | connector | `Location`, `Orientation` (0-3), `IsMirrored`, `WiringDiagramOriginUniqueId`; child 41 `LayoutDrawingSymbolModel<n>` (`IsImageParameter=T`, `Text` = `ViewName=..\|ViewType=ePhysicalView\|ViewSide\|Rotation\|Zoom\|MainModel=True..`) + child 30 image |
@@ -229,6 +237,15 @@ lengths + offset, or the fixed length) and which ignores a "Length" parameter on
 Fallback when the BOM has no row: `GetState_TotalLength`. So set branch lengths on bundles.
 
 ### Draftsman drawings (.HarDwf) (verified on Altium 26.7, 2026-10-29)
+
+- **Update from the layout**: Draftsman stores the BOM, wiring list and connection table data
+  it last read (a drawing whose layout wires had no part contains no "5876" at all).
+  Tools > Import Changes From <layout> = process `PcbDrawing:UpdateBoard`
+  (`DrawingDocumentActions.UpdateBoard` -> `BoardDataRetrievalService.UpdateBoardInformation`:
+  clones the old data, clears it, re-reads every board data item; a self-closing progress
+  form, no prompt). Stored component projections survive (the failed library lookup keeps
+  them); tables keep their top-left corner and grow down / right. `import_harness_changes`
+  runs it.
 
 - **Container**: DataContract XML of `DataSerialization.V1.DrawingDocumentData` written through
   K4os `LZ4Stream` (legacy lz4net framing): chunks of `varint flags` (1 compressed, 2 HC),

@@ -1,7 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-29 (session 15: Draftsman harness drawings, `.HarDwf`) for a fresh agent
-session.
+Updated 2026-10-30 (session 16: `import_harness_changes`; session 15: Draftsman harness
+drawings, `.HarDwf`) for a fresh agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -32,19 +32,20 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `5b1f71e` (sessions 10-15 committed) | session 16: `server/main.py`, `server/AltiumScript/{Altium_API,other_utils,schematic_utils}.pas`, `server/tests/test_harness_import.py`, skill `altium-mcp-development`, this file |
+| `altium-mcp/` | `feature/harness-support` | `1a93e86` (sessions 10-16 committed) | 2026-10-30 doc pass: README tool list, `references/wirdoc-format.md`, this file |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
-`a29063e`, session 14 `1fa3dfe`. Unit tests: 158 passed, 7 skipped, 13 pre-existing failures
-(§8 item 2).
+`a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`. Unit
+tests (2026-10-29): 192
+passed, 7 skipped, 13 pre-existing failures (§8 item 2).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 16 (2026-10-29): `import_harness_changes` (uncommitted)
+### Session 16 (2026-10-29/30): `import_harness_changes` (`1a93e86`)
 Asked: run Altium's "Import Changes From ..." for layout and Draftsman drawings (the three HVIL
 layouts had been imported before their wires were synced: no wire part in the layout, so none
 in the drawings' BOM / wiring list).
@@ -72,7 +73,11 @@ in the drawings' BOM / wiring list).
   the real HVSL1200, Mini MSD and P42C-1 HVIL projects: all 7 wires got 5876 BR005, layout
   connectors / CPs / bundles / routes unchanged against HEAD, drawings carry the wire data,
   projections kept. 17 unit tests (`test_harness_import.py`); suite 192 passed, 13 pre-existing
-  failures. The running MCP daemon has the old code until the IDE restarts.
+  failures. After the user's MCP restart (2026-10-30) the tool ran through the MCP on the Main
+  harness `.PrjHar`: W61-W63 got 5859/12 BK005, geometry unchanged, drawing updated.
+- Docs: README tool list (also `edit_harness_layout`, `get_multiboard_data`,
+  `edit_multiboard_schematic`, missing until now), workspace `AGENTS.md`, skill
+  `altium-harness-engineering` Steps 7 / 8, dev skill §5.
 
 ### Session 15 (2026-10-29): Draftsman harness drawings
 Asked: can the MCP review / modify `.HarDwf`, clean up the Slave sense drawing, and fix its
@@ -664,7 +669,10 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
   `_wire_break_orientation`; `_check_harness_links`; `sync_harness_library` engine
   `_sync_harness_from_library`; `run_altium_script` via `sandbox.py`; `get_harness_data`;
   `get_screenshot`; `edit_harness_layout` incl. the multi-run render sequence;
-  `get_multiboard_data`, `edit_multiboard_schematic`).
+  `get_multiboard_data`, `edit_multiboard_schematic`; `import_harness_changes` with
+  `_harness_import_targets`, `_run_harness_import`, the standalone scripts `_FOCUS_PRELUDE` /
+  `_OPEN_SCRIPT` / `_IMPORT_SCRIPT` / `_SAVE_SCRIPT` run by `_harness_import_script`,
+  `_layout_sync_gaps`, `_layout_import_report`, `_drawing_import_report`).
 - `harness_parser.py` - `.WirDoc` reader `parse_wirdoc` / `parse_wirdoc_records` (connectors per
   part object with visible pins, cavity / associated parts, wires, twists, shields, cables, wire
   breaks), `extract_ole_records`.
@@ -682,13 +690,16 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
   `ChildDesignatorText`, `FindLayoutObject`, `PlaceChildDesignator`, `PlaceChildText`,
   `SetBundleVertices`, `ProjectPathOfDocument`, `UnsavedProjectDocuments`, `RefreshFromLibrary`,
   `ConnectorPinIds`, `SyncConnectionPointPins`, `ExecuteEditHarnessLayout` (records incl. `VIEW`,
-  `WIRELEN`, `RELOADPROJECT`, `RENDER`, `TEXT`; result `render_pending` drives the extra runs).
-- `AltiumScript/Altium_API.pas` - `case CommandName of` dispatch (`'edit_harness_layout'`);
-  `other_utils.pas` - `EnsureDocumentFocused` skip-list, `SchDocumentKind`, `FindOpenDocument`.
-  `Altium_API.pas` / `other_utils.pas` are LF in the working tree (others CRLF) - keep each as is.
+  `WIRELEN`, `RELOADPROJECT`, `RENDER`, `TEXT`; result `render_pending` drives the extra runs);
+  `ExecuteImportHarnessChanges` (read-only check before an import: kind, open project, unsaved
+  documents, was_open).
+- `AltiumScript/Altium_API.pas` - `case CommandName of` dispatch (`'edit_harness_layout'`,
+  `'import_harness_changes'`); `other_utils.pas` - `EnsureDocumentFocused` skip-list,
+  `SchDocumentKind`, `FindOpenDocument`. All three `.pas` files are CRLF (checked 2026-10-29).
 - `tests/` (`test_harness_parser.py` fixtures pattern, `test_harness_layout.py` = synthetic
   layouts + tool with mocked parser/bridge, `test_harness_check.py`, `test_multiboard.py`,
-  `test_multiboard_edit.py`, `test_sandbox.py`).
+  `test_multiboard_edit.py`, `test_sandbox.py`, `test_harness_import.py` = the import tool with
+  mocked bridge and mocked `run_altium_script`).
 - `.agents/skills/altium-mcp-development/` (`scripts/call_tool.py`, `scripts/wirdoc_diff.py`,
   `scripts/r2r_method_at.py` = .NET error dialog address -> method, `references/wirdoc-format.md`
   = file formats incl. layout drawings, views, connection point pins, Draftsman lengths).
@@ -767,6 +778,13 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    job today (build123d session); a helper that takes footprint + side and returns the lines
    would save steps. Cavity numbers on face views would need Text items (no op yet); page
    navigation / zoom to a view for screenshots (only `ViewFit`, all sheets).
+7. `import_harness_changes` (session 16): find why a save from a bridge run drops the import
+   (probe the harness model's active project, `HarnessChangesWatcher.ActiveProjectFilePath`,
+   in a bridge run vs a sandbox run); if fixed, the open / import / save could move into the
+   bridge. The pin repair also runs when a connector's unassigned pins carry no wire (Main J3 /
+   J4 pins 3-6: one extra save cycle, 0 pins synced): repair only for pins with wires. Not
+   tried yet: a layout whose import adds or removes connectors / wires (expect new
+   connectors placed by Altium at its default spot).
 
 ## 9. How to verify
 ```powershell
