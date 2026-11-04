@@ -49,7 +49,6 @@ begin
             begin
                 // Found the designators parameter
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
-                i := ReadJSONStringArray(RequestData, i, DesignatorsList);
                 
                 break;
             end;
@@ -67,28 +66,6 @@ begin
     finally
         DesignatorsList.Free;
     end;
-end;
-
-// edit_schematic: sheet_path and save; the edits are in sch_edit_spec.txt
-function ExecuteEditSchematic(RequestData: TStringList): String;
-var
-    i         : Integer;
-    SheetPath : String;
-    Save      : Boolean;
-begin
-    SheetPath := '';
-    Save := False;
-    for i := 0 to RequestData.Count - 1 do
-    begin
-        if Pos('"sheet_path"', RequestData[i]) > 0 then SheetPath := JSONLineValue(RequestData[i])
-        else if Pos('"save"', RequestData[i]) > 0 then Save := Pos('true', RequestData[i]) > 0;
-    end;
-    if SheetPath = '' then
-    begin
-        Result := 'ERROR: edit_schematic needs sheet_path';
-        Exit;
-    end;
-    Result := EditSchematic(SheetPath, ROOT_DIR + 'sch_edit_spec.txt', Save);
 end;
 
 // edit_schematic: sheet_path and save; the edits are in sch_edit_spec.txt
@@ -131,11 +108,9 @@ begin
             // Look for class_name
             if (Pos('"class_name"', RequestData[i]) > 0) then
                 ComponentName := JSONLineValue(RequestData[i])
-                ComponentName := JSONLineValue(RequestData[i])
             // Look for net_names array
             else if (Pos('"net_names"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, SourceList);
                 i := ReadJSONStringArray(RequestData, i, SourceList);
             end;
         end;
@@ -199,7 +174,6 @@ begin
             // Look for optional designators array to zoom to before capture
             else if (Pos('"designators"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, DesignatorsList);
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
             end;
         end;
@@ -267,12 +241,10 @@ begin
             else if (Pos('"pins"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, PinsList);
-                i := ReadJSONStringArray(RequestData, i, PinsList);
             end
             // Look for graphics array
             else if (Pos('"graphics"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, GraphicsList);
                 i := ReadJSONStringArray(RequestData, i, GraphicsList);
             end
             // Look for description
@@ -308,12 +280,10 @@ var
     SourceList: TStringList;
     Visible: Boolean;
     Exclusive: Boolean;
-    Exclusive: Boolean;
 begin
     // Create a stringlist for layer names and extract the visible parameter
     SourceList := TStringList.Create;
     Visible := False;
-    Exclusive := True;
     Exclusive := True;
     
     try
@@ -323,7 +293,6 @@ begin
             // Look for layer_names array
             if (Pos('"layer_names"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, SourceList);
                 i := ReadJSONStringArray(RequestData, i, SourceList);
             end
             // Look for visible parameter
@@ -336,15 +305,10 @@ begin
             end
             else if (Pos('"exclusive"', RequestData[i]) > 0) then
                 Exclusive := (TrimJSON(Copy(RequestData[i], Pos(':', RequestData[i]) + 1, Length(RequestData[i]))) = 'true');
-            end
-            else if (Pos('"exclusive"', RequestData[i]) > 0) then
-                Exclusive := (TrimJSON(Copy(RequestData[i], Pos(':', RequestData[i]) + 1, Length(RequestData[i]))) = 'true');
         end;
-
 
         if SourceList.Count > 0 then
         begin
-            Result := SetPCBLayerVisibility(SourceList, Visible, Exclusive);
             Result := SetPCBLayerVisibility(SourceList, Visible, Exclusive);
         end
         else
@@ -445,7 +409,6 @@ begin
             if (Pos('"designators"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
-                i := ReadJSONStringArray(RequestData, i, DesignatorsList);
             end
             // Look for x_offset
             else if (Pos('"x_offset"', RequestData[i]) > 0) then
@@ -484,40 +447,6 @@ begin
         end;
     finally
         DesignatorsList.Free;
-    end;
-end;
-
-// Function to execute create PCB rule
-function ExecuteCreatePCBRule(RequestData: TStringList): String;
-var
-    i : Integer;
-    Kind, Name, Scope1, Scope2, Comment, ValueText : String;
-    Replace : Boolean;
-    Values  : TStringList;
-begin
-    Kind := ''; Name := ''; Scope1 := 'All'; Scope2 := 'All'; Comment := ''; ValueText := '';
-    Replace := False;
-    for i := 0 to RequestData.Count - 1 do
-    begin
-        if Pos('"rule_kind"', RequestData[i]) > 0 then Kind := JSONLineValue(RequestData[i])
-        else if Pos('"rule_name"', RequestData[i]) > 0 then Name := JSONLineValue(RequestData[i])
-        else if Pos('"scope1"', RequestData[i]) > 0 then Scope1 := JSONLineValue(RequestData[i])
-        else if Pos('"scope2"', RequestData[i]) > 0 then Scope2 := JSONLineValue(RequestData[i])
-        else if Pos('"comment"', RequestData[i]) > 0 then Comment := JSONLineValue(RequestData[i])
-        else if Pos('"values"', RequestData[i]) > 0 then ValueText := JSONLineValue(RequestData[i])
-        else if Pos('"replace"', RequestData[i]) > 0 then Replace := Pos('true', RequestData[i]) > 0;
-    end;
-    if (Kind = '') or (Name = '') then
-    begin
-        Result := 'ERROR: create_pcb_rule needs rule_kind and rule_name';
-        Exit;
-    end;
-    Values := TStringList.Create;
-    try
-        Values.Text := StringReplace(ValueText, ';', #13#10, REPLACEALL);
-        Result := CreatePCBRule(Kind, Name, Scope1, Scope2, Comment, Values, Replace);
-    finally
-        Values.Free;
     end;
 end;
 
@@ -674,70 +603,6 @@ begin
     end;
 end;
 
-// The outline records of a polygon or cutout request: one string of 'x|y'
-// records in internal units separated by ';', read with JSONLineValue
-function RequestOutline(RequestData: TStringList; Points: TStringList): Boolean;
-var
-    i : Integer;
-begin
-    for i := 0 to RequestData.Count - 1 do
-        if Pos('"outline"', RequestData[i]) > 0 then
-            Points.Text := StringReplace(JSONLineValue(RequestData[i]), ';', #13#10, REPLACEALL);
-    Result := Points.Count >= 3;
-end;
-
-function RequestText(RequestData: TStringList; Key: String; Default: String): String;
-var
-    i : Integer;
-begin
-    Result := Default;
-    for i := 0 to RequestData.Count - 1 do
-        if Pos('"' + Key + '"', RequestData[i]) > 0 then
-            Result := JSONLineValue(RequestData[i]);
-end;
-
-// Function to execute create polygon pour
-function ExecuteCreatePolygonPour(RequestData: TStringList): String;
-var
-    Points : TStringList;
-begin
-    Points := TStringList.Create;
-    try
-        if not RequestOutline(RequestData, Points) then
-        begin
-            Result := 'ERROR: create_polygon_pour needs an outline of at least three corners';
-            Exit;
-        end;
-        Result := CreatePolygonPour(RequestText(RequestData, 'layer', ''), RequestText(RequestData, 'net', ''),
-            RequestText(RequestData, 'name', ''), RequestText(RequestData, 'hatch', 'solid'),
-            RequestText(RequestData, 'pour_over_same_net', 'true') = 'true',
-            RequestText(RequestData, 'remove_dead_copper', 'true') = 'true',
-            StrToInt(RequestText(RequestData, 'track_size', '0')),
-            StrToInt(RequestText(RequestData, 'grid', '0')), Points);
-    finally
-        Points.Free;
-    end;
-end;
-
-// Function to execute create cutout
-function ExecuteCreateCutout(RequestData: TStringList): String;
-var
-    Points : TStringList;
-begin
-    Points := TStringList.Create;
-    try
-        if not RequestOutline(RequestData, Points) then
-        begin
-            Result := 'ERROR: create_cutout needs an outline of at least three corners';
-            Exit;
-        end;
-        Result := CreateCutout(RequestText(RequestData, 'kind', 'polygon'),
-                               RequestText(RequestData, 'layer', ''), Points);
-    finally
-        Points.Free;
-    end;
-end;
-
 // Extract the create symbols batch logic
 function ExecuteCreateSymbolsBatch(RequestData: TStringList): String;
 var
@@ -814,7 +679,6 @@ begin
             if (Pos('"designators"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
-                i := ReadJSONStringArray(RequestData, i, DesignatorsList);
             end;
         end;
 
@@ -842,7 +706,6 @@ begin
             // Look for designators array (optional - empty means use selection)
             if (Pos('"designators"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, DesignatorsList);
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
             end
             // Look for clearance_mils
@@ -880,7 +743,6 @@ begin
             if (Pos('"placements"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, PlacementsList);
-                i := ReadJSONStringArray(RequestData, i, PlacementsList);
             end;
         end;
 
@@ -894,153 +756,6 @@ begin
         end;
     finally
         PlacementsList.Free;
-    end;
-end;
-
-// Collect a string array parameter into OutList, decoded by the shared
-// reader (ReadJSONStringArray), as every other array parameter is.
-procedure ExtractRequestArray(RequestData: TStringList; Key: String; OutList: TStringList);
-var
-    i: Integer;
-begin
-    i := 0;
-    while (i < RequestData.Count) do
-    begin
-        if (Pos('"' + Key + '"', RequestData[i]) > 0) then
-            i := ReadJSONStringArray(RequestData, i, OutList);
-        i := i + 1;
-    end;
-end;
-
-// Designator placements arrive as pipe-delimited strings
-// ('Designator|CX|CY|Rotation|Height|StrokeWidth|Visible')
-// Same board file? Paths arrive with forward slashes and without commas (the
-// request parser strips them)
-function SameBoardFile(PathA: String; PathB: String): Boolean;
-var
-    A, B: String;
-begin
-    A := LowerCase(RemoveChar(StringReplace(PathA, '/', '\', REPLACEALL), ','));
-    B := LowerCase(RemoveChar(StringReplace(PathB, '/', '\', REPLACEALL), ','));
-    Result := (A = B);
-end;
-
-function ExecutePlaceDesignators(RequestData: TStringList): String;
-var
-    EntriesList: TStringList;
-    Expected: String;
-    Board: IPCB_Board;
-begin
-    // The placements were computed for one board: refuse to move anything on
-    // another one (focus can change between the snapshot and this call)
-    Expected := RequestParam('board', '');
-    Board := GetBoardSafe(0);
-    if (Expected <> '') and (Board <> nil) then
-        if not SameBoardFile(Board.FileName, Expected) then
-        begin
-            Result := 'ERROR: The focused PCB is ' + Board.FileName + ', not ' + Expected +
-                      ', the board these placements were computed for. Nothing was moved.';
-            Exit;
-        end;
-
-    EntriesList := TStringList.Create;
-    try
-        ExtractRequestArray(RequestData, 'placements', EntriesList);
-        if (EntriesList.Count > 0) then
-            Result := PlaceDesignatorsFromList(EntriesList)
-        else
-            Result := 'ERROR: No placements provided for place_designators';
-    finally
-        EntriesList.Free;
-    end;
-end;
-
-// Free silkscreen graphics (label-block links): "items" of +/- entries
-function ExecuteEditSilkGraphics(RequestData: TStringList): String;
-var
-    ItemsList: TStringList;
-    Expected: String;
-    Board: IPCB_Board;
-begin
-    Expected := RequestParam('board', '');
-    Board := GetBoardSafe(0);
-    if (Expected <> '') and (Board <> nil) then
-        if not SameBoardFile(Board.FileName, Expected) then
-        begin
-            Result := 'ERROR: The focused PCB is ' + Board.FileName + ', not ' + Expected +
-                      ', the board these graphics were computed for. Nothing was changed.';
-            Exit;
-        end;
-
-    ItemsList := TStringList.Create;
-    try
-        ExtractRequestArray(RequestData, 'items', ItemsList);
-        if (ItemsList.Count > 0) then
-            Result := EditSilkGraphics(ItemsList)
-        else
-            Result := 'ERROR: No items provided for edit_silk_graphics';
-    finally
-        ItemsList.Free;
-    end;
-end;
-
-// Designators to check (optional - empty means every visible designator)
-function ExecuteCheckSilkscreen(RequestData: TStringList): String;
-var
-    DesignatorsList: TStringList;
-begin
-    DesignatorsList := TStringList.Create;
-    try
-        ExtractRequestArray(RequestData, 'designators', DesignatorsList);
-        Result := CheckSilkscreen(DesignatorsList);
-    finally
-        DesignatorsList.Free;
-    end;
-end;
-
-// A scalar request parameter ("key": value), or Default when absent
-function RequestParam(Name: String; Default: String): String;
-begin
-    if (Params.IndexOfName(Name) >= 0) then
-        Result := Params.Values[Name]
-    else
-        Result := Default;
-end;
-
-// Run the ported Silkscreen Auto Placer (silk_autoplacer.pas)
-function ExecuteAutoPlaceSilkscreen(RequestData: TStringList): String;
-var
-    Scope, Positions, AutoHide, AllowUnder: TStringList;
-begin
-    Scope := TStringList.Create;
-    Positions := TStringList.Create;
-    AutoHide := TStringList.Create;
-    AllowUnder := TStringList.Create;
-    try
-        ExtractRequestArray(RequestData, 'designators', Scope);
-        ExtractRequestArray(RequestData, 'positions', Positions);
-        ExtractRequestArray(RequestData, 'auto_hide', AutoHide);
-        ExtractRequestArray(RequestData, 'allow_under', AllowUnder);
-        if (Positions.Count = 0) then
-            Result := 'ERROR: No autopositions enabled for auto_place_silkscreen'
-        else
-            Result := APS_Run(Scope, RequestParam('selected_only', 'false') = 'true', Positions,
-                RequestParam('failed_action', 'center'),
-                RequestParam('avoid_vias', 'true') = 'true',
-                StrToInt(RequestParam('rotation_strategy', '5')),
-                RequestParam('try_altered_rotation', 'true') = 'true',
-                RequestParam('second_pass', 'true') = 'true',
-                RequestParam('unhide_all', 'false') = 'true',
-                AutoHide, AllowUnder,
-                SafeStrToFloat(RequestParam('fixed_size_mils', '0')),
-                SafeStrToFloat(RequestParam('fixed_width_mils', '0')),
-                SafeStrToFloat(RequestParam('position_delta_mils', '16.535')),
-                RequestParam('outline_layer', ''));
-    finally
-        Scope.Free;
-        Positions.Free;
-        AutoHide.Free;
-        AllowUnder.Free;
     end;
 end;
 
@@ -1210,12 +925,10 @@ begin
             if (Pos('"source_designators"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, SourceList);
-                i := ReadJSONStringArray(RequestData, i, SourceList);
             end
             // Look for destination designators array
             else if (Pos('"destination_designators"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, DestList);
                 i := ReadJSONStringArray(RequestData, i, DestList);
             end
         end;
@@ -1267,38 +980,10 @@ begin
     end;
 end;
 
-// The board a PCB command names in "board_path", or '' to use the focused one
-function RequestBoardPath(RequestData: TStringList): String;
-var
-    i: Integer;
-begin
-    Result := '';
-    for i := 0 to RequestData.Count - 1 do
-    begin
-        if (Pos('"board_path"', RequestData[i]) > 0) then
-        begin
-            Result := Trim(JSONLineValue(RequestData[i]));
-            break;
-        end;
-    end;
-end;
-
 // Function to execute get output job containers
 function ExecuteGetOutputJobContainers(RequestData: TStringList): String;
 begin
     Result := GetOutputJobContainers(RequestOutJobPath(RequestData), ROOT_DIR);
-end;
-
-// Function to execute run DRC
-function ExecuteRunDRC(RequestData: TStringList): String;
-var
-    i, MaxViolations : Integer;
-begin
-    MaxViolations := 200;
-    for i := 0 to RequestData.Count - 1 do
-        if Pos('"max_violations"', RequestData[i]) > 0 then
-            MaxViolations := StrToInt(JSONLineValue(RequestData[i]));
-    Result := RunDRC(MaxViolations);
 end;
 
 // Function to execute run DRC
@@ -1328,7 +1013,6 @@ begin
         begin
             if (Pos('"container_names"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, ContainersList);
                 i := ReadJSONStringArray(RequestData, i, ContainersList);
             end;
         end;
@@ -1391,7 +1075,6 @@ begin
             end
             else if (Pos('"pads"', RequestData[i]) > 0) then
             begin
-                i := ReadJSONStringArray(RequestData, i, PadsList);
                 i := ReadJSONStringArray(RequestData, i, PadsList);
             end;
         end;
@@ -1478,7 +1161,6 @@ begin
             if (Pos('"designators"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
-                i := ReadJSONStringArray(RequestData, i, DesignatorsList);
                 break;
             end;
         end;
@@ -1511,7 +1193,6 @@ begin
     Result := GetProjectComponents(ROOT_DIR, IncludeParams);
 end;
 
-<<<<<<< HEAD
 function ExecuteConvertNetlabelsToTextCommand(RequestData: TStringList): String;
 var
     i: Integer;
@@ -1659,49 +1340,6 @@ begin
     end;
 end;
 
-// create_route_tracks: net_name, layer, width (internal units) and segments,
-// one string of 'x1|y1|x2|y2' records separated by ';'. A single string, not
-// an array, so it reads with JSONLineValue: the server writes only digits,
-// '-', '|' and ';' into it.
-function ExecuteCreateRouteTracks(RequestData: TStringList): String;
-var
-    i           : Integer;
-    NetName     : String;
-    LayerName   : String;
-    SegmentText : String;
-    Width       : Integer;
-    Segments    : TStringList;
-begin
-    NetName := '';
-    LayerName := '';
-    SegmentText := '';
-    Width := 0;
-    for i := 0 to RequestData.Count - 1 do
-    begin
-        if Pos('"net_name"', RequestData[i]) > 0 then
-            NetName := JSONLineValue(RequestData[i])
-        else if Pos('"layer"', RequestData[i]) > 0 then
-            LayerName := JSONLineValue(RequestData[i])
-        else if Pos('"width"', RequestData[i]) > 0 then
-            Width := StrToInt(JSONLineValue(RequestData[i]))
-        else if Pos('"segments"', RequestData[i]) > 0 then
-            SegmentText := JSONLineValue(RequestData[i]);
-    end;
-    if (NetName = '') or (LayerName = '') or (Width <= 0) or (SegmentText = '') then
-    begin
-        Result := 'ERROR: create_route_tracks needs net_name, layer, width and segments';
-        Exit;
-    end;
-
-    Segments := TStringList.Create;
-    try
-        Segments.Text := StringReplace(SegmentText, ';', #13#10, REPLACEALL);
-        Result := CreateRouteTracks(NetName, LayerName, Width, Segments);
-    finally
-        Segments.Free;
-    end;
-end;
-
 function ExecuteCommand(CommandName: String): String;
 var
     ViewHint   : String;
@@ -1788,8 +1426,6 @@ begin
             Result := ExecuteSetPCBLayerVisibility(RequestData);   
         'create_pcb_rule':
             Result := ExecuteCreatePCBRule(RequestData);
-        'create_pcb_rule':
-            Result := ExecuteCreatePCBRule(RequestData);
         'get_pcb_layer_stackup':
             Result := GetPCBLayerStackup(ROOT_DIR);         
         'get_selected_components_coordinates':
@@ -1814,22 +1450,10 @@ begin
             Result := ExecuteCheckSilkscreen(RequestData);
         'auto_place_silkscreen':
             Result := ExecuteAutoPlaceSilkscreen(RequestData);
-        'export_silkscreen_data':
-            Result := ExportSilkscreenData(ROOT_DIR);
-        'place_designators':
-            Result := ExecutePlaceDesignators(RequestData);
-        'edit_silk_graphics':
-            Result := ExecuteEditSilkGraphics(RequestData);
-        'check_silkscreen':
-            Result := ExecuteCheckSilkscreen(RequestData);
-        'auto_place_silkscreen':
-            Result := ExecuteAutoPlaceSilkscreen(RequestData);
         'get_symbol_primitives':
             Result := ExecuteGetSymbolPrimitives(RequestData);
         'create_symbols_batch':
             Result := ExecuteCreateSymbolsBatch(RequestData);
-        'edit_schematic':
-            Result := ExecuteEditSchematic(RequestData);
         'edit_schematic':
             Result := ExecuteEditSchematic(RequestData);
         'build_circuit':
@@ -1843,8 +1467,6 @@ begin
             Result := GetLayoutDuplicatorComponents(True);            
         'layout_duplicator_apply':
             Result := ExecuteLayoutDuplicatorApply(RequestData);            
-        'run_drc':
-            Result := ExecuteRunDRC(RequestData);
         'run_drc':
             Result := ExecuteRunDRC(RequestData);
         'get_pcb_rules':
@@ -1869,13 +1491,8 @@ begin
             Result := ExecuteCreatePolygonPour(RequestData);
         'create_cutout':
             Result := ExecuteCreateCutout(RequestData);
-        'create_polygon_pour':
-            Result := ExecuteCreatePolygonPour(RequestData);
-        'create_cutout':
-            Result := ExecuteCreateCutout(RequestData);
         'get_component_primitives':
             Result := ExecuteGetComponentPrimitives(RequestData);
-<<<<<<< HEAD
         'add_harness_wiring':
             Result := ExecuteAddHarnessWiring(ROOT_DIR, ROOT_DIR + 'harness_wiring_spec.txt');
         'convert_netlabels_to_text':
@@ -2056,13 +1673,10 @@ var
     Line: String;
     ValueStart: Integer;
     ErrText: String;
-    ErrText: String;
 begin
     // Initialize file paths based on script location
     InitializeFilePaths();
     RequestId := '';
-    CommandType := '';
-    LastScriptError := '';
     CommandType := '';
     LastScriptError := '';
 
@@ -2085,8 +1699,6 @@ begin
             // Consume the request: its disappearance tells the server the
             // script started, and a duplicate launch finds nothing to re-run
             DeleteFile(REQUEST_FILE);
-            LastProgress := 0;
-            ReportProgress;
             LastProgress := 0;
             ReportProgress;
 
@@ -2135,12 +1747,6 @@ begin
                     else
                         WriteResponse(False, '', 'Command execution failed');
                     LogScriptError('Error: Command execution failed: ' + CommandType);
-                    // The command logged why it gave up; pass that on
-                    if LastScriptError <> '' then
-                        WriteResponse(False, '', LastScriptError)
-                    else
-                        WriteResponse(False, '', 'Command execution failed');
-                    LogScriptError('Error: Command execution failed: ' + CommandType);
                 end;
             end
             else
@@ -2153,13 +1759,6 @@ begin
             Params.Free;
         end;
     except
-        // ExceptionMessage is Altium's own text for the error (the sandbox
-        // template reports it the same way)
-        ErrText := ExceptionMessage;
-        if CommandType <> '' then
-            ErrText := CommandType + ': ' + ErrText;
-        WriteResponse(False, '', 'Exception during script execution: ' + ErrText);
-        LogScriptError('Error: Exception during script execution: ' + ErrText);
         // ExceptionMessage is Altium's own text for the error (the sandbox
         // template reports it the same way)
         ErrText := ExceptionMessage;

@@ -270,8 +270,8 @@ Fallback when the BOM has no row: `GetState_TotalLength`. So set branch lengths 
   `LibraryDataReader.GetComponentByDesignItemID` (native) -> first PCBLIB model's `FilePath`;
   the file must exist; then `GetComponentByName(Pattern)` and `SaveModelToFile(.brep)`. On
   failure it keeps the old stored lines (`context.OldData`), so a first failure stores an empty
-  entry that blocks every later attempt. In the P42C-1 workspace (CSV DbLib, footprints found by
-  search path, no `Footprint Path` field) all eight drawings had an empty entry. The layout
+  entry that blocks every later attempt. With a CSV DbLib whose footprints are found by
+  search path (no `Footprint Path` field), every drawing tested had an empty entry. The layout
   drawing's physical views do not use this lookup (they store `LibraryPath=*` + `ModelName`).
 - **Projection frame** (`ProjectionByOCC.CalculateProjectionParams`, orthographic, visible
   edges only, lines only): dir / up = Top (0,0,1)/(0,1,0), Bottom (0,0,-1)/(0,1,0), Front

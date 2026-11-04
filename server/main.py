@@ -9,36 +9,6 @@ import os
 import re
 import subprocess
 import time
-=======
-from mcp.server.fastmcp import FastMCP, Context
-from mcp.server.fastmcp.utilities.types import Image as MCPImage
-from mcp.types import ToolAnnotations
-import json
-import os
-import time
-import asyncio
-import logging
-import logging.handlers
-import subprocess
-import tkinter as tk
-from tkinter import filedialog
-from pathlib import Path
-from typing import Dict, Any, Optional
-import sys
-import win32gui
-import win32ui
-import win32con
-import win32api
-import win32process
-from PIL import Image
-import glob
-import io
-import re
-import silkscreen
-import label_blocks
-import script_bundle
-import pcblib_file
->>>>>>> remotes/origin/main
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -202,24 +172,9 @@ _remove_leftover_temp_files()
 # Seconds for a running Altium to pick up a request (normally ~1-5 s), for a
 # cold Altium launch to get that far, for a started command to go without
 # reporting progress, and for any command to finish at all
-# cold Altium launch to get that far, for a started command to go without
-# reporting progress, and for any command to finish at all
 START_TIMEOUT = 20
 START_TIMEOUT_COLD = 240
 RESPONSE_TIMEOUT = 120
-RESPONSE_TIMEOUT_MAX = 30 * 60
-
-# How long to wait while another server's command holds the exchange folder
-LOCK_TIMEOUT = START_TIMEOUT_COLD + RESPONSE_TIMEOUT
-
-# Commands that change the design or write files. When one of them times out
-# it may have done some or all of its work, so it must not just be retried.
-MUTATING_COMMANDS = {
-    "create_net_class", "create_schematic_symbol", "set_component_position",
-    "move_components", "place_components", "create_symbols_batch", "build_circuit",
-    "create_footprints_batch", "layout_duplicator", "layout_duplicator_apply",
-    "run_output_jobs", "create_pcb_footprint",
-}
 RESPONSE_TIMEOUT_MAX = 30 * 60
 
 # How long to wait while another server's command holds the exchange folder
@@ -376,32 +331,7 @@ class AltiumConfig:
         self.save_config()
         return True
 
-    def discover_altium(self) -> bool:
-        """Keep the saved Altium path if it still exists, else look for one.
-
-        Never asks the user, so it is safe at import time. Called again
-        before commands, so an Altium started after the server, or one
-        updated to a new folder, is picked up without a restart.
-        """
-        if self.altium_exe_path and os.path.exists(self.altium_exe_path):
-            return True
-        found = find_altium_exe()
-        if not found:
-            return False
-        logger.info(f"Automatically found Altium at: {found}")
-        self.altium_exe_path = found
-        self.save_config()
-        return True
-
     def verify_paths(self):
-        """Verify that the paths in the configuration exist, prompt for input if they don't
-
-        Shows file dialogs, so it must not run on the event loop, and never
-        before the server has answered the client's initialize request: a
-        dialog nobody sees would hold the startup until the client gives up.
-        Messages go to the log only; under the stdio transport stdout is the
-        protocol channel.
-        """
         """Verify that the paths in the configuration exist, prompt for input if they don't
 
         Shows file dialogs, so it must not run on the event loop, and never
@@ -447,7 +377,6 @@ class AltiumConfig:
             logger.info(f"Script file not found at {self.script_path}. Prompting user for selection...")
 
             selected_path = filedialog.askopenfilename(
-                parent=root,
                 parent=root,
                 title="Select Altium Project File",
                 filetypes=[
@@ -572,18 +501,11 @@ class AltiumBridge:
 
         # Load configuration. Finding Altium needs nobody, so it happens now;
         # asking for a path waits for the first command (see ensure_paths)
-        # Load configuration. Finding Altium needs nobody, so it happens now;
-        # asking for a path waits for the first command (see ensure_paths)
         self.config = AltiumConfig()
-        self.config.discover_altium()
-        self._asked_for_paths = False
         self.config.discover_altium()
         self._asked_for_paths = False
 
         # Commands share a single request.json/response.json pair, so
-        # concurrent tool calls must be serialized or they clobber each other:
-        # within this server by the asyncio lock, and against other servers
-        # using the same exchange folder by the file lock
         # concurrent tool calls must be serialized or they clobber each other:
         # within this server by the asyncio lock, and against other servers
         # using the same exchange folder by the file lock
@@ -621,7 +543,6 @@ class AltiumBridge:
                     f"Altium_API.PrjScr, then retry.")
         return None
 
-<<<<<<< HEAD
     @contextlib.asynccontextmanager
     async def exclusive(self):
         """Hold the Altium bridge for one or more bridge runs.
@@ -715,7 +636,6 @@ class AltiumBridge:
         for _ in range(12):
             try:
                 text = read_altium_text(RESPONSE_FILE)
-                json.loads(text, strict=False)
                 json.loads(text, strict=False)
                 return text
             except (OSError, json.JSONDecodeError):
@@ -825,21 +745,8 @@ class AltiumBridge:
                 except OSError:
                     reply_mark = None
                 if reply_mark is not None and reply_mark != ignored_reply:
-            # Wait as long as the command keeps reporting progress, up to
-            # RESPONSE_TIMEOUT_MAX: a large batch is not stopped mid-way
-            start_time = last_progress = time.monotonic()
-            progress_mark = None
-            response_text = None
-            ignored_reply = None
-            while response_text is None:
-                try:
-                    reply_mark = RESPONSE_FILE.stat().st_mtime
-                except OSError:
-                    reply_mark = None
-                if reply_mark is not None and reply_mark != ignored_reply:
                     response_text = await self._read_response_text()
                     try:
-                        rid = json.loads(response_text, strict=False).get("request_id")
                         rid = json.loads(response_text, strict=False).get("request_id")
                     except (json.JSONDecodeError, AttributeError):
                         rid = None
@@ -859,23 +766,7 @@ class AltiumBridge:
                     progress_mark, last_progress = mark, now
                 if now - last_progress > timeout or now - start_time > max(RESPONSE_TIMEOUT_MAX, timeout):
                     break
-                    # Someone else's reply: a late one, or that of a server
-                    # still without the exchange lock. Leave it for its owner;
-                    # ours overwrites it when it comes.
-                    logger.warning(f"Ignoring a reply for request_id={rid}")
-                    response_text, ignored_reply = None, reply_mark
-                now = time.monotonic()
-                try:
-                    mark = PROGRESS_FILE.stat().st_mtime
-                except OSError:
-                    mark = None
-                if mark != progress_mark:
-                    progress_mark, last_progress = mark, now
-                if now - last_progress > timeout or now - start_time > max(RESPONSE_TIMEOUT_MAX, timeout):
-                    break
                 await asyncio.sleep(0.25)
-
-            if response_text is None:
 
             if response_text is None:
                 logger.error("Timeout waiting for response from Altium")
@@ -903,9 +794,6 @@ class AltiumBridge:
             # Log the raw response for debugging
             logger.info(f"Raw response (first 200 chars): {response_text[:200]}")
 
-            # Parse the JSON response. strict=False accepts control characters
-            # inside strings: JSONEscapeString escapes only CR, LF and TAB, and
-            # Altium text (descriptions, parameters) can hold others.
             # Parse the JSON response. strict=False accepts control characters
             # inside strings: JSONEscapeString escapes only CR, LF and TAB, and
             # Altium text (descriptions, parameters) can hold others.
@@ -1010,7 +898,6 @@ class AltiumBridge:
 # Create a global bridge instance
 altium_bridge = AltiumBridge()
 
-<<<<<<< HEAD
 
 async def _get_active_harness_path() -> Path | None:
     """The harness project (.PrjHar) or wiring document Altium has focused.
@@ -1126,7 +1013,6 @@ async def get_all_component_property_names(ctx: Context) -> str:
 
 
 @_tool(read_only=True)
-@_tool(read_only=True)
 async def get_component_property_values(ctx: Context, property_name: str) -> str:
     """
     Get values of a specific property for all components (PCB/Schematic or harness connectors).
@@ -1189,7 +1075,6 @@ async def get_component_property_values(ctx: Context, property_name: str) -> str
         return json.dumps(property_values, indent=2)
     except Exception as e:
         logger.error(f"Error processing component data: {e}")
-<<<<<<< HEAD
         return json.dumps({"error": f"Failed to process component data: {e!s}"})
 
 
@@ -1212,8 +1097,6 @@ async def get_symbol_placement_rules(ctx: Context) -> str:
 
         # Default rules content
         default_rules = (
-            "Your own pin placement rules, for example where power, ground, "
-            "inputs, outputs and no-connect pins go and how pin groups are spaced."
             "Your own pin placement rules, for example where power, ground, "
             "inputs, outputs and no-connect pins go and how pin groups are spaced."
         )
@@ -1253,7 +1136,6 @@ async def get_symbol_placement_rules(ctx: Context) -> str:
         )
 
 
-@_tool(read_only=True)
 @_tool(read_only=True)
 async def get_library_symbol_reference(ctx: Context) -> str:
     """
@@ -1356,8 +1238,6 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
     Create a new schematic symbol in the current library with the specified pins
     Instructions: follow the rules from get_symbol_placement_rules and the
                   reference symbol's conventions; keep pins on a 100 mil grid
-    Instructions: follow the rules from get_symbol_placement_rules and the
-                  reference symbol's conventions; keep pins on a 100 mil grid
 
     Pin name inversion/overbar: To show an overbar on a pin name (for active-low signals),
                   place a backslash after EACH character that should be overbarred.
@@ -1372,9 +1252,6 @@ async def create_schematic_symbol(ctx: Context, symbol_name: str, description: s
                     "pin_number|pin_name|pin_type|pin_orientation|x|y[|owner_part_id[|length[|show_name[|show_designator]]]]"
                     Pin types: eElectricHiZ, eElectricInput, eElectricIO, eElectricOpenCollector,
                                eElectricOpenEmitter, eElectricOutput, eElectricPassive, eElectricPower
-                    Pin orientations: eRotate0 (right), eRotate90 (up), eRotate180 (left), eRotate270 (down)
-                    x, y is where the pin meets the body; the pin extends from there
-                    in its orientation's direction (left-side pins eRotate180, top pins eRotate90)
                     Pin orientations: eRotate0 (right), eRotate90 (up), eRotate180 (left), eRotate270 (down)
                     x, y is where the pin meets the body; the pin extends from there
                     in its orientation's direction (left-side pins eRotate180, top pins eRotate90)
@@ -1720,7 +1597,6 @@ async def get_component_data(ctx: Context, cmp_designators: list) -> str:
 
 
 @_tool(read_only=True)
-@_tool(read_only=True)
 async def get_selected_components_coordinates(ctx: Context) -> str:
     """
     Get coordinates and positioning information for selected components in Altium layout
@@ -1830,7 +1706,6 @@ async def get_all_designators(ctx: Context) -> str:
 
 
 @_tool(read_only=True)
-@_tool(read_only=True)
 async def get_component_pins(ctx: Context, cmp_designators: list) -> str:
     """
     Get pin data for components in Altium PCB/Schematic, or connectors in harness wiring diagrams.
@@ -1885,8 +1760,6 @@ SANDBOX_PAS = SANDBOX_DIR / "Sandbox.pas"
 # Run files live in the exchange folder: Altium runs outside Claude Desktop's
 # MSIX package and cannot see the virtualized AppData path (issue #19)
 SANDBOX_RUNS = EXCHANGE_DIR / "runs"
-# Pictures of the dialogs a run answered (their text is often not readable)
-SANDBOX_DIALOGS = EXCHANGE_DIR / "dialogs"
 # Pictures of the dialogs a run answered (their text is often not readable)
 SANDBOX_DIALOGS = EXCHANGE_DIR / "dialogs"
 
@@ -2012,18 +1885,8 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
       (Integer), F1..F4 (Double), Obj1..Obj9 (IDispatch), List1..List3
       (TStringList, created empty by the sandbox - reuse with .Clear, never
       Free them), IntMan, DbDoc. Assigning an undeclared plain name is
-      (TStringList, created empty by the sandbox - reuse with .Clear, never
-      Free them), IntMan, DbDoc. Assigning an undeclared plain name is
       refused before Altium is called. Do not assign to a for-loop variable
       inside its loop (compile error).
-    - Calls known to crash Altium (GetState_DescriptionString, reading
-      .Corner or .BoundingRectangle through an IDispatch variable, ...) and
-      a PreProcess without PostProcess are refused before Altium is called:
-      a script that dies between PreProcess and PostProcess leaves Altium's
-      undo history broken until Altium is restarted.
-    - Every dialog the tool answers is saved as a picture first, listed in
-      "dialog_snapshots": Altium's own message boxes cannot be read from
-      outside, so open the picture to see the message.
     - Calls known to crash Altium (GetState_DescriptionString, reading
       .Corner or .BoundingRectangle through an IDispatch variable, ...) and
       a PreProcess without PostProcess are refused before Altium is called:
@@ -2047,24 +1910,8 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
       "loop guard" with the loop's line. Make loops that delete or retry
       objects bounded anyway (a fixed count, never the same object twice).
       for loops are not guarded.
-    - Loops: a running script cannot be stopped from outside, so a loop that
-      never ends would freeze Altium until it is killed. Every while and
-      repeat loop is therefore guarded: about 10 s before timeout_seconds all
-      loops exit, the rest of the script still runs (so a PostProcess after
-      the loop is not skipped), SaveDoc no longer saves, and the tool returns
-      "loop guard" with the loop's line. Make loops that delete or retry
-      objects bounded anyway (a fixed count, never the same object twice).
-      for loops are not guarded.
     - The sandbox is standalone: helpers and constants from the production
       units (TrimJSON, AddJSONProperty, ...) are NOT available; REPLACEALL is.
-    - Undo: wrap each edit in SchServer.ProcessControl.PreProcess(Doc, '') /
-      PostProcess(Doc, '') (PCBServer.PreProcess / PostProcess on a PCB), and
-      report changes to the robot manager (SCHM_PrimitiveRegistration for a new
-      object, SCHM_BeginModify / SCHM_EndModify around a change). An undo group
-      left open makes the user's own later edits in that document impossible
-      to undo until Altium restarts, so the sandbox closes any group the script
-      leaves open, even after an error, and reports it as
-      "undo_groups_closed": fix the script when you see it.
     - Undo: wrap each edit in SchServer.ProcessControl.PreProcess(Doc, '') /
       PostProcess(Doc, '') (PCBServer.PreProcess / PostProcess on a PCB), and
       report changes to the robot manager (SCHM_PrimitiveRegistration for a new
@@ -2078,8 +1925,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
       (ObjectID 32 = schematic, 33 = symbol library).
     - Copper: add routed tracks with route_track instead of computing segment
       ends here, and run check_routing after moving tracks, vias or parts.
-    - Copper: add routed tracks with route_track instead of computing segment
-      ends here, and run check_routing after moving tracks, vias or parts.
 
     For API guidance - interfaces, object models, worked examples - use the
     "altium-script" skill. ensure_altium_script_skill reports whether that
@@ -2089,8 +1934,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         script (str): DelphiScript statements to execute (body only, optionally
             preceded by a var block).
         timeout_seconds (int): How long to wait for completion (default 120).
-        skip_lint (bool): Run even though the known-crash check refused the
-            script. Only for a false positive.
         skip_lint (bool): Run even though the known-crash check refused the
             script. Only for a false positive.
 
@@ -2105,10 +1948,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         return json.dumps(
             {"success": False, "error": f"sandbox template missing: {SANDBOX_PAS}"}
         )
-
-    problem = altium_limit_problem()
-    if problem:
-        return json.dumps({"success": False, "error": problem})
 
     problem = altium_limit_problem()
     if problem:
@@ -2161,12 +2000,8 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     # The loops stop early enough for the script to finish and its result to
     # arrive before this tool gives up on it
     guard_seconds = max(5, timeout_seconds - 10)
-    # The loops stop early enough for the script to finish and its result to
-    # arrive before this tool gives up on it
-    guard_seconds = max(5, timeout_seconds - 10)
     try:
         files = sb.new_run_files()
-        built = sb.write(files, script, guard_seconds)
         built = sb.write(files, script, guard_seconds)
     except Exception as e:
         return json.dumps(
@@ -2180,17 +2015,7 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     # found again on every pass and must be reported once
     dismissed = {}
     snapshots = {}
-    snapshots = {}
     error_dialog = None
-
-    def snapshot(d):
-        if d.hwnd not in snapshots:
-            try:
-                snapshots[d.hwnd] = sandbox.snapshot_dialog(d, SANDBOX_DIALOGS)
-            except Exception as e:
-                logger.warning(f"dialog snapshot failed: {e}")
-                snapshots[d.hwnd] = None
-
 
     def snapshot(d):
         if d.hwnd not in snapshots:
@@ -2213,11 +2038,9 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
             ):
                 error_dialog = d
                 snapshot(d)
-                snapshot(d)
                 sandbox.answer_dialog(d)
                 break
             if time.time() - start > 6:
-                snapshot(d)
                 snapshot(d)
                 sandbox.answer_dialog(d)
                 dismissed[d.hwnd] = d
@@ -2234,27 +2057,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
         _clear_script_stuck()  # our script ran to the end: Altium is free
         result_text = sandbox.read_when_ready(files.result, read_altium_text).strip()
         sb.prune()
-        closed = [s[len(sandbox.UNDO_PREFIX):] for s in steps if s.startswith(sandbox.UNDO_PREFIX)]
-        if closed:
-            report["undo_groups_closed"] = closed
-            report["undo_warning"] = (
-                "The script called PreProcess without a matching PostProcess (or failed between "
-                "them). The sandbox closed the group so the user can still undo their own edits "
-                "in that document; pair every PreProcess with a PostProcess.")
-        guard = next((s for s in steps if s.startswith(sandbox.GUARD_PREFIX)), None)
-        if guard is not None:
-            m = re.search(r"line (\d+)", guard)
-            return json.dumps({
-                "success": False,
-                "error": "loop guard",
-                "altium_message": guard[len(sandbox.GUARD_PREFIX):],
-                "line": int(m.group(1)) if m else None,
-                "diagnosis": f"A while or repeat loop was still running after {guard_seconds} s, "
-                             "so every loop was cut short and the script ran to its end; Altium is "
-                             "free again. Statements after the loops ran on partial results and "
-                             "SaveDoc did not save: check the document before saving it. Make the "
-                             "loop bounded (a fixed count, never retrying the same object).",
-                "result": result_text, "steps": steps, "executor_wedged": False, **report}, indent=2)
         closed = [s[len(sandbox.UNDO_PREFIX):] for s in steps if s.startswith(sandbox.UNDO_PREFIX)]
         if closed:
             report["undo_groups_closed"] = closed
@@ -2310,12 +2112,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
             closed = await asyncio.to_thread(sb.close_leftover_undo, files)
             if closed:
                 report["undo_groups_closed"] = closed
-            # The script stopped before its end, so the template could not
-            # close the undo groups it had opened; a group left open makes
-            # the user's own edits in that document impossible to undo
-            closed = await asyncio.to_thread(sb.close_leftover_undo, files)
-            if closed:
-                report["undo_groups_closed"] = closed
         started = bool(steps)
         return json.dumps({
             "success": False,
@@ -2346,22 +2142,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
             },
             indent=2,
         )
-
-    # Still running: Stop and the recovery probe are window messages Altium
-    # is not reading, and each probe launch would only queue up behind it
-    if steps and await asyncio.to_thread(sandbox.altium_hung):
-        _mark_script_stuck("run_altium_script")
-        return json.dumps({
-            "success": False,
-            "error": f"no result after {timeout_seconds} s: the script is still running and "
-                     "Altium is not responding",
-            "last_step_reached": steps[-1],
-            "diagnosis": f"The script's while/repeat loops stop at {guard_seconds} s, so the time "
-                         "is going into a for loop or a single long Altium call. A running script "
-                         "cannot be stopped from outside. Wait for Altium; if it stays frozen, only "
-                         "ending X2.EXE frees it (unsaved work is lost). Do not retry until "
-                         "Altium responds.",
-            "steps": steps, "executor_wedged": True, **report}, indent=2)
 
     # Still running: Stop and the recovery probe are window messages Altium
     # is not reading, and each probe launch would only queue up behind it
@@ -2421,7 +2201,6 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     )
 
 
-@_tool()
 @_tool()
 async def ensure_altium_script_skill(ctx: Context, install: bool = False) -> str:
     """
@@ -2530,20 +2309,6 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
       offset come from the saved library file (Altium's script API cannot
       return them); "placement" says so, and they are null for a body that
       is not saved yet.
-      type/width/rotation, plating, paste_mode/paste_expansion,
-      mask_mode/mask_expansion, locked), tracks, arcs, fills, texts,
-      regions (outline vertices). Coordinates in mils relative to the
-      footprint origin (also for the footprint shown in the editor, which
-      Altium holds offset by the library origin); shapes and hole types as
-      raw Altium enum ints; layers as names. 3D component bodies are listed
-      apart in bodies_3d, not among the primitives, so the
-      create_footprints_batch round-trip is unchanged: model_file,
-      model_embedded, model_x/model_y (offset from the footprint origin),
-      standoff_height and overall_height (mils), layer, and
-      rotation_x/y/z (degrees) and model_z_offset (mils). The rotations and
-      offset come from the saved library file (Altium's script API cannot
-      return them); "placement" says so, and they are null for a body that
-      is not saved yet.
     - footprint_name "*": full dump of every footprint
 
     Use as the reference when recreating or validating footprints, and to
@@ -2557,8 +2322,6 @@ async def get_footprint_primitives(ctx: Context, library_path: str = "", footpri
 
     Returns:
         str: JSON - inventory: {library_name, footprint_count, footprints:
-             [{name, description, <type counts>}]}; dump: primitives and
-             bodies_3d per footprint
              [{name, description, <type counts>}]}; dump: primitives and
              bodies_3d per footprint
     """
@@ -2619,16 +2382,6 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
                 2 manual (with the expansion in mils). 0 (no mask) cannot
                 be set on a pad by script and is reported as a problem.
                 Omitted: rule. Every pad the tool creates is locked.
-            EDITFOOTPRINT|<name>      add MODEL3D records to an existing
-                                      footprint (never creates one; other
-                                      records under it are reported and
-                                      ignored)
-            PAD|name|x|y|rot|layer|plated|hole_size|hole_type|hole_width|hole_rot|top_x|top_y|top_shape[|corner_pct[|mode|mid_x|mid_y|mid_shape|bot_x|bot_y|bot_shape[|paste_mode|paste_expansion|mask_mode|mask_expansion]]]
-                Leave a field empty to skip it and still give a later one.
-                paste_mode/mask_mode are TMaskExpansionMode ints: 1 rule,
-                2 manual (with the expansion in mils). 0 (no mask) cannot
-                be set on a pad by script and is reported as a problem.
-                Omitted: rule. Every pad the tool creates is locked.
             TRACK|x1|y1|x2|y2|width|layer
             ARC|cx|cy|radius|start_angle|end_angle|width|layer
             FILL|x1|y1|x2|y2|rotation|layer
@@ -2643,20 +2396,8 @@ async def create_footprints_batch(ctx: Context, spec_file: str) -> str:
                 z offset appear only once the library is saved.
 
     The library is left modified and unsaved; the user saves it.
-            MODEL3D|<STEP file>|<layer>|<rot_x>|<rot_y>|<rot_z>|<z_offset>[|<x>|<y>[|<embed 1/0>]]
-                add a 3D body from a STEP file: rotations in degrees,
-                z_offset (model height above the board) and x|y (offset
-                from the footprint origin) in mils, embedded in the
-                library unless embed is 0. Read the result back with
-                get_footprint_primitives (bodies_3d); its rotations and
-                z offset appear only once the library is saved.
-
-    The library is left modified and unsaved; the user saves it.
 
     Returns:
-        str: JSON with created and edited counts, models_added,
-             primitive_errors, failed names and problems (e.g. a missing
-             model file, mask mode 0, a record EDITFOOTPRINT ignores)
         str: JSON with created and edited counts, models_added,
              primitive_errors, failed names and problems (e.g. a missing
              model file, mask mode 0, a record EDITFOOTPRINT ignores)
@@ -2705,8 +2446,6 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
 
     Once the sheet is saved, run check_schematic on it and fix what it finds.
 
-    Once the sheet is saved, run check_schematic on it and fix what it finds.
-
     Args:
         parts: component dicts. Required keys: designator, symbol_library
             (full path of a .SchLib file; .IntLib is not supported),
@@ -2728,22 +2467,11 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
         same precision: route from its values unrounded, or a wire ends up
         a few microns out of level and turns diagonal when its part moves.
 
-        All coordinates are mils and keep their fractions, so a metric sheet
-        can be drawn exactly (1 mm = 39.3700787 mil). The pin_map has the
-        same precision: route from its values unrounded, or a wire ends up
-        a few microns out of level and turns diagonal when its part moves.
-
     Returns:
         JSON with the created sheet name, counts, and the pin map - every
         placed pin's true connection point, for routing a follow-up call.
     """
     logger.info(f"Building schematic: {len(parts)} parts")
-
-    # The spec carries Altium coords (10000 per mil). Whole mils missed a
-    # metric grid by up to half a mil, and a wire that far out of level turns
-    # diagonal when its part is dragged.
-    def c(v):
-        return str(int(round(float(v) * 10000)))
 
     # The spec carries Altium coords (10000 per mil). Whole mils missed a
     # metric grid by up to half a mil, and a wire that far out of level turns
@@ -2828,7 +2556,6 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
             f = line.strip().split("|")
             if len(f) == 5 and f[0] == "PIN":
                 pin_map.setdefault(f[1], {})[f[2]] = [int(f[3]) / 10000, int(f[4]) / 10000]
-                pin_map.setdefault(f[1], {})[f[2]] = [int(f[3]) / 10000, int(f[4]) / 10000]
     result["pin_map"] = pin_map
     result["pin_map_note"] = (
         "Absolute electrical connection points. Route "
@@ -2836,7 +2563,6 @@ async def build_schematic(ctx: Context, parts: list, wires: list = None,
     )
     return json.dumps(result, indent=2)
 
-<<<<<<< HEAD
 
 HARNESS_SPEC_FILE = EXCHANGE_DIR / "harness_wiring_spec.txt"
 
@@ -3119,7 +2845,7 @@ async def add_harness_wiring(
             [
                 {
                     "designator": "W1",
-                    "net": "BMSS_C01_POS",           # written as the wire's Comment
+                    "net": "SIG_A",                  # written as the wire's Comment
                     "points": [16700, 8400, 11600, 8400, 11600, 13200, 6500, 13200],
                     "parameters": {"Gauge": "22 AWG", "Color": "Orange"},
                     "tcolor": 42495,                 # optional explicit drawing colour (TColor)
@@ -3148,7 +2874,7 @@ async def add_harness_wiring(
             ]
         labels (list): Text strings (ISch_Label, never net labels), e.g.:
             [
-                {"x": 16700, "y": 8400, "orientation": 0, "text": "BMSS_C01_POS"}
+                {"x": 16700, "y": 8400, "orientation": 0, "text": "SIG_A"}
             ]
         net_labels (list): Deprecated alias of labels.
         wire_updates (list): Parameters to upsert on existing wires, and names of parameters
@@ -3744,7 +3470,7 @@ async def edit_harness_layout(
             connection point does not split it: give one bundle per span.
         coverings (list): New or existing coverings (sleeves, tape, tubes) on bundles, e.g.
             [{"designator": "COV1", "bundles": ["B1", "B2"], "part_number": "...",
-              "source_library": "evt-components.DbLib", "thickness": 3,
+              "source_library": "my.DbLib", "thickness": 3,
               "start_offset_mm": -10, "end_offset_mm": 0}].
             Offsets are from the ends of the covered bundles: negative insets the covering,
             positive extends it past the end. "bundles" replaces the covered bundles.
@@ -4878,8 +4604,6 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     """
     Create many schematic symbols, or edit existing ones, in a single
     Altium script run.
-    Create many schematic symbols, or edit existing ones, in a single
-    Altium script run.
 
     Use instead of repeated create_schematic_symbol calls when creating
     more than a handful of symbols (bulk library imports/migrations): one
@@ -4938,53 +4662,8 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
 
     Every created or edited symbol is one undo step and marks the library
     as modified; nothing is saved - the user saves the library.
-            EDITSYMBOL|<name>   edit an existing symbol instead (its pins
-                                and graphics are left alone; a missing
-                                symbol is reported as failed, never created)
-            COMMENT|<text>[|<visible 1/0>]   set the Comment (empty text
-                                is allowed); hidden unless visible is 1
-            DESCRIPTION|<text>  set the Description
-            SYMPARAM|<name>|<value>|<visible 1/0>[|x|y[|justification[|font]]]
-                                add a symbol parameter, or replace one with
-                                that name. By default, visible ones without
-                                x|y go below the body's bottom-left corner,
-                                left-aligned, 100 mil apart in record order
-                                (leave a field empty to skip it and still
-                                give a later one). justification:
-                                bottom_left, bottom_center, bottom_right,
-                                center_left, center, center_right, top_left,
-                                top_center or top_right. font: <font
-                                name>:<size>, e.g. "Arial:10" (resolved by
-                                name, so it works in any document). Omitted
-                                fields keep the parameter's own. A parameter
-                                the tool positions gets Autoposition off, so
-                                Altium does not move it later.
-            PINPARAM|<pin number>|<name>|<value>   add (or replace) a hidden
-                                parameter on every pin with that number
-            PINDESC|<pin number>|<text>   set the Description of every pin
-                                with that number
-            PINSYMBOL|<pin number>|<edge>|<symbol>   set an IEEE symbol of
-                                every pin with that number. edge: inside,
-                                inside_edge, outside_edge or outside.
-                                symbol: a TIeeeSymbol name without the
-                                leading "e", any case - none, dot, clock,
-                                activelowinput, activelowoutput, schmitt,
-                                analogsignalin, digitalsignalin, opencollector,
-                                hiz, ... (the full list is in the
-                                altium-script skill, SCH_API_Reference.md,
-                                TIeeeSymbol). An unknown edge or symbol is
-                                reported under problems.
-            These records work after SYMBOL and EDITSYMBOL alike.
-            Each SYMBOL or EDITSYMBOL line starts a new symbol; the other
-            records belong to the most recent one.
-
-    Every created or edited symbol is one undo step and marks the library
-    as modified; nothing is saved - the user saves the library.
 
     Returns:
-        str: JSON object with created and edited counts, a failed name list
-             and problems (e.g. a pin number not in the symbol, an unknown
-             IEEE symbol or justification)
         str: JSON object with created and edited counts, a failed name list
              and problems (e.g. a pin number not in the symbol, an unknown
              IEEE symbol or justification)
@@ -5030,14 +4709,6 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
         str: JSON object - inventory mode: {library_name, symbol_count,
              symbols: [{name, description, part_count, <type counts>}]};
              dump mode: {library_name, symbol_name, description, part_count,
-             comment: {text, visible}, parameters: [{name, value, visible,
-             x, y, justification, autoposition, font: {name, size}}],
-             primitives: [...]} - x and y are where Altium holds the
-             parameter now. Pins also carry
-             description, symbol_inside, symbol_inside_edge,
-             symbol_outside_edge and symbol_outside (IEEE symbol names as
-             PINSYMBOL takes them), and their parameters [{name, value}]
-             when they have any
              comment: {text, visible}, parameters: [{name, value, visible,
              x, y, justification, autoposition, font: {name, size}}],
              primitives: [...]} - x and y are where Altium holds the
@@ -5105,9 +4776,6 @@ async def create_net_class(ctx: Context, class_name: str, net_names: list) -> st
         net_names (list): List of net names to add to the class
 
     Returns:
-        str: JSON object with the result of the operation. nets_added counts
-        the nets that were not in the class before; names the board has no
-        net for are listed in nets_not_found and not added.
         str: JSON object with the result of the operation. nets_added counts
         the nets that were not in the class before; names the board has no
         net for are listed in nets_not_found and not added.
@@ -6956,10 +6624,6 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
     what is on screen, and the window that was in front then gets the
     foreground back.
 
-    Altium comes to the front for about a second, because it only paints
-    what is on screen, and the window that was in front then gets the
-    foreground back.
-
     Args:
         view_type (str): Type of view to capture - 'pcb', 'sch' (schematic,
             harness wiring diagram .WirDoc or layout drawing .LdrDoc), 'mbs'
@@ -7111,12 +6775,8 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 # window comes back with a blank canvas. Letters typed while
                 # it is in front go to its menus (W then H tiles the
                 # documents), so whoever was in front gets the foreground back.
-                # window comes back with a blank canvas. Letters typed while
-                # it is in front go to its menus (W then H tiles the
-                # documents), so whoever was in front gets the foreground back.
                 activated = False
                 altium_pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-                previous_pid = win32process.GetWindowThreadProcessId(previous_window)[1] if previous_window else 0
                 previous_pid = win32process.GetWindowThreadProcessId(previous_window)[1] if previous_window else 0
 
                 def altium_is_foreground():
@@ -7228,7 +6888,6 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         # limits (a full-window capture is ~300 KB), while image blocks are
         # rendered natively by clients
         png_bytes = result.pop("image_data")
-        png_bytes = result.pop("image_data")
         zoom_info = response.get("result", {})
         if isinstance(zoom_info, dict) and "zoomed_component_count" in zoom_info:
             result["zoomed_component_count"] = zoom_info["zoomed_component_count"]
@@ -7237,7 +6896,6 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         result["captured_document"] = focused_document or None
         return [
             json.dumps(result),
-            MCPImage(data=png_bytes, format="png"),
             MCPImage(data=png_bytes, format="png"),
         ]
 
@@ -7348,9 +7006,6 @@ async def get_pcb_rules(ctx: Context) -> str:
     Get all design rules from the current Altium PCB
 
     Returns:
-        str: JSON array of PCB design rules: name, enabled, priority (1 is
-             the highest within a rule kind), descriptor, rule_kind and the
-             two scope expressions (filter1, filter2)
         str: JSON array of PCB design rules: name, enabled, priority (1 is
              the highest within a rule kind), descriptor, rule_kind and the
              two scope expressions (filter1, filter2)
@@ -7640,10 +7295,6 @@ async def get_outjob_settings(ctx: Context, outjob_path: str, include_raw_settin
             settings as the file has them, for outputs with a decoded
             summary. It doubles the reply. Outputs without a summary always
             have raw_settings.
-        include_raw_settings (bool): Also return raw_settings, the output's
-            settings as the file has them, for outputs with a decoded
-            summary. It doubles the reply. Outputs without a summary always
-            have raw_settings.
 
     Returns:
         str: JSON with path, group_name, variant, containers (name, type,
@@ -7651,10 +7302,8 @@ async def get_outjob_settings(ctx: Context, outjob_path: str, include_raw_settin
              (type, name, document_path, variant, connected_containers and a
              decoded summary for Gerber, NC Drill, test points, pick and
              place and print outputs, or sections by name for a BOM)
-             place and print outputs, or sections by name for a BOM)
     """
     try:
-        data = parse_outjob(outjob_path, include_raw=include_raw_settings)
         data = parse_outjob(outjob_path, include_raw=include_raw_settings)
     except FileNotFoundError:
         return json.dumps({"error": f"OutJob not found: {outjob_path}"})
@@ -8238,7 +7887,7 @@ async def edit_harness_drawing(
     designator and side, and computes one only when none is stored, from the
     connector footprint's 3D body found through the database library (the
     lookup passes no table name). When that fails, as it has for every
-    connector of this workspace's DbLib, an empty projection is stored and
+    connector of a CSV-backed DbLib tested so far, an empty projection is stored and
     never recomputed. Compute the visible edges of the footprint's 3D
     model yourself (extract the STEP with altium-society extract_step_model;
     build123d shape.project_to_viewport(dir * 1000, up, (0, 0, 0)) with
@@ -8812,7 +8461,6 @@ async def _simple_command(command: str, params: dict, what: str) -> str:
 
 
 @_tool(read_only=True)
-@_tool(read_only=True)
 async def get_project_info(ctx: Context) -> str:
     """
     Get the focused Altium project: parameters, documents and variants.
@@ -8878,16 +8526,8 @@ async def get_project_info(ctx: Context) -> str:
 async def get_project_components(ctx: Context, include_parameters: bool = False, designators: list = None,
                                  sheet: str = "", offset: int = 0, limit: int = 0,
                                  parameter_names: list = None) -> str:
-@_tool(read_only=True)
-async def get_project_components(ctx: Context, include_parameters: bool = False, designators: list = None,
-                                 sheet: str = "", offset: int = 0, limit: int = 0,
-                                 parameter_names: list = None) -> str:
     """
-<<<<<<< HEAD
     List every component of the compiled project (schematic or harness side).
-=======
-    List the components of the compiled project (schematic side).
->>>>>>> remotes/origin/main
 
     Compiles the focused project in memory first (nothing is saved). If the focused
     project is an Altium Harness project (.PrjHar), it automatically parses the wiring
@@ -8898,23 +8538,10 @@ async def get_project_components(ctx: Context, include_parameters: bool = False,
     offset=next_offset and the same filters for the rest. Filter first when
     you can: all parameters of every part can come to megabytes.
 
-    A large project does not fit in one reply. A reply stops at about 60,000
-    characters: when next_offset is not null, call again with
-    offset=next_offset and the same filters for the rest. Filter first when
-    you can: all parameters of every part can come to megabytes.
-
     Args:
         include_parameters (bool): Also return every component parameter
             (e.g. Manufacturer_Part_Number). Default False - the output is
             much larger with parameters.
-        designators (list): Only these designators. Wildcards work and case
-            does not matter, e.g. ["R*", "U1", "C1?"].
-        sheet (str): Only this sheet, by file name ("Power.SchDoc");
-            wildcards work.
-        offset (int): Skip this many matching components.
-        limit (int): At most this many components; 0 for as many as fit.
-        parameter_names (list): Return only these parameters, e.g.
-            ["Manufacturer_Part_Number"]. Implies include_parameters.
         designators (list): Only these designators. Wildcards work and case
             does not matter, e.g. ["R*", "U1", "C1?"].
         sheet (str): Only this sheet, by file name ("Power.SchDoc");
@@ -9017,7 +8644,6 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
 
 
 @_tool(read_only=True)
-@_tool(read_only=True)
 async def get_board_summary(ctx: Context) -> str:
     """
     Summarise the focused PCB for fabrication checks (or harness overview).
@@ -9067,7 +8693,6 @@ async def get_board_summary(ctx: Context) -> str:
     return json.dumps({"error": f"Failed to get board summary: {error_msg}"})
 
 
-@_tool(read_only=True)
 @_tool(read_only=True)
 async def get_component_primitives(ctx: Context, designators: list) -> str:
     """
@@ -9164,7 +8789,6 @@ async def create_pcb_footprint(ctx: Context, footprint_name: str, description: s
                 Coordinates are in mm relative to component origin (0,0).
                 Pin 1 is indicated by a gap in the top-left silkscreen corner.
                 Pads are created locked.
-                Pads are created locked.
 
     Courtyard & silkscreen are auto-generated from pad extents + 0.25 mm margin
     unless courtyard_x_mm / courtyard_y_mm are provided explicitly (half-dimensions).
@@ -9206,7 +8830,6 @@ async def create_pcb_footprint(ctx: Context, footprint_name: str, description: s
 @_tool(read_only=True)
 async def get_server_status(ctx: Context) -> str:
     """Get the current status of the Altium MCP server"""
-    altium_bridge.config.discover_altium()
     altium_bridge.config.discover_altium()
     status = {
         "server": "Running",

@@ -4,37 +4,10 @@ const
     PROGRESS_FILE = 'C:\Users\Public\altium_mcp\progress.txt';
     // The board the PCB tools last ran on, see FocusBoardForCommand
     LAST_BOARD_FILE = 'C:\Users\Public\altium_mcp\last_board.txt';
-    PROGRESS_FILE = 'C:\Users\Public\altium_mcp\progress.txt';
-    // The board the PCB tools last ran on, see FocusBoardForCommand
-    LAST_BOARD_FILE = 'C:\Users\Public\altium_mcp\last_board.txt';
 
 var
     // Why the last EnsureDocumentFocused call failed; reported to the server.
     FocusFailure : String;
-    // When ReportProgress last wrote PROGRESS_FILE
-    LastProgress : Double;
-    // The last message passed to LogScriptError during this run. A command
-    // that gives up with an empty result has logged why; Run replies with it.
-    LastScriptError : String;
-
-// Tell the server a long command is still working. The server waits as long
-// as this file keeps changing, instead of stopping the command after a fixed
-// time. Writes at most once a second, so it is cheap to call on every item
-// of a batch.
-procedure ReportProgress;
-var
-    L : TStringList;
-begin
-    if Now - LastProgress < 1 / 86400 then Exit;
-    LastProgress := Now;
-    L := TStringList.Create;
-    try
-        L.Text := FormatDateTime('yyyy-mm-dd hh:nn:ss', Now);
-        L.SaveToFile(PROGRESS_FILE);
-    except
-    end;
-    L.Free;
-end;
     // When ReportProgress last wrote PROGRESS_FILE
     LastProgress : Double;
     // The last message passed to LogScriptError during this run. A command
@@ -68,7 +41,6 @@ procedure LogScriptError(Msg: String);
 var
     L : TStringList;
 begin
-    LastScriptError := Msg;
     LastScriptError := Msg;
     L := TStringList.Create;
     try
@@ -239,7 +211,6 @@ begin
         Result := Copy(S, FieldStart, Length(S) - FieldStart + 1);
 end;
 
-<<<<<<< HEAD
 // A file path in one canonical spelling for comparisons: lower case,
 // backslashes, and doubled separators collapsed (a leading \\ of a UNC path
 // is kept)
@@ -600,7 +571,6 @@ begin
     // Commands that handle their own document management - skip focusing
     if (CommandName = 'search_library_symbol') or
        (CommandName = 'build_circuit') or
-<<<<<<< HEAD
        (CommandName = 'add_harness_wiring') or
        (CommandName = 'edit_harness_layout') or
        (CommandName = 'get_active_document') or
@@ -631,7 +601,6 @@ begin
        (CommandName = 'get_pcb_layers')                      or
        (CommandName = 'get_pcb_rules')                       or
        (CommandName = 'run_drc')                             or
-       (CommandName = 'run_drc')                             or
        (CommandName = 'get_selected_components_coordinates') or
        (CommandName = 'layout_duplicator')                   or
        (CommandName = 'layout_duplicator_apply')             or
@@ -644,21 +613,12 @@ begin
        (CommandName = 'edit_silk_graphics')                  or
        (CommandName = 'check_silkscreen')                    or
        (CommandName = 'auto_place_silkscreen')               or
-       (CommandName = 'export_silkscreen_data')              or
-       (CommandName = 'place_designators')                   or
-       (CommandName = 'edit_silk_graphics')                  or
-       (CommandName = 'check_silkscreen')                    or
-       (CommandName = 'auto_place_silkscreen')               or
        (CommandName = 'set_component_position')              or
-       (CommandName = 'create_vias')                         or
        (CommandName = 'create_vias')                         or
        (CommandName = 'set_pcb_layer_visibility')            or
        (CommandName = 'get_pcb_layer_stackup')               or
        (CommandName = 'create_pcb_rule')                     or
-       (CommandName = 'create_pcb_rule')                     or
        (CommandName = 'get_board_summary')                   or
-       (CommandName = 'create_polygon_pour')                 or
-       (CommandName = 'create_cutout')                       or
        (CommandName = 'create_polygon_pour')                 or
        (CommandName = 'create_cutout')                       or
        (CommandName = 'get_component_primitives')            then
@@ -724,15 +684,9 @@ begin
     if (DocumentKind = 'PCB') and (PCBServer <> Nil) then
     begin
         if FocusedBoard(0) <> Nil then
-        if FocusedBoard(0) <> Nil then
         begin
             RememberBoard(FocusedBoard(0).FileName);
-            RememberBoard(FocusedBoard(0).FileName);
             Result := True;
-        end
-        else
-            Result := FocusBoardForCommand(CommandName);
-        Exit;
         end
         else
             Result := FocusBoardForCommand(CommandName);

@@ -1,8 +1,8 @@
 """Read-only drawing check for Altium Harness Wiring Diagrams (.WirDoc).
 
-Wires are routed by the agent (skill altium-harness-routing) and moved in place
-with add_harness_wiring(reroutes=...). This module reports what is wrong with a
-sheet's saved drawing, against the AGENTS.md drawing rules:
+Wires are routed by the agent and moved in place with
+add_harness_wiring(reroutes=...). This module reports what is wrong with a
+sheet's saved drawing, against a default drawing style (the constants below):
 
 errors   - diagonal segments, wire ends on neither a pin hot end nor a splice,
            wires sharing a stretch with another wire (drawn on top of it),
@@ -26,7 +26,8 @@ from typing import Any
 
 from harness_parser import parse_wirdoc
 
-# Designator -> comment distance along the wire (AGENTS.md: 350-400 mils)
+# Default drawing style. Designator -> comment distance along the wire
+# (350-400 mils accepted)
 LABEL_SPACING = 375
 LABEL_ABOVE = 15
 LABEL_BELOW = -85
@@ -39,7 +40,7 @@ MIN_PARALLEL = 100
 MIN_CHANNEL_PITCH = 200
 MIN_STRAIGHT = 100
 LABEL_REACH = 120
-# Twist mark (user's style): 500 mils along the pair, rectangle 100 mils beyond
+# Twist mark: 500 mils along the pair, rectangle 100 mils beyond
 # each wire so the hook tips land on the wires
 TWIST_LENGTH = 500
 TWIST_OVERHANG = 100
@@ -194,7 +195,7 @@ def _connector_zones(pins: list[dict[str, Any]]) -> dict[str, Box]:
 
 
 def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
-    """Check the saved drawing of a .WirDoc against the AGENTS.md drawing rules.
+    """Check the saved drawing of a .WirDoc against the default drawing style.
 
     Returns:
         {"clean": bool, "summary": {...}, "problems": [...], "crossings": [...]}

@@ -5,12 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-<<<<<<< HEAD
     "mcp[cli]>=2.0.0",
     "olefile>=0.46",
-=======
-    "mcp[cli]>=1.30.0,<2",
->>>>>>> remotes/origin/main
     "pillow>=11.1.0",
     "pywin32>=310",
 ]

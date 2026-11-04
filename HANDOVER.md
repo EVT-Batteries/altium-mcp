@@ -3,9 +3,11 @@
 Updated 2026-11-03 (session 17: upstream v0.6.1 merged; session 16: `import_harness_changes`;
 session 15: Draftsman harness drawings, `.HarDwf`) for a fresh agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
-(+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
-developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
-workspace that holds this submodule.
+(+ `references/wirdoc-format.md`) before touching anything, and `AGENTS.md`: this file
+stays project-agnostic like the code (no design, workspace, company or user names, no machine
+paths). The real designs the tools were developed on are described generically ("a two-pin
+pigtail", "a four-sheet main harness"); their own state lives in the workspace that uses
+the server.
 
 ## 1. Goal
 
@@ -32,7 +34,7 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `3e7e2c7` (sessions 10-16 committed) | session 17: merge of `origin/main` (upstream v0.6.1) in progress, all conflicts resolved and staged, not committed (the user commits) |
+| `altium-mcp/` | `feature/harness-support` | `767380c` (upstream v0.6.1 merge, committed with conflict markers) | session 18: the resolved files restored from the stash of session 17's resolution, fixture-based tests, project-agnostic pass (not committed; the user commits) |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
@@ -99,10 +101,9 @@ feature working, regression-test all our tools.
   (`get_project_components` pages at ~60 kB: walk `next_offset`; the bridge passes a timeout
   argument). New `tests/test_bridge_exclusive.py` (6): lock held by another server, hung
   Altium, missing Altium, failure inside a result, `add_harness_wiring` on a busy bridge.
-- **Live regression** (renamed scratch copies of `HVIL_Harness_HVSL1200` as
-  `MCP_Test_Reg` / `MCP_Test_Reg2` and of `P42C-1_System.MbsDoc` as `MCP_Test_Mbs`, merged
-  code called directly with the server venv; scratchpad of session
-  `321510b5-e4a4-4867-bb9b-baa57eb1c7bc`): the merged 746 kB bundle compiles and runs;
+- **Live regression** (renamed scratch copies of a two-pin pigtail harness project as
+  `MCP_Test_Reg` / `MCP_Test_Reg2` and of a multi-board schematic as `MCP_Test_Mbs`, merged
+  code called directly with the server venv): the merged 746 kB bundle compiles and runs;
   `get_server_status`, `get_project_info`, `run_altium_script` (incl. lint refusal and
   clean recovery from a script error), `get_screenshot` (`sch` WirDoc / LdrDoc, `dwf`,
   `mbs`; reported kinds right), `add_harness_wiring` (copy, wires, no-connects, text,
@@ -119,7 +120,7 @@ feature working, regression-test all our tools.
   with the pre-merge code): §8 item 8.
 
 ### Session 16 (2026-10-29/30): `import_harness_changes` (`1a93e86`)
-Asked: run Altium's "Import Changes From ..." for layout and Draftsman drawings (the three HVIL
+Asked: run Altium's "Import Changes From ..." for layout and Draftsman drawings (three
 layouts had been imported before their wires were synced: no wire part in the layout, so none
 in the drawings' BOM / wiring list).
 - **Altium's commands** (decompiled `Altium.Har.LayoutDrawing` / `Altium.Har.Core`, Draftsman
@@ -142,18 +143,17 @@ in the drawings' BOM / wiring list).
   the in-memory import (cause not found; typed `IServerDocument`, focus on the doc did not
   help); sandbox `if Obj.Modified then` on the IDispatch scratch variables always reads False
   (use `BoolToStr`); `DM_OpenAndFocusDocument` on an open document reloads it after the run.
-- Verified on 15 renamed scratch copies of `HVIL_Harness_HVSL1200` (scratchpad `imp*`), then on
-  the real HVSL1200, Mini MSD and P42C-1 HVIL projects: all 7 wires got 5876 BR005, layout
-  connectors / CPs / bundles / routes unchanged against HEAD, drawings carry the wire data,
-  projections kept. 17 unit tests (`test_harness_import.py`); suite 192 passed, 13 pre-existing
-  failures. After the user's MCP restart (2026-10-30) the tool ran through the MCP on the Main
-  harness `.PrjHar`: W61-W63 got 5859/12 BK005, geometry unchanged, drawing updated.
+- Verified on 15 renamed scratch copies of a two-pin pigtail harness project, then on three
+  real harness projects: all 7 wires got their wire part, layout connectors / CPs / bundles /
+  routes unchanged against HEAD, drawings carry the wire data, projections kept. 17 unit tests (`test_harness_import.py`); suite 192 passed, 13 pre-existing
+  failures. After the user's MCP restart (2026-10-30) the tool ran through the MCP on a
+  four-sheet harness project: three wires got their wire part, geometry unchanged, drawing
+  updated.
 - Docs: README tool list (also `edit_harness_layout`, `get_multiboard_data`,
-  `edit_multiboard_schematic`, missing until now), workspace `AGENTS.md`, skill
-  `altium-harness-engineering` Steps 7 / 8, dev skill §5.
+  `edit_multiboard_schematic`, missing until now), dev skill §5.
 
 ### Session 15 (2026-10-29): Draftsman harness drawings
-Asked: can the MCP review / modify `.HarDwf`, clean up the Slave sense drawing, and fix its
+Asked: can the MCP review / modify `.HarDwf`, clean up a harness drawing, and fix its
 harness component view, which showed nothing (wanted: connector front / back pin views).
 - **Format** (`references/wirdoc-format.md`, "Draftsman drawings"): LZ4Stream-framed
   DataContract XML; pure-Python LZ4 block codec in `server/harness_drawing.py` (no new
@@ -163,8 +163,8 @@ harness component view, which showed nothing (wanted: connector front / back pin
   extension; `Altium.Sch.Core` `ComponentServiceProvider`; `Altium.Edp.Classes`
   `ComponentServiceByLibraryId`): Draftsman finds the connector's PCB library through the DbLib
   with an empty table name and needs the footprint's 3D body exported to BREP; it computes a
-  projection only when none is stored and keeps the old lines on failure. All eight P42C-1
-  drawings held an empty P1/J1 Top entry, so no update could ever fill them. The failing step of
+  projection only when none is stored and keeps the old lines on failure. All eight drawings
+  tested held an empty P1/J1 Top entry, so no update could ever fill them. The failing step of
   the native lookup was not isolated (live call of `GetLocalComponentPCBLibraryPath` from
   DelphiScript not tried on an open harness project); removing the stale entry lets Draftsman
   retry.
@@ -182,7 +182,7 @@ harness component view, which showed nothing (wanted: connector front / back pin
   `get_screenshot(view_type="dwf")`. Bridge: `SchDocumentKind` maps `.HarDwf` ->
   `HarnessDrawing`; `multiboard_document` opens with `SchDocumentKind` (was `SdDoc` only) and
   serves both editors. Live-tested status -> close -> write -> reopen on an open scratch drawing.
-- Applied to `P42C-1_Slave_Sense_Harness.HarDwf` (workspace HANDOVER). Tests
+- Applied to a real harness drawing. Tests
   `tests/test_harness_drawing.py` (14); suite 172 passed, same 13 pre-existing failures.
 - Second part (after an IDE restart, tools tested through the MCP): `add_callout` (custom-text
   callout snapped to a projection point; page point = view Location + (point - bound min) x
@@ -193,18 +193,18 @@ harness component view, which showed nothing (wanted: connector front / back pin
   (`dwftest\MCP_Prev_*.HarDwf`, `PcbDrawing:FitSheet` / `Zoom Action=Out`): the JAE MX84 rear view
   (staggered rows) showed Draftsman draws projections unmirrored. Draftsman stores a table's new
   size only when it saves, so the review reads old table sizes until then. Tests 16.
-- Third part (rollout to all P42C-1 drawings + template project): fixed `copy_table_format`
-  editing several tables at stale offsets (it worked on Slave sense only because all column
+- Third part (rollout to eight drawings + a template project): fixed `copy_table_format`
+  editing several tables at stale offsets (it worked on the first drawing only because all column
   blocks had the same length; now from the end of the document; regression test); `add_callout`
   adds Draftsman's default arrow style (`ArrowStyles/ArrowStyleData Id 1`) when the drawing has
-  none - callouts referencing a missing arrow style are not drawn (found on HVIL HVSL1200);
+  none - callouts referencing a missing arrow style are not drawn (found on a pigtail drawing);
   `set_view_scale` (any view, e.g. a layout at 0.75); `.HarDot` accepted by both drawing tools
   and mapped to `HarnessDrawing` in `SchDocumentKind`. Tests 17; suite 175 passed, same 13
-  pre-existing failures. Per-part rear sides / numbering: workspace skill
-  `altium-harness-engineering/references/connector-rear-views.md`.
+  pre-existing failures. Which model side is a connector's rear (wire side) differs per
+  library model: find it per part on asymmetric features.
 
 ### Session 14 (2026-10-28): layout text justification, CP names, unnamed objects (`1fa3dfe`)
-Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
+Found while tidying the layout of a high-voltage harness with ring lugs:
 - **`show_name` on a connection point now hides / shows its name.** Altium draws the name by
   its Designator text's `IsHidden`; `ShowName` is only read when it imports an old drawing
   (decompiled `SchHarnessLayoutConnectionPoint.HandleAfterImportEvent`). `CPOINT` sets both;
@@ -217,7 +217,7 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   `"justification"` (9 names, `TEXT_JUSTIFICATIONS`); `TEXT` record field 6, Pascal
   `PlaceChildText(..., Just)`. `get_harness_data` reports each text's `justification`.
   `IsMirrored` alone does not flip the glyphs and is left as it is.
-- Verified on the renamed scratch copy `hvt\MCP_Test_HV` (§7) with `call_tool.py`: raw records
+- Verified on a renamed scratch copy (`MCP_Test_HV`) with `call_tool.py`: raw records
   and `parse_ldrdoc` read back as intended (CP_X1 shown, CP1 hidden, B14 length J 2 -> 0, B15
   kept bottom-right on request, B13 name centred), no wire unrouted, real files untouched. Not
   re-checked by screenshot then (the user was working in Altium); after the IDE restart the
@@ -226,7 +226,7 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
 - **Unnamed objects sharing a designator ('B?', 'CP?') are told apart by UniqueID.**
   `edit_harness_layout` keyed connection point positions and the bundles it checks after the
   call by designator, so of 22 bundles all named `B?` it checked one arbitrary bundle against
-  another's ends (false `problems`, `success: false` on the HV layout), and naming a 'CP?'
+  another's ends (false `problems`, `success: false` on that layout), and naming a 'CP?'
   by unique_id in `from` / `to` or moving one could use another 'CP?''s position. Now
   `cp_pos` and `expect["bundles"]` are keyed by UniqueID (new objects: `DES:<designator>`),
   `check_layout` compares bundle ends by UniqueID and labels shared names `B? (<uid>)`, and an
@@ -249,7 +249,8 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   and wires, so a call can copy lugs and wire them. Result: `"copied"`; an empty region or
   unopenable source goes to `not_found` (`copy_region:` / `copy_source:`).
 - Why: Altium harness connectors cannot be placed from a desktop DbLib by script; copying a
-  placed one (Replicate) is how a sheet is replicated (HV harness Master1 -> Master2, 23 objects).
+  placed one (Replicate) is how a sheet is replicated (one sheet of lugs onto its twin, 23
+  objects).
 - Verified on renamed scratch copies in a scratch project, then on the real sheet: record counts
   per type exact, 0 UniqueIds shared with the source (377 new), wires drawn in the same call
   attached to the copied pins, `check_harness_wiring` identical to the source sheet. Unit tests
@@ -272,8 +273,8 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   `get_harness_data` reports `current_part_id` / `part_count` per part object, lists only its
   visible pins and reports `hidden_pin_cavity_parts`. New `clear_hidden_cavity_parts` (record
   `CLEARHIDDEN`); `sync_harness_library` uses it automatically and reports
-  `hidden_pin_cavity_parts_removed`. The old FH1 workaround left 64 stray terminals (4 per pin)
-  on part A's hidden pins 11-20 of P42C-1 Top; sync removed them.
+  `hidden_pin_cavity_parts_removed`. The old workaround on a two-part fuse holder left 64
+  stray terminals (4 per pin) on part A's hidden pins 11-20; sync removed them.
 - **Wire component kind**: `component_kind` on `wires` / `wire_updates` (record `WIREKIND`,
   `SetState_ComponentKind`; the `ComponentKind` property does not exist in DelphiScript);
   `standard_no_bom` draws a connection that is not a BOM wire (bus bar links). Parser:
@@ -293,8 +294,8 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   without twists / breaks) and `sync_harness_library` passes `relink=True`.
 - Tests: 3 new (`test_parse_multipart_connector`, `..._kinds_visibility_breaks`,
   `..._rejects_unknown_kind_and_style`); 153 passed, same 13 old failures. Verified live on
-  scratch copies of P42C-1 Top (`MCP_Test_Multi`, `MCP_Test_TopRun`), then applied to the
-  four P42C-1 Main harness sheets.
+  scratch copies of a sheet with that fuse holder (`MCP_Test_Multi`, `MCP_Test_TopRun`), then
+  applied to the four sheets of a real harness.
 
 ### Session 11 (2026-10-27): harness entry components (`aedbea7`)
 - `edit_multiboard_schematic` gains `assign_entry_parts` and the tool-level shortcut
@@ -313,8 +314,8 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   New issues: `harness_entry_without_part` (info) and `entry_part_mismatch` (error).
   `harness_review` rows gain `connector_part`.
 - Verified on scratch copy `mbs_test\MCP_Test_Assign.MbsDoc`: Altium loads it, and an Altium
-  save keeps the 20 components, 228 pin pairs and net names. Then applied to
-  `P42C-1_System.MbsDoc`: 0 errors, 82 nets.
+  save keeps the 20 components, 228 pin pairs and net names. Then applied to a real system
+  schematic: 0 errors, 82 nets.
 - Also found by decompiling: Cable and Direct connections can start only on a module entry
   that has no connection yet (`ModuleEntryDragDropBehavior.CanEnter`). Direct lines never
   branch, and a branch only joins a line of the same type (`CanConnectToHost`).
@@ -326,7 +327,7 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   numbers (DbLib `Mating Part`, either way), assigns entries to harness connectors (`entry_map`
   for identical ones) and traces nets through wired pins only (no-connect pins keep callout
   text as net name) and inline connector pin pairs. Each harness connection is one instance,
-  so a project used twice (slave sense harness) is traced twice.
+  so a harness project used twice (one per module) is traced twice.
 - Format and editor behaviour from decompiled `Altium.Designer.SystemDesign.dll`
   (`LogicalObjects.Serialization.V1`, `CommandBuilder.CreateInlineConnection`,
   `ModuleEntryCreator.PlaceEntryOnConnection`): inline connectors only come from placing an
@@ -342,15 +343,16 @@ Found while tidying the HV harness layout (P42C-1 workspace HANDOVER):
   connect positions (entry position + direction x gridSize); Python `ZipInfo()` turns `\` into
   `/` in member names on Windows (set `.filename` afterwards). Verified live on scratch copies:
   Altium loads the result, and an Altium re-save keeps every added object (it only renumbers
-  system parameters and styles). Then applied to `P42C-1_System.MbsDoc` (MOD_5 J3/J4 swap,
-  H_1.Entry_4 -> H_5 inline DTM04-6P / DTM06-6S): 0 errors, all 82 traced nets closed.
+  system parameters and styles). Then applied to a real system schematic (an entry part
+  swap, one harness joined to another through an inline 6-way pair): 0 errors, all 82 traced
+  nets closed.
 - **Upstream 0.5.1 merged** (`6a76414`, repaired in `0bdbf41`): our Ctrl+F3 recovery,
   `_blocking_altium_dialogs` and `test_script_recovery.py` are gone; script recovery is upstream's
   (`server/sandbox.py` for sandbox runs, the `mcp_script_stuck.txt` marker + `EditScript:Stop`
   for bridge timeouts; see the dev skill §5). `requirements.txt` re-exported from `uv.lock`
   (olefile was missing).
-- Layout: a connection point may hold a no-connect (`8681502`; the HVSL1200 HVIL pigtail's free
-  wire ends TERM1/TERM2 sit in CP1/CP3).
+- Layout: a connection point may hold a no-connect (`8681502`; a pigtail's free wire ends,
+  no-connects TERM1/TERM2, sit in CP1/CP3).
 
 ### Session 9 (2026-10-22): limitations found while wiring a real harness (no code change)
 Three tool limitations, details in §6 "Multi-part connectors", "Cavity parts and ERC",
@@ -364,9 +366,9 @@ Three tool limitations, details in §6 "Multi-part connectors", "Cavity parts an
   two sense sheets, 6 crossings vs 1 and 7 segments through connectors on a comm sheet).
   New read-only `check_harness_wiring` (`harness_check.py`, also home of `label_positions`);
   parser reports visible wire label positions (`designator_pos` / `comment_pos`). Routing is done
-  by the agent following the workspace skill `altium-harness-routing`.
+  by the agent, following the drawing style of the project it works on.
   Tests: 11 new in `test_harness_check.py`; 106 passed, same 15 old failures.
-- Twist style (user's correction): rectangle 100 mils beyond each wire so the hook tips land on
+- Twist style (default): rectangle 100 mils beyond each wire so the hook tips land on
   the wires, 500 mils along (vertical pair `rotation: 1`). `check_harness_wiring` checks the style
   and twists on labels.
 
@@ -501,9 +503,9 @@ lengths":
   `EnsureDocumentFocused`, the screenshot path in `Altium_API.pas` and the zoom check.
   `get_screenshot(view_type="sch", document_path=<.LdrDoc>)` works.
 - `call_tool.py` saves image results to `%TEMP%\altium_mcp_<tool>_<ns>.png` and prints the path.
-- **Pre-existing test failures (13 since session 12, were 15):** they read a real WirDoc of the
-  development workspace that has since changed. Fix the tests to use synthetic records
-  (`parse_wirdoc_records`).
+- **The 13 long-standing test failures** (tests reading real design files that had since
+  changed) were replaced in session 18 by tests on the synthetic fixture project
+  (`tests/harness_fixture.py`); no test reads a design file any more.
 
 ## 4. Key decisions and why
 - **DB is the single source of truth**; parameters written by `sync_harness_library`, never typed.
@@ -608,8 +610,8 @@ lengths":
   lengths (`LengthLong`, `Physical*`) are internal coords: mm = coord / 10000 * 0.0254.
 - Bash heredoc + `< /dev/null` on the same python command: stdin goes to /dev/null and python starts
   a REPL (hangs). Write scripts to files in the scratchpad instead.
-- **Multi-part connectors (found session 9 on an MTA 0301640 fuse holder, symbol
-  `FUSE_HOLDER_2x10_MINIVAL`, parts A = sockets 1-10, B = 11-20; fixed session 12).** Each placed
+- **Multi-part connectors (found session 9 on a two-part fuse holder, parts A = sockets
+  1-10, B = 11-20; fixed session 12).** Each placed
   part is its own component object (own UniqueID) carrying *all 40 pins*; only the pins whose
   `OwnerPartId` = the part's `CurrentPartId` are visible, the others sit hidden at the same
   relative positions (a hidden pin can share a visible pin's hot end). Every lookup by
@@ -791,47 +793,9 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
   `scripts/r2r_method_at.py` = .NET error dialog address -> method, `references/wirdoc-format.md`
   = file formats incl. layout drawings, views, connection point pins, Draftsman lengths).
 
-Scratch of the development sessions (session scratchpad, not in git; may be gone - recreate if
-needed)
-`C:\Users\Felix\AppData\Local\Temp\claude\c--evt-gits-electrical-p42c-1\4927401e-1e9d-4146-9d3d-0abdf0020ac1\scratchpad\`:
-- `ldr\MCP_Test_Ldr.{PrjHar,WirDoc,LdrDoc,BomDoc,HarDwf}` - renamed scratch copy of a real harness
-  project (PrjHar made with `sed 's/<original name>/MCP_Test_Ldr/g'`; no other file references the
-  names); `MCP_Test_Ldr.orig.LdrDoc` = untouched import. Backups of states: `ldr\*.LdrDoc.bak`
-  (`t1_after`, `t2_after`, `v_before`, `v4_replicated`, `v5_physical`,
-  `s6_crash_on_open` = a file that crashes Altium on opening, `s7_after_render` = current good
-  layout: pins repaired, all wires routed, J1/P2 physical, W1 600 mm / W2 700 mm fixed, B1 300 mm
-  manual). It is open in Altium inside its own project `MCP_Test_Ldr.PrjHar`.
-- `txt\MCP_Test_Txt`, `twist\MCP_Test_Twist.WirDoc` - scratch copies for sessions 7-8.
-- `sb.py <script.pas> [timeout]` runs a sandbox file (written for the old `main._run_sandbox`;
-  session 12's `...\6e56e396-a910-46dd-8442-72b590f81793\scratchpad\sb.py` calls
-  `main.run_altium_script`, plus `t\close.pas` / `t2\zoom.pas` = close a scratch document /
-  zoom to selected objects before a screenshot); `probe\*.pas` = the
-  session 3-6 probes (`open.inc` = open scratch project + drawing into `Obj1`/`Obj2`;
-  `v2`-`v5` = physical view steps, `w1` = wire length, `prjreload`, `close`, `reload`,
-  `pins1`, `route1`-`route3`, `prjclose`, `prjopen`).
-- `re2\strsearch.py <terms>` (string search in all Altium binaries, ASCII + UTF-16),
-  `re2\imgparams.py <ldrdoc>` (image parameters + their image child per connector),
-  `re2\subtree.py <before> <after> <uid>` (record diff of one object's subtree + wires/CP check),
-  `re2\impl.py <ldrdoc> <conn uid>` (PCBLIB implementation records + CP stream pin ids),
-  `r2rmap.py <dll> <rva hex>`.
-- `ilspy\pkg\tools\net8.0\any\ilspycmd.dll` (decompiler) and `decomp\<assembly>\` (decompiled C#
-  of the assemblies listed in §6), `dwf\` (decompiled Draftsman) - grep these instead of
-  guessing APIs; recreate per the dev skill §6 if the scratchpad is gone.
-- `ldr_counts.py`, `ldr_dump.py <file> <records,csv> [limit]`, `ldr_range.py <file> <a> <b>`,
-  `ldr_test.py <file>` (prints `parse_ldrdoc`), `cpc.py` (stream decode), `uidfind.py`, `ping.py`,
-  `err.json`; `re\` (SDK dumps, `dump_meta.ps1`, `params2.ps1`, `sig.ps1`, `rt_harness.txt` = all
-  `Rt_Schematic.ISch_Harness*` members).
-- Session 13 `...\3aa743d9-ec13-4f37-94d2-e7f50a027134\scratchpad\`: `MCP_Test_Copy.PrjHar` +
-  `cp\MCP_Test_CopySrc.WirDoc` / `cp\MCP_Test_CopyDst(.orig).WirDoc` (scratch project for
-  `copy_objects`; the user closes it in Altium), `cp\copy_test.json` / `cp\wires_test.json`
-  (`call_tool.py` kwargs), `cp\uids.py` (UniqueIds shared by two sheets).
-- Session 14, same scratchpad: `hvt\MCP_Test_HV.*` (renamed copy of the HV harness project;
-  open in Altium, the user closes it). Its `.LdrDoc` is now the layout before the review after
-  the `t2.json` lug swap; `MCP_Test_HV.pre.LdrDoc` = that layout before (all `B?` / `CP?`),
-  `MCP_Test_HV.orig.LdrDoc` = the reviewed layout, `MCP_Test_HV.t1_after.LdrDoc` = after the
-  `t1.json` text / name test. `hvt\t1.json` / `hvt\t2.json` (`call_tool.py` kwargs),
-  `hvt\readback.py` (raw text records + `parse_ldrdoc` of chosen objects), `raw_texts.py` (texts
-  with a non-default justification).
+Scratch tools of past sessions (scratch project copies, probe scripts, decompiled
+assemblies) lived in per-session scratch folders and are not kept. Recreate them as the
+dev skill describes: scratch projects §2, the decompiler §6.
 
 ## 8. Next steps
 Announce "using Altium now" / "Altium free" around live tests; a desktop screenshot tells
@@ -840,7 +804,7 @@ the user to clear it). Test each change on a scratch copy first, and close the s
 in Altium before overwriting it on disk (a file-changed prompt blocks the bridge).
 1. Fixes from session 9 (§6); part-aware lookup, parser parts and sync reload done in session 12:
    - `CONNECTOR` (move) and `ASSOCPART` still take the first part object of a multi-part
-     connector (no way yet to name the part, e.g. `FH1:B`).
+     connector (no way yet to name the part, e.g. `<designator>:B`).
    - `check_harness_wiring`: key wires by UniqueID, not designator (unannotated `W?` wires merge).
    - `check_harness_wiring`: parse the sheet rectangles (RECORD 14, the connector frames) and
      report labels and channels inside another connector's frame (today only the screenshot shows
@@ -848,7 +812,7 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    - `get_screenshot(view_type="sch")` on a harness sheet: optional zoom (whole sheet via
      `Sch:Zoom Action=Document`, or an area), so the agent can see every part of a large sheet.
      Session 12 workaround: a sandbox run that selects objects and runs `Sch:Zoom
-     Action=Selected` (it zoomed only a little on the P42C-1 Top sheet), then crop the PNG.
+     Action=Selected` (it zoomed only a little on a large sheet), then crop the PNG.
    - `check_harness_wiring`: a vertical wire's label must start within 120 mils to its right
      (`beside`); labels left of a vertical run are reported "off its wire".
 2. Fix the 13 pre-existing test failures (synthetic records instead of a real WirDoc).
@@ -893,19 +857,17 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
      and its compiler reports "Orphaned Wire ... not routed via any bundle". The CP stream
      entries look like those of the GUI-made CPs that do route. Find what differs (wire
      data end links after the import?) and make the parser agree with Altium.
-   - `check_harness_wiring` reports a wire ending on a no-connect (pigtail free end, e.g.
-     HVSL1200 TERM1 / TERM2) as `dangling_end` (error).
-   - `get_screenshot`: while this session ran (late evening, Windows probably idle/locked)
-     the canvas came back stale (another document's picture) with both the old PrintWindow
-     and upstream's BitBlt capture, though the document metadata was right. Re-check
-     visually when the desktop is in use.
+   - `check_harness_wiring` reports a wire ending on a no-connect (a pigtail's free end) as
+     `dangling_end` (error).
+   - (resolved) `get_screenshot` returned a stale canvas during session 17 with old and new
+     capture code alike: the desktop was idle. In normal use (session 18) captures are right.
    - `get_harness_data` reports sheet texts (RECORD 4) under `net_labels` /
      `net_label_count` and `get_all_nets` lists them as nets (naming only).
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 375 passed, 7 skipped, 13 pre-existing failures (§3, session 17)
-cd C:\evt_gits\electrical-p42c-1\altium-mcp
+# unit tests (altium-mcp root) - 392 passed, 7 skipped, 0 failed (session 18)
+cd <altium-mcp checkout>
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py
 # main.py has ~50 pre-existing ruff findings: compare counts before / after a change

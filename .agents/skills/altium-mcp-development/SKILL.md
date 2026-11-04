@@ -21,6 +21,20 @@ Real designs are binary files in git where a bad write is easy to miss. So the w
 about one thing: make a change, prove on disk what it did, and never let an experiment touch a
 real document.
 
+## 0. Keep the server project-agnostic
+
+The server is generic: it is developed while working on real designs, but serves any Altium
+user. Code, tool descriptions, defaults, tests, fixtures, this skill and `HANDOVER.md` never
+name or assume a particular project, workspace, company or person (see `AGENTS.md`):
+
+- examples use generic names (`P1`, `W1`, `SIG_A`, `CONN-4P`, `my.DbLib`), never a real
+  design's sheets, nets or parts; no absolute machine or workspace paths;
+- a project's conventions (wire colours, label spacing, drawing standards) stay in that
+  project's own instructions; what the server checks by default is documented as a default;
+- write a finding from a real design down generically ("a multi-part fuse holder", "a layout
+  whose import added connectors"), and leave the design's state to the workspace using it;
+- tests use synthetic data (§7), never a design file.
+
 ## 1. How a tool call flows
 
 ```
@@ -255,9 +269,18 @@ Tests must never reach the live bridge. Follow the existing fixtures in
   `main.BRIDGE_LOCK_FILE` into a temp folder; for the layout tool also patch
   `main.parse_ldrdoc` with synthetic layouts (`tests/test_harness_layout.py`), and give the
   bridge mock a `side_effect` when one call makes several bridge runs;
-- patch `main._get_active_harness_path` when a fallback needs an "active" harness;
-- prefer synthetic records with `harness_parser.parse_wirdoc_records(records, path)` over sample
-  design files, so tests run in any checkout and publish no company data.
+- patch `main._get_active_harness_path` when a fallback needs an "active" harness (point it
+  at the fixture project);
+- use synthetic data only, so tests run in any checkout and publish no design data:
+  - `tests/harness_fixture.py` writes a generic harness project as real compound files
+    (`make_fixture_project(folder)`: a `.PrjHar`, a complete main sheet with two 4-way
+    connectors, crimps, a boot, a splice, a twist and a no-connect, and a second sheet with
+    a wire break, an unwired pin and an unannotated connector). Tests that read files
+    (`parse_wirdoc`, the `get_harness_*` helpers, ERC, `check_harness_wiring`, the tool
+    fallbacks) use it; extend its sheets, or add records with `_Sheet` and
+    `write_wirdoc`, when a test needs another object;
+  - `harness_parser.parse_wirdoc_records(records, path)` for parser corner cases;
+  - never a real design file, and no path outside the repository.
 
 The live-Altium suite (`test_altium_script.py`) only runs with `ALTIUM_INTEGRATION=1`.
 Lint new modules with `uvx ruff check --extend-select I <files>`.

@@ -95,9 +95,6 @@ STALE_LOCK_SECONDS = 1800
 # A venv another launch has not used for this long, and that nothing runs
 # from, is deleted after a build (see _prune_old_venvs)
 KEEP_UNUSED_DAYS = 14
-# A venv another launch has not used for this long, and that nothing runs
-# from, is deleted after a build (see _prune_old_venvs)
-KEEP_UNUSED_DAYS = 14
 
 
 def venv_is_ready():
@@ -296,55 +293,11 @@ def _prune_old_venvs():
     if in_use is None:
         return
     cutoff = time.time() - KEEP_UNUSED_DAYS * 86400
-    # Venvs keyed to another requirement list or interpreter. Deleting one a
-    # server still runs from removes every file that is not locked, and the
-    # server then fails on whatever it imports next (a screenshot's PNG
-    # encoder, say); its next launch cannot rebuild it either, as the locked
-    # files stay. So a venv is kept while a process runs from it, while
-    # another builder is building it, and for KEEP_UNUSED_DAYS after its
-    # last launch: two clients may launch with different interpreters (Claude
-    # Desktop and Claude Code, or "py" with and without PY_PYTHON), and each
-    # keeps its venv instead of rebuilding it every time the other ran.
-    in_use = _venvs_in_use()
-    if in_use is None:
-        return
-    cutoff = time.time() - KEEP_UNUSED_DAYS * 86400
     for child in VENVS_DIR.iterdir():
         if not child.is_dir() or child == VENV_DIR:
             continue
         if child.name.endswith(".trash"):
-        if not child.is_dir() or child == VENV_DIR:
-            continue
-        if child.name.endswith(".trash"):
             shutil.rmtree(child, ignore_errors=True)
-            continue
-        if child.name in in_use or _builder_alive(child.name):
-            continue
-        try:
-            last_used = (child / MARKER.name).stat().st_mtime
-        except OSError:
-            last_used = 0  # never finished building
-        if last_used > cutoff:
-            continue
-        # Renamed first, so a delete that stops half way never leaves a
-        # broken venv under a name a launcher would pick up
-        trash = child.with_name(child.name + ".trash")
-        try:
-            os.rename(child, trash)
-        except OSError:
-            continue
-        shutil.rmtree(trash, ignore_errors=True)
-
-
-def _builder_alive(venv_name):
-    """True while a builder holds the lock for that venv."""
-    lock = VENVS_DIR / (venv_name + ".lock")
-    try:
-        age = time.time() - lock.stat().st_mtime
-        pid = int(lock.read_text(encoding="ascii").strip() or 0)
-    except (OSError, ValueError):
-        return False
-    return age < STALE_LOCK_SECONDS and _pid_alive(pid)
             continue
         if child.name in in_use or _builder_alive(child.name):
             continue
@@ -449,7 +402,6 @@ def _mark_used():
 def ensure_venv():
     if venv_is_ready():
         _mark_used()
-        _mark_used()
         return str(PYTHON_EXE)
 
     if not _lock_is_live():
@@ -460,7 +412,6 @@ def ensure_venv():
     while time.time() - started < LAUNCH_WAIT_SECONDS:
         time.sleep(0.5)
         if venv_is_ready():
-            _mark_used()
             _mark_used()
             return str(PYTHON_EXE)
         if _lock_is_live():
