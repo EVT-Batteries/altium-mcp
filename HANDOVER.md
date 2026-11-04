@@ -815,7 +815,8 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
      Action=Selected` (it zoomed only a little on a large sheet), then crop the PNG.
    - `check_harness_wiring`: a vertical wire's label must start within 120 mils to its right
      (`beside`); labels left of a vertical run are reported "off its wire".
-2. Fix the 13 pre-existing test failures (synthetic records instead of a real WirDoc).
+2. (done, session 18) The 13 old test failures were replaced by tests on the synthetic fixture
+   project (`server/tests/harness_fixture.py`).
 3. Open question: should view options (side, zoom) be copied from a template connector?
 4. Not supported yet: LdrDoc notes / text frames; wire `LengthOffset` / user length / manual wire
    paths (no script setter, §5).
