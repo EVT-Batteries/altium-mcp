@@ -1,5 +1,5 @@
-const
-    REPLACEALL = 1;
+// REPLACEALL (StringReplace flag) is declared once, in Altium_API.pas: the
+// bridge runs every unit merged into one file (script_bundle.py)
 
 // Helper function to convert string to pin electrical type
 function StrToPinElectricalType(ElecType: String): TPinElectrical;
@@ -248,10 +248,20 @@ begin
             end;
         end;
 
+    // One undo step; this is also what marks the library as modified (the
+    // user saves it)
+    SchServer.ProcessControl.PreProcess(CurrentLib, '');
+
+    // One undo step; this is also what marks the library as modified (the
+    // user saves it)
+    SchServer.ProcessControl.PreProcess(CurrentLib, '');
+
     // Create a library component (a page of the library is created)
     SchComponent := SchServer.SchObjectFactory(eSchComponent, eCreate_Default);
     if (SchComponent = Nil) Then
     begin
+        SchServer.ProcessControl.PostProcess(CurrentLib, '');
+        SchServer.ProcessControl.PostProcess(CurrentLib, '');
         Result := 'ERROR: Failed to create component';
         Exit;
     end;
@@ -569,12 +579,20 @@ begin
         PinCount := PinCount + 1;
     end;
 
-    // Add the component to the library
+    // Add the component to the library and register it with the document
+    // Add the component to the library and register it with the document
     CurrentLib.AddSchComponent(SchComponent);
-
-    // Send a system notification that a new component has been added to the library
-    SchServer.RobotManager.SendMessage(nil, c_BroadCast, SCHM_PrimitiveRegistration, SchComponent.I_ObjectAddress);
+    SchServer.RobotManager.SendMessage(CurrentLib.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, SchComponent.I_ObjectAddress);
+    SchServer.ProcessControl.PostProcess(CurrentLib, '');
+    SchServer.RobotManager.SendMessage(CurrentLib.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, SchComponent.I_ObjectAddress);
+    SchServer.ProcessControl.PostProcess(CurrentLib, '');
     CurrentLib.CurrentSchComponent := SchComponent;
+    // Adding a symbol from a script does not set the library's modified
+    // flag, so closing it would drop the symbol without asking (#30)
+    MarkDocumentModified(CurrentLib.DocumentName);
+    // Adding a symbol from a script does not set the library's modified
+    // flag, so closing it would drop the symbol without asking (#30)
+    MarkDocumentModified(CurrentLib.DocumentName);
 
     // Refresh library
     CurrentLib.GraphicallyInvalidate;
@@ -800,31 +818,169 @@ begin
     Result := (Pos('"success": true', R) > 0);
 end;
 
-// Create many symbols in a single script run from a spec file. The file is
-// plain text, one record per line, pipe-delimited (no JSON, so field text
-// is preserved exactly):
+// Finish the current symbol of a batch: create it (Mode 'SYMBOL') or find it
+// (Mode 'EDITSYMBOL' - never created when missing), then apply its edit
+// records. Returns 1 created, 2 edited, 0 nothing to do, -1 failed (the name
+// is added to Failed, the reason to Problems).
+function BatchFlushSymbol(Mode, SymName, SymDesc: String; PartCount: Integer;
+    PinsList, GraphicsList, EditsList, Failed, Problems: TStringList): Integer;
+var
+    Lib  : ISch_Lib;
+    Comp : ISch_Component;
+begin
+    Result := 0;
+    if (SymName = '') then Exit;
+
+    if (Mode = 'SYMBOL') then
+    begin
+        if not BatchCreateOne(SymName, SymDesc, PartCount, PinsList, GraphicsList) then
+        begin
+            Failed.Add('"' + JSONEscapeString(SymName) + '"');
+            Result := -1;
+            Exit;
+        end;
+        Result := 1;
+    end
+    else
+        Result := 2;
+
+    Comp := nil;
+    Lib := SchServer.GetCurrentSchDocument;
+    if (Lib <> nil) then
+        if (Lib.ObjectID = eSchLib) then
+            Comp := FindLibSymbol(Lib, SymName);
+    if (Comp = nil) then
+    begin
+        if (Mode = 'EDITSYMBOL') then
+        begin
+            Failed.Add('"' + JSONEscapeString(SymName) + '"');
+            Problems.Add('"' + JSONEscapeString(SymName + ': not in the focused schematic library (EDITSYMBOL never creates a symbol)') + '"');
+            Result := -1;
+        end
+        else if (EditsList.Count > 0) then
+            Problems.Add('"' + JSONEscapeString(SymName + ': created, but not found again to set its properties') + '"');
+        Exit;
+    end;
+    ApplySymbolEdits(Lib, Comp, EditsList, Problems);
+end;
+
+// Create or edit many symbols in a single script run from a spec file. The
+// file is plain text, one record per line, pipe-delimited (no JSON, so field
+// text is preserved exactly):
+// Finish the current symbol of a batch: create it (Mode 'SYMBOL') or find it
+// (Mode 'EDITSYMBOL' - never created when missing), then apply its edit
+// records. Returns 1 created, 2 edited, 0 nothing to do, -1 failed (the name
+// is added to Failed, the reason to Problems).
+function BatchFlushSymbol(Mode, SymName, SymDesc: String; PartCount: Integer;
+    PinsList, GraphicsList, EditsList, Failed, Problems: TStringList): Integer;
+var
+    Lib  : ISch_Lib;
+    Comp : ISch_Component;
+begin
+    Result := 0;
+    if (SymName = '') then Exit;
+
+    if (Mode = 'SYMBOL') then
+    begin
+        if not BatchCreateOne(SymName, SymDesc, PartCount, PinsList, GraphicsList) then
+        begin
+            Failed.Add('"' + JSONEscapeString(SymName) + '"');
+            Result := -1;
+            Exit;
+        end;
+        Result := 1;
+    end
+    else
+        Result := 2;
+
+    Comp := nil;
+    Lib := SchServer.GetCurrentSchDocument;
+    if (Lib <> nil) then
+        if (Lib.ObjectID = eSchLib) then
+            Comp := FindLibSymbol(Lib, SymName);
+    if (Comp = nil) then
+    begin
+        if (Mode = 'EDITSYMBOL') then
+        begin
+            Failed.Add('"' + JSONEscapeString(SymName) + '"');
+            Problems.Add('"' + JSONEscapeString(SymName + ': not in the focused schematic library (EDITSYMBOL never creates a symbol)') + '"');
+            Result := -1;
+        end
+        else if (EditsList.Count > 0) then
+            Problems.Add('"' + JSONEscapeString(SymName + ': created, but not found again to set its properties') + '"');
+        Exit;
+    end;
+    ApplySymbolEdits(Lib, Comp, EditsList, Problems);
+end;
+
+// Create or edit many symbols in a single script run from a spec file. The
+// file is plain text, one record per line, pipe-delimited (no JSON, so field
+// text is preserved exactly):
 //   LIBRARY|<path to .SchLib>            (optional first line - focus/open)
-//   SYMBOL|<name>|<description>|<part_count>
-//   PIN|<same fields as create_schematic_symbol pins>
-//   GRAPHIC|<same entry format as create_schematic_symbol graphics>
-// Each SYMBOL line flushes the previous symbol. Far fewer Altium script
-// launches than one create call per symbol - use for bulk imports.
+//   SYMBOL|<name>|<description>|<part_count>   start a new symbol
+//   EDITSYMBOL|<name>                    start editing an existing symbol
+//   PIN|<same fields as create_schematic_symbol pins>      (SYMBOL only)
+//   GRAPHIC|<same entry format as create_schematic_symbol graphics>  (SYMBOL only)
+//   COMMENT|<text>[|<visible 1/0>]       set the Comment (hidden unless visible is 1)
+//   DESCRIPTION|<text>                   set the Description
+//   SYMPARAM|<name>|<value>|<visible 1/0>[|x|y[|justification[|font name:size]]]
+//   PINPARAM|<pin number>|<name>|<value>
+//   PINDESC|<pin number>|<text>
+//   PINSYMBOL|<pin number>|<inside|inside_edge|outside_edge|outside>|<IEEE symbol>
+// Records belong to the most recent SYMBOL or EDITSYMBOL line. Far fewer
+// Altium script launches than one create call per symbol.
+//   SYMBOL|<name>|<description>|<part_count>   start a new symbol
+//   EDITSYMBOL|<name>                    start editing an existing symbol
+//   PIN|<same fields as create_schematic_symbol pins>      (SYMBOL only)
+//   GRAPHIC|<same entry format as create_schematic_symbol graphics>  (SYMBOL only)
+//   COMMENT|<text>[|<visible 1/0>]       set the Comment (hidden unless visible is 1)
+//   DESCRIPTION|<text>                   set the Description
+//   SYMPARAM|<name>|<value>|<visible 1/0>[|x|y[|justification[|font name:size]]]
+//   PINPARAM|<pin number>|<name>|<value>
+//   PINDESC|<pin number>|<text>
+//   PINSYMBOL|<pin number>|<inside|inside_edge|outside_edge|outside>|<IEEE symbol>
+// Records belong to the most recent SYMBOL or EDITSYMBOL line. Far fewer
+// Altium script launches than one create call per symbol.
 function CreateSymbolsBatch(SpecFilePath: String): String;
 var
-    Lines        : TStringList;
-    PinsList     : TStringList;
-    GraphicsList : TStringList;
-    FailedArray  : TStringList;
-    ResultProps  : TStringList;
-    ServerDoc    : IServerDocument;
-    Line, Kind   : String;
-    LibPath      : String;
-    CurrentName  : String;
-    CurrentDesc  : String;
-    FieldValue   : String;
-    PartCount    : Integer;
-    CreatedCount : Integer;
-    i            : Integer;
+    Lines         : TStringList;
+    PinsList      : TStringList;
+    GraphicsList  : TStringList;
+    EditsList     : TStringList;
+    FailedArray   : TStringList;
+    ProblemsArray : TStringList;
+    ResultProps   : TStringList;
+    ServerDoc     : IServerDocument;
+    Line, Kind    : String;
+    LibPath       : String;
+    Mode          : String;
+    CurrentName   : String;
+    CurrentDesc   : String;
+    FieldValue    : String;
+    PartCount     : Integer;
+    CreatedCount  : Integer;
+    EditedCount   : Integer;
+    Outcome       : Integer;
+    i             : Integer;
+    Lines         : TStringList;
+    PinsList      : TStringList;
+    GraphicsList  : TStringList;
+    EditsList     : TStringList;
+    FailedArray   : TStringList;
+    ProblemsArray : TStringList;
+    ResultProps   : TStringList;
+    ServerDoc     : IServerDocument;
+    Line, Kind    : String;
+    LibPath       : String;
+    Mode          : String;
+    CurrentName   : String;
+    CurrentDesc   : String;
+    FieldValue    : String;
+    PartCount     : Integer;
+    CreatedCount  : Integer;
+    EditedCount   : Integer;
+    Outcome       : Integer;
+    i             : Integer;
 begin
     if not FileExists(SpecFilePath) then
     begin
@@ -835,90 +991,191 @@ begin
     Lines := TStringList.Create;
     PinsList := TStringList.Create;
     GraphicsList := TStringList.Create;
+    EditsList := TStringList.Create;
+    EditsList := TStringList.Create;
     FailedArray := TStringList.Create;
+    ProblemsArray := TStringList.Create;
+    ProblemsArray := TStringList.Create;
     ResultProps := TStringList.Create;
+    Mode := '';
+    Mode := '';
     CurrentName := '';
     CurrentDesc := '';
     PartCount := 1;
     CreatedCount := 0;
+    EditedCount := 0;
+    EditedCount := 0;
 
     try
         Lines.LoadFromFile(SpecFilePath);
 
-        for i := 0 to Lines.Count - 1 do
+        // One extra pass: a final line that flushes the last symbol
+        for i := 0 to Lines.Count do
         begin
-            Line := Lines[i];
-            Kind := UpperCase(Trim(GetFieldFromPipeString(Line, 0)));
+            ReportProgress;
+            if (i < Lines.Count) then
+            begin
+                Line := Lines[i];
+                Kind := UpperCase(Trim(GetFieldFromPipeString(Line, 0)));
+            end
+            else
+            begin
+                Line := '';
+                Kind := 'END';
+            end;
+        // One extra pass: a final line that flushes the last symbol
+        for i := 0 to Lines.Count do
+        begin
+            ReportProgress;
+            if (i < Lines.Count) then
+            begin
+                Line := Lines[i];
+                Kind := UpperCase(Trim(GetFieldFromPipeString(Line, 0)));
+            end
+            else
+            begin
+                Line := '';
+                Kind := 'END';
+            end;
 
             if (Kind = 'LIBRARY') then
             begin
+                // Focus if already open; never re-open (reload discards
+                // unsaved symbols). Stop unless that library is now the
+                // focused one - never work on whatever else is focused.
+                // Focus if already open; never re-open (reload discards
+                // unsaved symbols). Stop unless that library is now the
+                // focused one - never work on whatever else is focused.
                 LibPath := Trim(GetFieldFromPipeString(Line, 1));
-                if (LibPath <> '') and FileExists(LibPath) then
+                if FileExists(LibPath) then
+                    ServerDoc := OpenLibraryDocument('SchLib', LibPath);
+                if not SchLibIsFocused(LibPath) then
+                if FileExists(LibPath) then
+                    ServerDoc := OpenLibraryDocument('SchLib', LibPath);
+                if not SchLibIsFocused(LibPath) then
                 begin
-                    // Focus if already open; never re-open (reload discards
-                    // unsaved symbols)
-                    if Client.IsDocumentOpen(LibPath) then
-                        ServerDoc := Client.GetDocumentByPath(LibPath)
-                    else
-                        ServerDoc := Client.OpenDocument('SchLib', LibPath);
-                    if (ServerDoc <> Nil) then
-                    begin
-                        Client.ShowDocument(ServerDoc);
-                        Sleep(500);
-                    end;
+                    Result := 'ERROR: Could not open and focus ' + LibPath + ' - nothing was created or edited';
+                    Exit;
+                    Result := 'ERROR: Could not open and focus ' + LibPath + ' - nothing was created or edited';
+                    Exit;
                 end;
             end
-            else if (Kind = 'SYMBOL') then
+            else if (Kind = 'SYMBOL') or (Kind = 'EDITSYMBOL') or (Kind = 'END') then
+            else if (Kind = 'SYMBOL') or (Kind = 'EDITSYMBOL') or (Kind = 'END') then
             begin
-                // Flush the previous symbol
-                if (CurrentName <> '') then
-                begin
-                    if BatchCreateOne(CurrentName, CurrentDesc, PartCount, PinsList, GraphicsList) then
-                        CreatedCount := CreatedCount + 1
-                    else
-                        FailedArray.Add('"' + JSONEscapeString(CurrentName) + '"');
-                end;
+                // Finish the previous symbol
+                Outcome := BatchFlushSymbol(Mode, CurrentName, CurrentDesc, PartCount,
+                                            PinsList, GraphicsList, EditsList, FailedArray, ProblemsArray);
+                if (Outcome = 1) then
+                    CreatedCount := CreatedCount + 1
+                else if (Outcome = 2) then
+                    EditedCount := EditedCount + 1;
+                // Finish the previous symbol
+                Outcome := BatchFlushSymbol(Mode, CurrentName, CurrentDesc, PartCount,
+                                            PinsList, GraphicsList, EditsList, FailedArray, ProblemsArray);
+                if (Outcome = 1) then
+                    CreatedCount := CreatedCount + 1
+                else if (Outcome = 2) then
+                    EditedCount := EditedCount + 1;
                 PinsList.Clear;
                 GraphicsList.Clear;
+                EditsList.Clear;
+                Mode := Kind;
+                EditsList.Clear;
+                Mode := Kind;
                 CurrentName := Trim(GetFieldFromPipeString(Line, 1));
-                CurrentDesc := GetFieldFromPipeString(Line, 2);
-                FieldValue := Trim(GetFieldFromPipeString(Line, 3));
-                if (FieldValue <> '') then
-                    PartCount := StrToInt(FieldValue)
-                else
-                    PartCount := 1;
+                CurrentDesc := '';
+                PartCount := 1;
+                if (Kind = 'SYMBOL') then
+                begin
+                    CurrentDesc := GetFieldFromPipeString(Line, 2);
+                    FieldValue := Trim(GetFieldFromPipeString(Line, 3));
+                    if (FieldValue <> '') then
+                        PartCount := StrToInt(FieldValue);
+                end;
+                CurrentDesc := '';
+                PartCount := 1;
+                if (Kind = 'SYMBOL') then
+                begin
+                    CurrentDesc := GetFieldFromPipeString(Line, 2);
+                    FieldValue := Trim(GetFieldFromPipeString(Line, 3));
+                    if (FieldValue <> '') then
+                        PartCount := StrToInt(FieldValue);
+                end;
             end
             else if (Kind = 'PIN') then
             begin
-                PinsList.Add(Copy(Line, 5, Length(Line)));
+                if (Mode = 'SYMBOL') then
+                    PinsList.Add(Copy(Line, 5, Length(Line)))
+                else
+                    ProblemsArray.Add('"' + JSONEscapeString('line ' + IntToStr(i + 1) + ': PIN only belongs to a SYMBOL') + '"');
+                if (Mode = 'SYMBOL') then
+                    PinsList.Add(Copy(Line, 5, Length(Line)))
+                else
+                    ProblemsArray.Add('"' + JSONEscapeString('line ' + IntToStr(i + 1) + ': PIN only belongs to a SYMBOL') + '"');
             end
             else if (Kind = 'GRAPHIC') then
             begin
-                GraphicsList.Add(Copy(Line, 9, Length(Line)));
+                if (Mode = 'SYMBOL') then
+                    GraphicsList.Add(Copy(Line, 9, Length(Line)))
+                else
+                    ProblemsArray.Add('"' + JSONEscapeString('line ' + IntToStr(i + 1) + ': GRAPHIC only belongs to a SYMBOL') + '"');
+            end
+            else if (Kind = 'COMMENT') or (Kind = 'DESCRIPTION') or (Kind = 'SYMPARAM') or
+                    (Kind = 'PINPARAM') or (Kind = 'PINDESC') or (Kind = 'PINSYMBOL') then
+            begin
+                if (CurrentName <> '') then
+                    EditsList.Add(Line)
+                else
+                    ProblemsArray.Add('"' + JSONEscapeString('line ' + IntToStr(i + 1) + ': ' + Kind + ' before any SYMBOL or EDITSYMBOL') + '"');
+            end;
+                if (Mode = 'SYMBOL') then
+                    GraphicsList.Add(Copy(Line, 9, Length(Line)))
+                else
+                    ProblemsArray.Add('"' + JSONEscapeString('line ' + IntToStr(i + 1) + ': GRAPHIC only belongs to a SYMBOL') + '"');
+            end
+            else if (Kind = 'COMMENT') or (Kind = 'DESCRIPTION') or (Kind = 'SYMPARAM') or
+                    (Kind = 'PINPARAM') or (Kind = 'PINDESC') or (Kind = 'PINSYMBOL') then
+            begin
+                if (CurrentName <> '') then
+                    EditsList.Add(Line)
+                else
+                    ProblemsArray.Add('"' + JSONEscapeString('line ' + IntToStr(i + 1) + ': ' + Kind + ' before any SYMBOL or EDITSYMBOL') + '"');
             end;
         end;
 
-        // Flush the last symbol
-        if (CurrentName <> '') then
-        begin
-            if BatchCreateOne(CurrentName, CurrentDesc, PartCount, PinsList, GraphicsList) then
-                CreatedCount := CreatedCount + 1
-            else
-                FailedArray.Add('"' + JSONEscapeString(CurrentName) + '"');
-        end;
-
+        // Created symbols mark the library already; edits alone do not
+        if (EditedCount > 0) then
+            MarkDocumentModified(LibPathOfFocusedSchLib(0));
+        // Created symbols mark the library already; edits alone do not
+        if (EditedCount > 0) then
+            MarkDocumentModified(LibPathOfFocusedSchLib(0));
         AddJSONInteger(ResultProps, 'created', CreatedCount);
+        AddJSONInteger(ResultProps, 'edited', EditedCount);
+        AddJSONInteger(ResultProps, 'edited', EditedCount);
         if (FailedArray.Count > 0) then
             ResultProps.Add(BuildJSONArray(FailedArray, 'failed'))
         else
             ResultProps.Add('"failed": []');
+        if (ProblemsArray.Count > 0) then
+            ResultProps.Add(BuildJSONArray(ProblemsArray, 'problems'))
+        else
+            ResultProps.Add('"problems": []');
+        if (ProblemsArray.Count > 0) then
+            ResultProps.Add(BuildJSONArray(ProblemsArray, 'problems'))
+        else
+            ResultProps.Add('"problems": []');
 
         Result := BuildJSONObject(ResultProps);
     finally
         Lines.Free;
         PinsList.Free;
         GraphicsList.Free;
+        EditsList.Free;
+        EditsList.Free;
         FailedArray.Free;
+        ProblemsArray.Free;
+        ProblemsArray.Free;
         ResultProps.Free;
     end;
 end;
@@ -1078,6 +1335,8 @@ begin
                     AddJSONProperty(SymProps, 'symbol_name', LibComp.LibReference);
                     AddJSONProperty(SymProps, 'description', LibComp.ComponentDescription);
                     AddJSONInteger(SymProps, 'part_count', LibComp.PartCount);
+                    AddSymbolPropertiesJSON(SymProps, LibComp);
+                    AddSymbolPropertiesJSON(SymProps, LibComp);
 
                     PrimIterator := LibComp.SchIterator_Create;
                     Prim := PrimIterator.FirstSchObject;
@@ -1104,6 +1363,18 @@ begin
                                     AddJSONNumber(PrimProps, 'length', CoordToMils(PinObj.PinLength));
                                     AddJSONBoolean(PrimProps, 'show_name', PinObj.ShowName);
                                     AddJSONBoolean(PrimProps, 'show_designator', PinObj.ShowDesignator);
+                                    AddJSONProperty(PrimProps, 'description', PinObj.Description);
+                                    AddJSONProperty(PrimProps, 'symbol_inside', IeeeSymbolName(PinObj.Symbol_Inner));
+                                    AddJSONProperty(PrimProps, 'symbol_inside_edge', IeeeSymbolName(PinObj.Symbol_InnerEdge));
+                                    AddJSONProperty(PrimProps, 'symbol_outside_edge', IeeeSymbolName(PinObj.Symbol_OuterEdge));
+                                    AddJSONProperty(PrimProps, 'symbol_outside', IeeeSymbolName(PinObj.Symbol_Outer));
+                                    AddPinParametersJSON(PrimProps, PinObj);
+                                    AddJSONProperty(PrimProps, 'description', PinObj.Description);
+                                    AddJSONProperty(PrimProps, 'symbol_inside', IeeeSymbolName(PinObj.Symbol_Inner));
+                                    AddJSONProperty(PrimProps, 'symbol_inside_edge', IeeeSymbolName(PinObj.Symbol_InnerEdge));
+                                    AddJSONProperty(PrimProps, 'symbol_outside_edge', IeeeSymbolName(PinObj.Symbol_OuterEdge));
+                                    AddJSONProperty(PrimProps, 'symbol_outside', IeeeSymbolName(PinObj.Symbol_Outer));
+                                    AddPinParametersJSON(PrimProps, PinObj);
                                 end;
                                 eRectangle:
                                 begin
@@ -1318,7 +1589,8 @@ begin
     Project := GetWorkspace.DM_FocusedProject;
     If (Project = Nil) Then
     begin
-        Result := '{"success": false, "error": "No project is currently open"}';
+        // Never a ShowMessage: it would block the bridge until someone clicks OK
+        Result := 'ERROR: No project is currently open';
         Exit;
     end;
 
@@ -1464,12 +1736,19 @@ end;
 { the drafting rules the spec is expected to already satisfy - this code places }
 { what it is told and reports what it did; it does not lay out.                 }
 {                                                                              }
-{ Spec records (pipe-delimited, one per line, coordinates in mils):             }
+{ Spec records (pipe-delimited, one per line). Coordinates are Altium coords  }
+{ (10000 per mil), not mils: whole mils miss a metric grid, and a wire a few  }
+{ microns out of level turns diagonal when the part is dragged.               }
+{ Spec records (pipe-delimited, one per line). Coordinates are Altium coords  }
+{ (10000 per mil), not mils: whole mils miss a metric grid, and a wire a few  }
+{ microns out of level turns diagonal when the part is dragged.               }
 {   PART|desig|symlib|symbol|designitemid|x|y|orient|mirror                     }
 {   COMMENT|t   DESCRIPTION|t   FOOTPRINT|n   PARAM|name|value                  }
 {   WIRE|x1|y1|x2|y2[|...]      JUNCTION|x|y                                    }
 {   NETLABEL|x|y|orient|text    POWER|x|y|orient|style|text|shownetname         }
 {   NOTE|x|y|text                                                               }
+{ pin_map.txt gives each pin's connection point in coords too.                }
+{ pin_map.txt gives each pin's connection point in coords too.                }
 {                                                                              }
 { Uses LOCAL variables throughout, deliberately. The dev sandbox shares scratch }
 { variables between blocks and that silently corrupted results three separate   }
@@ -1480,13 +1759,18 @@ end;
 // Absolute electrical connection point of a pin. Pin.Location is the end
 // attached to the BODY; the hot end is PinLength further along the pin's
 // orientation. Verified 119:0 against a hand-wired production sheet.
+// In coords, not mils: rounding to mils misplaces pins of metric symbols.
+// In coords, not mils: rounding to mils misplaces pins of metric symbols.
 procedure GetPinHotEnd(Pin: ISch_Pin; var HotX: Integer; var HotY: Integer);
 var
     PinLen : Integer;
 begin
-    HotX := CoordToMils(Pin.Location.X);
-    HotY := CoordToMils(Pin.Location.Y);
-    PinLen := CoordToMils(Pin.PinLength);
+    HotX := Pin.Location.X;
+    HotY := Pin.Location.Y;
+    PinLen := Pin.PinLength;
+    HotX := Pin.Location.X;
+    HotY := Pin.Location.Y;
+    PinLen := Pin.PinLength;
     if      (Pin.Orientation = 0) then HotX := HotX + PinLen
     else if (Pin.Orientation = 1) then HotY := HotY + PinLen
     else if (Pin.Orientation = 2) then HotX := HotX - PinLen
@@ -1535,8 +1819,12 @@ begin
     LibRef := Comp.LibReference;
 
     // Prefer a record harvested from a part in the SAME pose. Its offsets are
-    // then literal - the house style puts a horizontal resistor's four fields
-    // at the four corners, which is not a stack and must not be re-flowed.
+    // then literal - a reference sheet may put a horizontal resistor's four
+    // fields at the four corners, which is not a stack and must not be
+    // re-flowed.
+    // then literal - a reference sheet may put a horizontal resistor's four
+    // fields at the four corners, which is not a stack and must not be
+    // re-flowed.
     ExactPose := False;
     Found := False;
     MaxDy := -999999;
@@ -1583,10 +1871,14 @@ begin
                 AnchorX := CoordToMils(Comp.Location.X) + StrToInt(GetFieldFromPipeString(Rec, 4));
                 TextY   := CoordToMils(Comp.Location.Y) + StrToInt(GetFieldFromPipeString(Rec, 5));
 
-                // ...unless the anchor lands ON the body. RES-DISCRETE offsets
-                // (-100 / +600) sit clear of its body and give the four-corner
-                // house layout; CAP-NP uses dx=0, which for a rotated cap is
-                // the middle of the plates. Push those clear, keeping dy.
+                // ...unless the anchor lands ON the body. Offsets such as a
+                // resistor's -100 / +600 sit clear of its body; dx=0 on a
+                // rotated capacitor is the middle of its plates. Push those
+                // clear, keeping dy.
+                // ...unless the anchor lands ON the body. Offsets such as a
+                // resistor's -100 / +600 sit clear of its body; dx=0 on a
+                // rotated capacitor is the middle of its plates. Push those
+                // clear, keeping dy.
                 if (AnchorX >= BodyL) and (AnchorX <= BodyR) then
                     if (Just = 2) or (Just = 5) or (Just = 8) then
                         AnchorX := BodyL - 50
@@ -1801,8 +2093,10 @@ begin
 
                 // MoveByXY, not Location, so child text travels with the part
                 Replica.MoveByXY(
-                    MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 5)) - CoordToMils(Replica.Location.X)),
-                    MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 6)) - CoordToMils(Replica.Location.Y)));
+                    StrToInt(GetFieldFromPipeString(Rec, 5)) - Replica.Location.X,
+                    StrToInt(GetFieldFromPipeString(Rec, 6)) - Replica.Location.Y);
+                    StrToInt(GetFieldFromPipeString(Rec, 5)) - Replica.Location.X,
+                    StrToInt(GetFieldFromPipeString(Rec, 6)) - Replica.Location.Y);
 
                 Comp := Replica;
                 PartCount := PartCount + 1;
@@ -1870,8 +2164,10 @@ begin
         else if (Kind = 'WIRE') then
         begin
             Obj := SchServer.SchObjectFactory(eWire, eCreate_GlobalCopy);
-            Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
             fld := 1;
             vtx := 0;
             while (GetFieldFromPipeString(Rec, fld) <> '') do
@@ -1879,8 +2175,10 @@ begin
                 vtx := vtx + 1;
                 Obj.InsertVertex := vtx;
                 Obj.SetState_Vertex(vtx,
-                    Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld))),
-                          MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, fld + 1)))));
+                    Point(StrToInt(GetFieldFromPipeString(Rec, fld)),
+                          StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
+                    Point(StrToInt(GetFieldFromPipeString(Rec, fld)),
+                          StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
                 fld := fld + 2;
             end;
             TargetDoc.RegisterSchObjectInContainer(Obj);
@@ -1892,8 +2190,10 @@ begin
         else if (Kind = 'JUNCTION') then
         begin
             Obj := SchServer.SchObjectFactory(eJunction, eCreate_GlobalCopy);
-            Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
             TargetDoc.RegisterSchObjectInContainer(Obj);
             SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
                 SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
@@ -1903,8 +2203,10 @@ begin
         else if (Kind = 'NETLABEL') then
         begin
             Obj := SchServer.SchObjectFactory(eNetLabel, eCreate_GlobalCopy);
-            Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
             Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
             Obj.Text := GetFieldFromPipeString(Rec, 4);
             TargetDoc.RegisterSchObjectInContainer(Obj);
@@ -1916,8 +2218,10 @@ begin
         else if (Kind = 'POWER') then
         begin
             Obj := SchServer.SchObjectFactory(ePowerObject, eCreate_GlobalCopy);
-            Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
             Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
             Obj.Style := StrToInt(GetFieldFromPipeString(Rec, 4));
             // NOTE: ShowNetName := False does NOT hide the label - Altium draws
@@ -1936,12 +2240,15 @@ begin
             // IOType: 0=unspecified 1=output 2=input 3=bidirectional.
             // Location is the port's connection-side end; wire to it.
             Obj := SchServer.SchObjectFactory(ePort, eCreate_GlobalCopy);
-            Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
             Obj.Name := GetFieldFromPipeString(Rec, 3);
             Obj.IOType := StrToInt(GetFieldFromPipeString(Rec, 4));
             Obj.Style := StrToInt(GetFieldFromPipeString(Rec, 5));
-            Obj.Width := MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 6)));
+            Obj.Width := StrToInt(GetFieldFromPipeString(Rec, 6));
+            Obj.Width := StrToInt(GetFieldFromPipeString(Rec, 6));
             TargetDoc.RegisterSchObjectInContainer(Obj);
             SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
                 SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
@@ -1951,8 +2258,10 @@ begin
         else if (Kind = 'NOTE') then
         begin
             Obj := SchServer.SchObjectFactory(eLabel, eCreate_GlobalCopy);
-            Obj.Location := Point(MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 1))),
-                                  MilsToCoord(StrToInt(GetFieldFromPipeString(Rec, 2))));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
+            Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)),
+                                  StrToInt(GetFieldFromPipeString(Rec, 2)));
             Obj.Text := GetFieldFromPipeString(Rec, 3);
             TargetDoc.RegisterSchObjectInContainer(Obj);
             SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
@@ -2015,6 +2324,7 @@ begin
     Placement.Free;
 end;
 
+<<<<<<< HEAD
 function HarnessColorToTColor(ColorName: String): Integer;
 var
     C: String;
@@ -4603,10 +4913,1031 @@ begin
     if not FileExists(SpecPath) then
     begin
         Result := '{"success": false, "error": "spec file not found: ' + JSONEscapeString(SpecPath) + '"}';
+=======
+// The symbol (library component) with this name in a schematic library, or
+// nil. SchLibIterator_Create, not SchIterator_Create, works on SchLib documents.
+function FindLibSymbol(Lib: ISch_Lib; Name: String): ISch_Component;
+var
+    Iter : ISch_Iterator;
+    Comp : ISch_Component;
+begin
+    Result := nil;
+    Iter := Lib.SchLibIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eSchComponent));
+    Comp := Iter.FirstSchObject;
+    while (Comp <> nil) do
+    begin
+        if (UpperCase(Comp.LibReference) = UpperCase(Name)) then
+        begin
+            Result := Comp;
+            Break;
+        end;
+        Comp := Iter.NextSchObject;
+    end;
+    Lib.SchIterator_Destroy(Iter);
+end;
+
+// True when a parameter that Owner's iterator returned belongs to Owner
+// itself. A symbol's iterator also returns its pins' parameters. While a
+// symbol is shown in the library editor, the library document holds its
+// visible parameters (their Container is the SchLib) and hands them back
+// when another symbol is shown; those still belong to the symbol.
+function IsOwnParameter(Param: ISch_Parameter; Owner: ISch_GraphicalObject): Boolean;
+begin
+    Result := False;
+    if (Param.Container = nil) then Exit;
+    if (Param.Container.I_ObjectAddress = Owner.I_ObjectAddress) then
+        Result := True
+    else if (Owner.ObjectId = eSchComponent) then
+        Result := (Param.Container.ObjectId = eSchLib);
+end;
+
+// A parameter of a symbol or a pin by name (case-insensitive), or nil
+function FindChildParameter(Owner: ISch_GraphicalObject; Name: String): ISch_Parameter;
+var
+    Iter  : ISch_Iterator;
+    Param : ISch_Parameter;
+begin
+    Result := nil;
+    Iter := Owner.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eParameter));
+    Param := Iter.FirstSchObject;
+    while (Param <> nil) do
+    begin
+        if (UpperCase(Param.Name) = UpperCase(Name)) and IsOwnParameter(Param, Owner) then
+        begin
+            Result := Param;
+            Break;
+        end;
+        Param := Iter.NextSchObject;
+    end;
+    Owner.SchIterator_Destroy(Iter);
+end;
+
+// Set a symbol's Comment and whether it is visible. The library editor
+// keeps its own copy of the Comment of the symbol it shows and writes that
+// copy back to the symbol when it shows another one, so for that symbol the
+// copy is set too.
+procedure SetSymbolComment(Lib: ISch_Lib; Comp: ISch_Component; Text: String; Visible: Boolean);
+var
+    Iter : ISch_Iterator;
+    LibCopy : ISch_Parameter;
+    Prim : ISch_Parameter;
+begin
+    SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    Comp.Comment.Text := Text;
+    Comp.Comment.IsHidden := not Visible;
+    SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+
+    if (Lib.CurrentSchComponent = nil) then Exit;
+    if (Lib.CurrentSchComponent.I_ObjectAddress <> Comp.I_ObjectAddress) then Exit;
+    LibCopy := nil;
+    Iter := Lib.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eParameter));
+    Prim := Iter.FirstSchObject;
+    while (Prim <> nil) do
+    begin
+        if (UpperCase(Prim.Name) = 'COMMENT') and IsOwnParameter(Prim, Lib) then
+            LibCopy := Prim;
+        Prim := Iter.NextSchObject;
+    end;
+    Lib.SchIterator_Destroy(Iter);
+    if (LibCopy = nil) then Exit;
+    SchServer.RobotManager.SendMessage(LibCopy.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    LibCopy.Text := Text;
+    LibCopy.IsHidden := not Visible;
+    SchServer.RobotManager.SendMessage(LibCopy.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+end;
+
+// The bottom-left corner of a symbol's first part, as 'x|y' (coords): the
+// extent of its drawn graphics, or of its pins when it has none. Used to
+// place parameters below the body. Taken from the geometry, not the
+// bounding rectangles, which include line widths and so land off grid.
+function SymbolBodyCorner(Comp: ISch_Component): String;
+var
+    Iter    : ISch_Iterator;
+    Prim    : ISch_GraphicalObject;
+    ObjId   : Integer;
+    Pass, V : Integer;
+    Found   : Boolean;
+    Use     : Boolean;
+    MinX    : Integer;
+    MinY    : Integer;
+    PX, PY  : Integer;
+begin
+    Found := False;
+    MinX := 0;
+    MinY := 0;
+    for Pass := 1 to 2 do
+    begin
+        if not Found then
+        begin
+            Iter := Comp.SchIterator_Create;
+            Prim := Iter.FirstSchObject;
+            while (Prim <> nil) do
+            begin
+                // Pass 1: the drawn body; pass 2: the pins (Location is
+                // the end at the body)
+                ObjId := Prim.ObjectId;
+                Use := False;
+                if (Prim.OwnerPartId <= 1) then
+                begin
+                    if (Pass = 2) then
+                    begin
+                        if (ObjId = ePin) then
+                        begin
+                            Use := True;
+                            PX := Prim.Location.X;
+                            PY := Prim.Location.Y;
+                        end;
+                    end
+                    else if (ObjId = eRectangle) or (ObjId = eRoundRectangle) or (ObjId = eLine) then
+                    begin
+                        Use := True;
+                        PX := Prim.Location.X;
+                        PY := Prim.Location.Y;
+                        if (Prim.Corner.X < PX) then PX := Prim.Corner.X;
+                        if (Prim.Corner.Y < PY) then PY := Prim.Corner.Y;
+                    end
+                    else if (ObjId = ePolyline) or (ObjId = ePolygon) or (ObjId = eBezier) then
+                    begin
+                        for V := 1 to Prim.VerticesCount do
+                        begin
+                            if (not Use) or (Prim.Vertex[V].X < PX) then PX := Prim.Vertex[V].X;
+                            if (not Use) or (Prim.Vertex[V].Y < PY) then PY := Prim.Vertex[V].Y;
+                            Use := True;
+                        end;
+                    end
+                    else if (ObjId = eArc) or (ObjId = ePie) then
+                    begin
+                        Use := True;
+                        PX := Prim.Location.X - Prim.Radius;
+                        PY := Prim.Location.Y - Prim.Radius;
+                    end
+                    else if (ObjId = eEllipticalArc) or (ObjId = eEllipse) then
+                    begin
+                        Use := True;
+                        PX := Prim.Location.X - Prim.Radius;
+                        PY := Prim.Location.Y - Prim.SecondaryRadius;
+                    end;
+                end;
+                if Use then
+                begin
+                    if (not Found) or (PX < MinX) then MinX := PX;
+                    if (not Found) or (PY < MinY) then MinY := PY;
+                    Found := True;
+                end;
+                Prim := Iter.NextSchObject;
+            end;
+            Comp.SchIterator_Destroy(Iter);
+        end;
+    end;
+    Result := IntToStr(MinX) + '|' + IntToStr(MinY);
+end;
+
+// Apply edit records to a symbol, as one undo step:
+//   COMMENT|<text>[|<visible 1/0>]               set the Comment (hidden unless visible is 1)
+//   DESCRIPTION|<text>                           set the Description
+//   SYMPARAM|<name>|<value>|<visible 1/0>[|x|y[|justification[|font name:size]]]
+//                                                add or replace a symbol parameter;
+//                                                one the tool positions gets
+//                                                Autoposition off, so it stays put
+//   PINPARAM|<pin number>|<name>|<value>         add or replace a hidden pin
+//                                                parameter on every pin with that number
+//   PINDESC|<pin number>|<text>                  set the Description of every pin with
+//                                                that number
+//   PINSYMBOL|<pin number>|<edge>|<symbol>       set an IEEE symbol of every pin with that
+//                                                number; edge inside, inside_edge,
+//                                                outside_edge or outside
+// By default, visible symbol parameters without x|y go below the body's
+// bottom-left corner, 100 mil apart, in record order. Problems (e.g. no pin with that
+// number) are added to Problems as JSON strings. Returns the records applied.
+function ApplySymbolEdits(Lib: ISch_Lib; Comp: ISch_Component; Edits: TStringList; Problems: TStringList): Integer;
+var
+    i, Placed : Integer;
+    Line      : String;
+    Kind      : String;
+    Name      : String;
+    Value     : String;
+    PinNum    : String;
+    Visible   : Boolean;
+    Matched   : Boolean;
+    Param     : ISch_Parameter;
+    Iter      : ISch_Iterator;
+    Pin       : ISch_Pin;
+    Corner    : String;
+    X, Y      : Integer;
+    Just      : Integer;
+    Sym       : Integer;
+    Edge      : String;
+    FontID    : Integer;
+    FontSpec  : String;
+begin
+    Result := 0;
+    if (Edits.Count = 0) then Exit;
+    Corner := SymbolBodyCorner(Comp);
+    Placed := 0;
+
+    SchServer.ProcessControl.PreProcess(Lib, '');
+    for i := 0 to Edits.Count - 1 do
+    begin
+        Line := Edits[i];
+        Kind := UpperCase(Trim(GetFieldFromPipeString(Line, 0)));
+        if (Kind = 'COMMENT') then
+        begin
+            // Hidden unless the optional visible field is 1
+            SetSymbolComment(Lib, Comp, GetFieldFromPipeString(Line, 1),
+                             Trim(GetFieldFromPipeString(Line, 2)) = '1');
+            Result := Result + 1;
+        end
+        else if (Kind = 'DESCRIPTION') then
+        begin
+            SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+            Comp.ComponentDescription := GetFieldFromPipeString(Line, 1);
+            SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+            Result := Result + 1;
+        end
+        else if (Kind = 'SYMPARAM') then
+        begin
+            Name := Trim(GetFieldFromPipeString(Line, 1));
+            Value := GetFieldFromPipeString(Line, 2);
+            Visible := (Trim(GetFieldFromPipeString(Line, 3)) = '1');
+            // Optional justification; omitted keeps the parameter's own
+            Just := -1;
+            if (Trim(GetFieldFromPipeString(Line, 6)) <> '') then
+            begin
+                Just := JustificationValue(GetFieldFromPipeString(Line, 6));
+                if (Just < 0) then
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': unknown justification ' +
+                        Trim(GetFieldFromPipeString(Line, 6)) + ' for SYMPARAM ' + Name) + '"');
+            end;
+            // Optional font as <name>:<size>; omitted keeps the parameter's own
+            FontID := -1;
+            FontSpec := Trim(GetFieldFromPipeString(Line, 7));
+            if (FontSpec <> '') then
+            begin
+                FontID := FontIDFromSpec(FontSpec);
+                if (FontID < 0) then
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': font ' + FontSpec +
+                        ' for SYMPARAM ' + Name + ' is not <font name>:<size>') + '"');
+            end;
+            if (Trim(GetFieldFromPipeString(Line, 4)) <> '') then
+            begin
+                X := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4))));
+                Y := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 5))));
+            end
+            else
+            begin
+                if Visible then
+                    Placed := Placed + 1;
+                X := StrToInt(GetFieldFromPipeString(Corner, 0));
+                Y := StrToInt(GetFieldFromPipeString(Corner, 1)) - MilsToCoord(100) * Placed;
+            end;
+            Param := FindChildParameter(Comp, Name);
+            if (Param = nil) then
+            begin
+                Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                Param.Name := Name;
+                Param.Text := Value;
+                Param.IsHidden := not Visible;
+                Param.ShowName := False;
+                // Autoposition would let Altium re-stack the parameter away
+                // from the location given here
+                Param.Autoposition := False;
+                Param.Location := Point(X, Y);
+                if (Just >= 0) then
+                    Param.Justification := Just;
+                if (FontID >= 0) then
+                    Param.FontID := FontID;
+                Comp.AddSchObject(Param);
+                SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+            end
+            else
+            begin
+                SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                Param.Text := Value;
+                Param.IsHidden := not Visible;
+                if Visible or (Trim(GetFieldFromPipeString(Line, 4)) <> '') then
+                begin
+                    Param.Autoposition := False;
+                    Param.Location := Point(X, Y);
+                end;
+                if (Just >= 0) then
+                    Param.Justification := Just;
+                if (FontID >= 0) then
+                    Param.FontID := FontID;
+                SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+            end;
+            Result := Result + 1;
+        end
+        else if (Kind = 'PINPARAM') or (Kind = 'PINDESC') or (Kind = 'PINSYMBOL') then
+        begin
+            PinNum := Trim(GetFieldFromPipeString(Line, 1));
+            Name := Trim(GetFieldFromPipeString(Line, 2));
+            Value := GetFieldFromPipeString(Line, 3);
+            Matched := False;
+            Sym := 0;
+            Edge := LowerCase(Name);
+            if (Kind = 'PINSYMBOL') then
+            begin
+                Sym := IeeeSymbolValue(Value);
+                if (Edge <> 'inside') and (Edge <> 'inside_edge') and (Edge <> 'outside_edge') and (Edge <> 'outside') then
+                begin
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': unknown pin edge ' + Name +
+                        ' for PINSYMBOL (inside, inside_edge, outside_edge or outside)') + '"');
+                    Sym := -1;
+                end
+                else if (Sym < 0) then
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': unknown IEEE symbol ' + Trim(Value) +
+                        ' for PINSYMBOL') + '"');
+            end;
+            Iter := Comp.SchIterator_Create;
+            Iter.AddFilter_ObjectSet(MkSet(ePin));
+            Pin := Iter.FirstSchObject;
+            while (Pin <> nil) and (Sym >= 0) do
+            begin
+                if (Pin.Designator = PinNum) and (Kind <> 'PINPARAM') then
+                begin
+                    Matched := True;
+                    SchServer.RobotManager.SendMessage(Pin.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    if (Kind = 'PINDESC') then
+                        Pin.Description := GetFieldFromPipeString(Line, 2)
+                    else if (Edge = 'inside') then
+                        Pin.Symbol_Inner := Sym
+                    else if (Edge = 'inside_edge') then
+                        Pin.Symbol_InnerEdge := Sym
+                    else if (Edge = 'outside_edge') then
+                        Pin.Symbol_OuterEdge := Sym
+                    else
+                        Pin.Symbol_Outer := Sym;
+                    SchServer.RobotManager.SendMessage(Pin.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                end
+                else if (Pin.Designator = PinNum) then
+                begin
+                    Matched := True;
+                    Param := FindChildParameter(Pin, Name);
+                    if (Param = nil) then
+                    begin
+                        Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                        Param.Name := Name;
+                        Param.Text := Value;
+                        Param.IsHidden := True;
+                        Param.Location := Pin.Location;
+                        Pin.AddSchObject(Param);
+                        SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                    end
+                    else
+                    begin
+                        SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                        Param.Text := Value;
+                        Param.IsHidden := True;
+                        SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    end;
+                end;
+                Pin := Iter.NextSchObject;
+            end;
+            Comp.SchIterator_Destroy(Iter);
+            if Matched then
+                Result := Result + 1
+            else if (Kind = 'PINPARAM') then
+                Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': no pin ' + PinNum + ' for PINPARAM ' + Name) + '"')
+            else if (Sym >= 0) then
+                Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': no pin ' + PinNum + ' for ' + Kind) + '"');
+        end;
+    end;
+    SchServer.ProcessControl.PostProcess(Lib, '');
+    Lib.GraphicallyInvalidate;
+end;
+
+// Add a pin's parameters (name, value) to its JSON properties, when it has any
+procedure AddPinParametersJSON(Props: TStringList; Pin: ISch_Pin);
+var
+    Iter   : ISch_Iterator;
+    Param  : ISch_Parameter;
+    Items  : TStringList;
+    PProps : TStringList;
+begin
+    Items := TStringList.Create;
+    try
+        Iter := Pin.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eParameter));
+        Param := Iter.FirstSchObject;
+        while (Param <> nil) do
+        begin
+            if IsOwnParameter(Param, Pin) then
+            begin
+                PProps := TStringList.Create;
+                try
+                    AddJSONProperty(PProps, 'name', Param.Name);
+                    AddJSONProperty(PProps, 'value', Param.Text);
+                    Items.Add(BuildJSONObject(PProps, 3));
+                finally
+                    PProps.Free;
+                end;
+            end;
+            Param := Iter.NextSchObject;
+        end;
+        Pin.SchIterator_Destroy(Iter);
+        if (Items.Count > 0) then
+            Props.Add(BuildJSONArray(Items, 'parameters', 2));
+    finally
+        Items.Free;
+    end;
+end;
+
+// Add a symbol's Comment (text, visible) and its parameters (name, value,
+// visible, location in mils) to its JSON properties
+procedure AddSymbolPropertiesJSON(Props: TStringList; Comp: ISch_Component);
+var
+    Iter   : ISch_Iterator;
+    Param  : ISch_Parameter;
+    Items  : TStringList;
+    PProps : TStringList;
+begin
+    PProps := TStringList.Create;
+    try
+        AddJSONProperty(PProps, 'text', Comp.Comment.Text);
+        AddJSONBoolean(PProps, 'visible', not Comp.Comment.IsHidden);
+        Props.Add('"comment": ' + BuildJSONObject(PProps, 2));
+    finally
+        PProps.Free;
+    end;
+
+    Items := TStringList.Create;
+    try
+        Iter := Comp.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eParameter));
+        Param := Iter.FirstSchObject;
+        while (Param <> nil) do
+        begin
+            // The Comment is reported above; pin parameters are reported
+            // with their pins
+            if (UpperCase(Param.Name) <> 'COMMENT') and IsOwnParameter(Param, Comp) then
+            begin
+                PProps := TStringList.Create;
+                try
+                    AddJSONProperty(PProps, 'name', Param.Name);
+                    AddJSONProperty(PProps, 'value', Param.Text);
+                    AddJSONBoolean(PProps, 'visible', not Param.IsHidden);
+                    AddJSONNumber(PProps, 'x', CoordToMils(Param.Location.X));
+                    AddJSONNumber(PProps, 'y', CoordToMils(Param.Location.Y));
+                    AddJSONProperty(PProps, 'justification', JustificationName(Param.Justification));
+                    AddJSONBoolean(PProps, 'autoposition', Param.Autoposition);
+                    PProps.Add('"font": ' + FontJSON(Param.FontID));
+                    Items.Add(BuildJSONObject(PProps, 2));
+                finally
+                    PProps.Free;
+                end;
+            end;
+            Param := Iter.NextSchObject;
+        end;
+        Comp.SchIterator_Destroy(Iter);
+        Props.Add(BuildJSONArray(Items, 'parameters', 1));
+    finally
+        Items.Free;
+    end;
+end;
+
+// True when the focused document is the schematic library at Path (compared
+// with NormalizedPath, so spelling differences do not matter)
+function SchLibIsFocused(Path: String): Boolean;
+var
+    Lib : ISch_Lib;
+begin
+    Result := False;
+    Lib := SchServer.GetCurrentSchDocument;
+    if (Lib <> nil) then
+        if (Lib.ObjectID = eSchLib) then
+            Result := (NormalizedPath(Lib.DocumentName) = NormalizedPath(Path));
+end;
+
+// The file path of the focused schematic library, or ''
+function LibPathOfFocusedSchLib(Dummy: Integer): String;
+var
+    Lib : ISch_Lib;
+begin
+    Result := '';
+    Lib := SchServer.GetCurrentSchDocument;
+    if (Lib <> nil) then
+        if (Lib.ObjectID = eSchLib) then
+            Result := Lib.DocumentName;
+end;
+
+// TIeeeSymbol names without the leading 'e', in enum order: a name's
+// position is its value (eNoSymbol = 0 ... eBidirectionalSignalFlow = 34)
+function IeeeSymbolNames(Dummy: Integer): String;
+begin
+    Result := 'NOSYMBOL|DOT|RIGHTLEFTSIGNALFLOW|CLOCK|ACTIVELOWINPUT|ANALOGSIGNALIN|' +
+              'NOTLOGICCONNECTION|SHIFTRIGHT|POSTPONEDOUTPUT|OPENCOLLECTOR|HIZ|HIGHCURRENT|' +
+              'PULSE|SCHMITT|DELAY|GROUPLINE|GROUPBIN|ACTIVELOWOUTPUT|PISYMBOL|GREATEREQUAL|' +
+              'LESSEQUAL|SIGMA|OPENCOLLECTORPULLUP|OPENEMITTER|OPENEMITTERPULLUP|' +
+              'DIGITALSIGNALIN|AND|INVERTOR|OR|XOR|SHIFTLEFT|INPUTOUTPUT|OPENCIRCUITOUTPUT|' +
+              'LEFTRIGHTSIGNALFLOW|BIDIRECTIONALSIGNALFLOW';
+end;
+
+// The TIeeeSymbol value of a name (case-insensitive, no leading 'e'; 'none'
+// is eNoSymbol), or -1 for an unknown name
+function IeeeSymbolValue(Name: String): Integer;
+var
+    i   : Integer;
+    Key : String;
+begin
+    Result := -1;
+    Key := UpperCase(Trim(Name));
+    if (Key = 'NONE') then
+        Key := 'NOSYMBOL';
+    if (Key = '') then Exit;
+    for i := 0 to 34 do
+        if (GetFieldFromPipeString(IeeeSymbolNames(0), i) = Key) then
+        begin
+            Result := i;
+            Exit;
+        end;
+end;
+
+// The lower-case name of a TIeeeSymbol value; 'none' for eNoSymbol
+function IeeeSymbolName(Value: Integer): String;
+begin
+    if (Value = 0) then
+        Result := 'none'
+    else
+        Result := LowerCase(GetFieldFromPipeString(IeeeSymbolNames(0), Value));
+end;
+
+// Text justification names in TTextJustification order: a name's position
+// is its value (eJustify_BottomLeft = 0 ... eJustify_TopRight = 8)
+function JustificationNames(Dummy: Integer): String;
+begin
+    Result := 'bottom_left|bottom_center|bottom_right|center_left|center|' +
+              'center_right|top_left|top_center|top_right';
+end;
+
+// The TTextJustification value of a name (case-insensitive), or -1
+function JustificationValue(Name: String): Integer;
+var
+    i : Integer;
+begin
+    Result := -1;
+    for i := 0 to 8 do
+        if (GetFieldFromPipeString(JustificationNames(0), i) = LowerCase(Trim(Name))) then
+        begin
+            Result := i;
+            Exit;
+        end;
+end;
+
+// The name of a TTextJustification value
+function JustificationName(Value: Integer): String;
+begin
+    Result := GetFieldFromPipeString(JustificationNames(0), Value);
+end;
+
+// The font ID for '<font name>:<size>' (e.g. 'Times New Roman:9'), adding
+// the font to the font table when it is missing; -1 when the text is not of
+// that form. Fonts are always given by name and size: font IDs differ
+// between documents.
+function FontIDFromSpec(Spec: String): Integer;
+var
+    i, Cut   : Integer;
+    FontName : String;
+    SizeText : String;
+begin
+    Result := -1;
+    Cut := 0;
+    for i := 1 to Length(Spec) do
+        if (Copy(Spec, i, 1) = ':') then
+            Cut := i;
+    if (Cut < 2) then Exit;
+    FontName := Trim(Copy(Spec, 1, Cut - 1));
+    SizeText := Trim(Copy(Spec, Cut + 1, Length(Spec)));
+    if (FontName = '') or (SizeText = '') or (Length(SizeText) > 3) then Exit;
+    for i := 1 to Length(SizeText) do
+        if (Pos(Copy(SizeText, i, 1), '0123456789') = 0) then Exit;
+    if (StrToInt(SizeText) < 1) then Exit;
+    Result := SchServer.FontManager.GetFontID(StrToInt(SizeText), 0, False, False, False, False, FontName);
+end;
+
+// A font as JSON: {"name": ..., "size": ...}
+function FontJSON(FontID: Integer): String;
+var
+    Props : TStringList;
+begin
+    Props := TStringList.Create;
+    try
+        AddJSONProperty(Props, 'name', SchServer.FontManager.FontName[FontID]);
+        AddJSONInteger(Props, 'size', SchServer.FontManager.Size[FontID]);
+        Result := BuildJSONObject(Props, 3);
+    finally
+        Props.Free;
+    end;
+end;
+
+
+// ---------------------------------------------------------------------------
+// edit_schematic: change an existing sheet. Every edit is reported to
+// Altium's undo system - one PreProcess/PostProcess around the whole edit,
+// SCHM_BeginModify/EndModify around each change to an existing object,
+// SCHM_PrimitiveRegistration for each object added or removed - so a single
+// Undo in Altium takes the whole edit back and the user's own edits stay
+// undoable.
+
+// The component with this designator (and part, when Part > 0); nil when
+// there is none. Ambiguous is set when several parts share the designator
+// and no part was given.
+function FindSchComponent(Doc: ISch_Document; Designator: String; Part: Integer; var Ambiguous: Boolean): ISch_Component;
+var
+    Iterator : ISch_Iterator;
+    Comp     : ISch_Component;
+begin
+    Result := nil;
+    Ambiguous := False;
+    Iterator := Doc.SchIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eSchComponent));
+    Comp := Iterator.FirstSchObject;
+    while Comp <> nil do
+    begin
+        if (UpperCase(Comp.Designator.Text) = UpperCase(Designator)) and
+           ((Part <= 0) or (Comp.CurrentPartID = Part)) then
+        begin
+            if Result <> nil then Ambiguous := True;
+            Result := Comp;
+        end;
+        Comp := Iterator.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iterator);
+end;
+
+// The designator, comment or named parameter of Comp; nil when absent
+function FindSchText(Comp: ISch_Component; Name: String): ISch_GraphicalObject;
+var
+    Iterator : ISch_Iterator;
+    Param    : ISch_Parameter;
+begin
+    Result := nil;
+    if UpperCase(Name) = 'DESIGNATOR' then
+    begin
+        Result := Comp.Designator;
+        Exit;
+    end;
+    if UpperCase(Name) = 'COMMENT' then
+    begin
+        Result := Comp.Comment;
+        Exit;
+    end;
+    Iterator := Comp.SchIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eParameter));
+    Param := Iterator.FirstSchObject;
+    while (Param <> nil) and (Result = nil) do
+    begin
+        if UpperCase(Param.Name) = UpperCase(Name) then Result := Param;
+        Param := Iterator.NextSchObject;
+    end;
+    Comp.SchIterator_Destroy(Iterator);
+end;
+
+procedure SchBeginModify(Obj: ISch_GraphicalObject);
+begin
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+end;
+
+procedure SchEndModify(Obj: ISch_GraphicalObject);
+begin
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+end;
+
+procedure SchRegister(Doc: ISch_Document; Obj: ISch_GraphicalObject);
+begin
+    Doc.RegisterSchObjectInContainer(Obj);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+end;
+
+procedure SchRemove(Doc: ISch_Document; Obj: ISch_GraphicalObject);
+begin
+    Doc.RemoveSchObject(Obj);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+end;
+
+// Does the wire pass through or end at (X, Y), within Tol (internal units)?
+function WireTouches(Wire: ISch_Wire; X: Integer; Y: Integer; Tol: Integer): Boolean;
+var
+    k, X1, Y1, X2, Y2 : Integer;
+begin
+    Result := False;
+    for k := 1 to Wire.VerticesCount - 1 do
+    begin
+        X1 := Wire.Vertex[k].X; Y1 := Wire.Vertex[k].Y;
+        X2 := Wire.Vertex[k + 1].X; Y2 := Wire.Vertex[k + 1].Y;
+        if (X >= Min(X1, X2) - Tol) and (X <= Max(X1, X2) + Tol) and
+           (Y >= Min(Y1, Y2) - Tol) and (Y <= Max(Y1, Y2) + Tol) then
+            // axis-aligned and diagonal segments alike: distance to the line
+            if Abs((X - X1) * (Y2 - Y1) - (Y - Y1) * (X2 - X1)) <=
+               Tol * Sqrt(Sqr(X2 - X1) + Sqr(Y2 - Y1)) + Tol then
+                Result := True;
+    end;
+end;
+
+// Remove the objects of Kind at (X, Y): a wire passing through the point,
+// or a label, port, junction or no-ERC whose location is the point. Text,
+// when given, must match too. Returns how many were removed.
+function DeleteSchObjectsAt(Doc: ISch_Document; Kind: String; X: Integer; Y: Integer; Text: String): Integer;
+var
+    Iterator : ISch_Iterator;
+    Obj      : ISch_GraphicalObject;
+    Hits     : TList;
+    i, Tol   : Integer;
+    Match    : Boolean;
+begin
+    Result := 0;
+    Tol := MilsToCoord(1);
+    Hits := TList.Create;
+    try
+        Iterator := Doc.SchIterator_Create;
+        if Kind = 'wire' then Iterator.AddFilter_ObjectSet(MkSet(eWire))
+        else if Kind = 'net_label' then Iterator.AddFilter_ObjectSet(MkSet(eNetLabel))
+        else if Kind = 'power_port' then Iterator.AddFilter_ObjectSet(MkSet(ePowerObject))
+        else if Kind = 'junction' then Iterator.AddFilter_ObjectSet(MkSet(eJunction))
+        else if Kind = 'no_erc' then Iterator.AddFilter_ObjectSet(MkSet(eNoERC))
+        else if Kind = 'port' then Iterator.AddFilter_ObjectSet(MkSet(ePort))
+        else Iterator.AddFilter_ObjectSet(MkSet(eLabel));
+        Obj := Iterator.FirstSchObject;
+        while Obj <> nil do
+        begin
+            if Kind = 'wire' then
+                Match := WireTouches(Obj, X, Y, Tol)
+            else
+                Match := (Abs(Obj.Location.X - X) <= Tol) and (Abs(Obj.Location.Y - Y) <= Tol);
+            if Match and (Text <> '') then
+            begin
+                if Kind = 'port' then Match := UpperCase(Obj.Name) = UpperCase(Text)
+                else if Kind <> 'wire' then Match := UpperCase(Obj.Text) = UpperCase(Text);
+            end;
+            if Match then Hits.Add(Obj);
+            Obj := Iterator.NextSchObject;
+        end;
+        Doc.SchIterator_Destroy(Iterator);
+        // Removed after the walk, not during it
+        for i := 0 to Hits.Count - 1 do
+        begin
+            SchRemove(Doc, Hits[i]);
+            Result := Result + 1;
+        end;
+    finally
+        Hits.Free;
+    end;
+end;
+
+// Place a symbol from a .SchLib on Doc. Opening the library makes it the
+// current document, so Doc is held by reference throughout.
+function PlaceSchComponent(Doc: ISch_Document; Rec: String; var Msg: String): Boolean;
+var
+    LibDoc   : ISch_Document;
+    Iterator : ISch_Iterator;
+    Prim     : ISch_GraphicalObject;
+    Found, Replica : ISch_Component;
+    LibPath  : String;
+begin
+    Result := False;
+    LibPath := GetFieldFromPipeString(Rec, 2);
+    if not FileExists(LibPath) then
+    begin
+        Msg := 'library not found: ' + LibPath;
+        Exit;
+    end;
+    OpenLibraryDocument('SchLib', LibPath);
+    LibDoc := SchServer.GetSchDocumentByPath(LibPath);
+    if (LibDoc = nil) or (LibDoc.ObjectID <> eSchLib) then
+    begin
+        Msg := 'could not open the symbol library ' + LibPath;
+        Exit;
+    end;
+    Found := nil;
+    Iterator := LibDoc.SchLibIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eSchComponent));
+    Prim := Iterator.FirstSchObject;
+    while Prim <> nil do
+    begin
+        if Prim.LibReference = GetFieldFromPipeString(Rec, 3) then Found := Prim;
+        Prim := Iterator.NextSchObject;
+    end;
+    LibDoc.SchIterator_Destroy(Iterator);
+    if Found = nil then
+    begin
+        Msg := GetFieldFromPipeString(Rec, 3) + ' not found in ' + LibPath;
+        Exit;
+    end;
+    Replica := ReplicateLibSymbol(Found);
+    Replica.Designator.Text := GetFieldFromPipeString(Rec, 1);
+    Replica.LibraryPath := LibPath;
+    Replica.SourceLibraryName := ExtractFileName(LibPath);
+    Replica.Orientation := StrToInt(GetFieldFromPipeString(Rec, 6));
+    SchRegister(Doc, Replica);
+    if GetFieldFromPipeString(Rec, 7) = '1' then
+        Replica.Mirror(Replica.Location);
+    Replica.MoveByXY(StrToInt(GetFieldFromPipeString(Rec, 4)) - Replica.Location.X,
+                     StrToInt(GetFieldFromPipeString(Rec, 5)) - Replica.Location.Y);
+    if GetFieldFromPipeString(Rec, 8) <> '' then Replica.Comment.Text := GetFieldFromPipeString(Rec, 8);
+    Result := True;
+end;
+
+// One edit record; Msg says why it failed
+function ApplySchEdit(Doc: ISch_Document; Rec: String; var Msg: String): Boolean;
+var
+    Kind, Name : String;
+    Comp       : ISch_Component;
+    Obj        : ISch_GraphicalObject;
+    Param      : ISch_Parameter;
+    Ambiguous  : Boolean;
+    fld, vtx, n, Want : Integer;
+begin
+    Result := False;
+    Msg := '';
+    Kind := GetFieldFromPipeString(Rec, 0);
+
+    if (Kind = 'MOVE') or (Kind = 'DELETE') or (Kind = 'PARAM') or (Kind = 'TEXT') then
+    begin
+        // MOVE|des|part|x|y|rot|mirror  DELETE|des|part  PARAM|des|part|name|value|visible
+        // TEXT|des|part|name|x|y|justification|orientation|visible   (-1: keep)
+        Comp := FindSchComponent(Doc, GetFieldFromPipeString(Rec, 1),
+                                 StrToInt(GetFieldFromPipeString(Rec, 2)), Ambiguous);
+        if Comp = nil then
+        begin
+            Msg := 'no component ' + GetFieldFromPipeString(Rec, 1) + ' on the sheet';
+            Exit;
+        end;
+        if Ambiguous then
+        begin
+            Msg := GetFieldFromPipeString(Rec, 1) + ' has several parts on the sheet; give "part"';
+            Exit;
+        end;
+    end;
+
+    if Kind = 'MOVE' then
+    begin
+        SchBeginModify(Comp);
+        Want := StrToInt(GetFieldFromPipeString(Rec, 5));
+        if Want >= 0 then Comp.Orientation := Want;
+        Want := StrToInt(GetFieldFromPipeString(Rec, 6));
+        // Mirror is the editor's X key; IsMirrored alone only changes the flag
+        if (Want >= 0) and ((Want = 1) <> Comp.IsMirrored) then Comp.Mirror(Comp.Location);
+        // MoveByXY, not Location, so the part's text travels with it
+        if GetFieldFromPipeString(Rec, 3) <> '' then
+            Comp.MoveByXY(StrToInt(GetFieldFromPipeString(Rec, 3)) - Comp.Location.X,
+                          StrToInt(GetFieldFromPipeString(Rec, 4)) - Comp.Location.Y);
+        SchEndModify(Comp);
+        Result := True;
+    end
+    else if Kind = 'DELETE' then
+    begin
+        SchRemove(Doc, Comp);
+        Result := True;
+    end
+    else if Kind = 'PARAM' then
+    begin
+        Name := GetFieldFromPipeString(Rec, 3);
+        Obj := FindSchText(Comp, Name);
+        if Obj = nil then
+        begin
+            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+            Param.Name := Name;
+            Param.Text := GetFieldFromPipeString(Rec, 4);
+            Param.IsHidden := GetFieldFromPipeString(Rec, 5) <> '1';
+            Param.Location := Comp.Location;
+            Comp.AddSchObject(Param);
+            SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+        end
+        else
+        begin
+            SchBeginModify(Obj);
+            Obj.Text := GetFieldFromPipeString(Rec, 4);
+            Want := StrToInt(GetFieldFromPipeString(Rec, 5));
+            if Want >= 0 then Obj.IsHidden := Want = 0;
+            SchEndModify(Obj);
+        end;
+        Result := True;
+    end
+    else if Kind = 'TEXT' then
+    begin
+        Obj := FindSchText(Comp, GetFieldFromPipeString(Rec, 3));
+        if Obj = nil then
+        begin
+            Msg := GetFieldFromPipeString(Rec, 1) + ' has no ' + GetFieldFromPipeString(Rec, 3);
+            Exit;
+        end;
+        SchBeginModify(Obj);
+        Obj.Autoposition := False;
+        if GetFieldFromPipeString(Rec, 4) <> '' then
+            Obj.MoveToXY(StrToInt(GetFieldFromPipeString(Rec, 4)), StrToInt(GetFieldFromPipeString(Rec, 5)));
+        Want := StrToInt(GetFieldFromPipeString(Rec, 6));
+        if Want >= 0 then Obj.Justification := Want;
+        Want := StrToInt(GetFieldFromPipeString(Rec, 7));
+        if Want >= 0 then Obj.Orientation := Want;
+        Want := StrToInt(GetFieldFromPipeString(Rec, 8));
+        if Want >= 0 then Obj.IsHidden := Want = 0;
+        SchEndModify(Obj);
+        Result := True;
+    end
+    else if Kind = 'WIRE' then
+    begin
+        // WIRE|x1|y1|x2|y2|...
+        Obj := SchServer.SchObjectFactory(eWire, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        fld := 1;
+        vtx := 0;
+        while GetFieldFromPipeString(Rec, fld) <> '' do
+        begin
+            vtx := vtx + 1;
+            Obj.InsertVertex := vtx;
+            Obj.SetState_Vertex(vtx, Point(StrToInt(GetFieldFromPipeString(Rec, fld)),
+                                           StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
+            fld := fld + 2;
+        end;
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if Kind = 'LABEL' then
+    begin
+        // LABEL|x|y|orientation|justification|text
+        Obj := SchServer.SchObjectFactory(eNetLabel, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
+        Obj.Justification := StrToInt(GetFieldFromPipeString(Rec, 4));
+        Obj.Text := GetFieldFromPipeString(Rec, 5);
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if Kind = 'POWER' then
+    begin
+        // POWER|x|y|orientation|style|show name|text
+        Obj := SchServer.SchObjectFactory(ePowerObject, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
+        Obj.Style := StrToInt(GetFieldFromPipeString(Rec, 4));
+        Obj.ShowNetName := GetFieldFromPipeString(Rec, 5) = '1';
+        Obj.Text := GetFieldFromPipeString(Rec, 6);
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if (Kind = 'JUNCTION') or (Kind = 'NOERC') then
+    begin
+        if Kind = 'JUNCTION' then
+            Obj := SchServer.SchObjectFactory(eJunction, eCreate_GlobalCopy)
+        else
+            Obj := SchServer.SchObjectFactory(eNoERC, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if Kind = 'DELETE_AT' then
+    begin
+        // DELETE_AT|kind|x|y|text
+        n := DeleteSchObjectsAt(Doc, GetFieldFromPipeString(Rec, 1), StrToInt(GetFieldFromPipeString(Rec, 2)),
+                                StrToInt(GetFieldFromPipeString(Rec, 3)), GetFieldFromPipeString(Rec, 4));
+        if n = 0 then
+            Msg := 'nothing of kind ' + GetFieldFromPipeString(Rec, 1) + ' at that point'
+        else
+            Result := True;
+    end
+    else if Kind = 'PLACE' then
+        Result := PlaceSchComponent(Doc, Rec, Msg)
+    else
+        Msg := 'unknown edit ' + Kind;
+end;
+
+function EditSchematic(SheetPath: String; SpecPath: String; Save: Boolean): String;
+var
+    Doc       : ISch_Document;
+    ServerDoc : IServerDocument;
+    Spec, Errors, Props : TStringList;
+    i, Applied : Integer;
+    Msg       : String;
+    Ok        : Boolean;
+begin
+    if not FileExists(SpecPath) then
+    begin
+        Result := 'ERROR: edit spec not found';
+        Exit;
+    end;
+    Doc := SchServer.GetSchDocumentByPath(SheetPath);
+    if Doc = nil then
+    begin
+        if not FileExists(SheetPath) then
+        begin
+            Result := 'ERROR: Sheet not found: ' + SheetPath;
+            Exit;
+        end;
+        ServerDoc := Client.OpenDocument('SCH', SheetPath);
+        if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
+        Doc := SchServer.GetSchDocumentByPath(SheetPath);
+    end;
+    if (Doc = nil) or (Doc.ObjectID <> eSheet) then
+    begin
+        Result := 'ERROR: ' + SheetPath + ' is not a schematic sheet that could be opened';
+>>>>>>> remotes/origin/main
         Exit;
     end;
 
     Spec := TStringList.Create;
+<<<<<<< HEAD
     Misses := TStringList.Create;
     ViewUids := TStringList.Create;
     try
@@ -5240,3 +6571,1079 @@ begin
               '", "was_open": ' + LowerCase(BoolToStr(WasOpen, True)) + '}';
 end;
 
+
+// The symbol (library component) with this name in a schematic library, or
+// nil. SchLibIterator_Create, not SchIterator_Create, works on SchLib documents.
+function FindLibSymbol(Lib: ISch_Lib; Name: String): ISch_Component;
+var
+    Iter : ISch_Iterator;
+    Comp : ISch_Component;
+begin
+    Result := nil;
+    Iter := Lib.SchLibIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eSchComponent));
+    Comp := Iter.FirstSchObject;
+    while (Comp <> nil) do
+    begin
+        if (UpperCase(Comp.LibReference) = UpperCase(Name)) then
+        begin
+            Result := Comp;
+            Break;
+        end;
+        Comp := Iter.NextSchObject;
+    end;
+    Lib.SchIterator_Destroy(Iter);
+end;
+
+// True when a parameter that Owner's iterator returned belongs to Owner
+// itself. A symbol's iterator also returns its pins' parameters. While a
+// symbol is shown in the library editor, the library document holds its
+// visible parameters (their Container is the SchLib) and hands them back
+// when another symbol is shown; those still belong to the symbol.
+function IsOwnParameter(Param: ISch_Parameter; Owner: ISch_GraphicalObject): Boolean;
+begin
+    Result := False;
+    if (Param.Container = nil) then Exit;
+    if (Param.Container.I_ObjectAddress = Owner.I_ObjectAddress) then
+        Result := True
+    else if (Owner.ObjectId = eSchComponent) then
+        Result := (Param.Container.ObjectId = eSchLib);
+end;
+
+// A parameter of a symbol or a pin by name (case-insensitive), or nil
+function FindChildParameter(Owner: ISch_GraphicalObject; Name: String): ISch_Parameter;
+var
+    Iter  : ISch_Iterator;
+    Param : ISch_Parameter;
+begin
+    Result := nil;
+    Iter := Owner.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eParameter));
+    Param := Iter.FirstSchObject;
+    while (Param <> nil) do
+    begin
+        if (UpperCase(Param.Name) = UpperCase(Name)) and IsOwnParameter(Param, Owner) then
+        begin
+            Result := Param;
+            Break;
+        end;
+        Param := Iter.NextSchObject;
+    end;
+    Owner.SchIterator_Destroy(Iter);
+end;
+
+// Set a symbol's Comment and whether it is visible. The library editor
+// keeps its own copy of the Comment of the symbol it shows and writes that
+// copy back to the symbol when it shows another one, so for that symbol the
+// copy is set too.
+procedure SetSymbolComment(Lib: ISch_Lib; Comp: ISch_Component; Text: String; Visible: Boolean);
+var
+    Iter : ISch_Iterator;
+    LibCopy : ISch_Parameter;
+    Prim : ISch_Parameter;
+begin
+    SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    Comp.Comment.Text := Text;
+    Comp.Comment.IsHidden := not Visible;
+    SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+
+    if (Lib.CurrentSchComponent = nil) then Exit;
+    if (Lib.CurrentSchComponent.I_ObjectAddress <> Comp.I_ObjectAddress) then Exit;
+    LibCopy := nil;
+    Iter := Lib.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(eParameter));
+    Prim := Iter.FirstSchObject;
+    while (Prim <> nil) do
+    begin
+        if (UpperCase(Prim.Name) = 'COMMENT') and IsOwnParameter(Prim, Lib) then
+            LibCopy := Prim;
+        Prim := Iter.NextSchObject;
+    end;
+    Lib.SchIterator_Destroy(Iter);
+    if (LibCopy = nil) then Exit;
+    SchServer.RobotManager.SendMessage(LibCopy.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    LibCopy.Text := Text;
+    LibCopy.IsHidden := not Visible;
+    SchServer.RobotManager.SendMessage(LibCopy.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+end;
+
+// The bottom-left corner of a symbol's first part, as 'x|y' (coords): the
+// extent of its drawn graphics, or of its pins when it has none. Used to
+// place parameters below the body. Taken from the geometry, not the
+// bounding rectangles, which include line widths and so land off grid.
+function SymbolBodyCorner(Comp: ISch_Component): String;
+var
+    Iter    : ISch_Iterator;
+    Prim    : ISch_GraphicalObject;
+    ObjId   : Integer;
+    Pass, V : Integer;
+    Found   : Boolean;
+    Use     : Boolean;
+    MinX    : Integer;
+    MinY    : Integer;
+    PX, PY  : Integer;
+begin
+    Found := False;
+    MinX := 0;
+    MinY := 0;
+    for Pass := 1 to 2 do
+    begin
+        if not Found then
+        begin
+            Iter := Comp.SchIterator_Create;
+            Prim := Iter.FirstSchObject;
+            while (Prim <> nil) do
+            begin
+                // Pass 1: the drawn body; pass 2: the pins (Location is
+                // the end at the body)
+                ObjId := Prim.ObjectId;
+                Use := False;
+                if (Prim.OwnerPartId <= 1) then
+                begin
+                    if (Pass = 2) then
+                    begin
+                        if (ObjId = ePin) then
+                        begin
+                            Use := True;
+                            PX := Prim.Location.X;
+                            PY := Prim.Location.Y;
+                        end;
+                    end
+                    else if (ObjId = eRectangle) or (ObjId = eRoundRectangle) or (ObjId = eLine) then
+                    begin
+                        Use := True;
+                        PX := Prim.Location.X;
+                        PY := Prim.Location.Y;
+                        if (Prim.Corner.X < PX) then PX := Prim.Corner.X;
+                        if (Prim.Corner.Y < PY) then PY := Prim.Corner.Y;
+                    end
+                    else if (ObjId = ePolyline) or (ObjId = ePolygon) or (ObjId = eBezier) then
+                    begin
+                        for V := 1 to Prim.VerticesCount do
+                        begin
+                            if (not Use) or (Prim.Vertex[V].X < PX) then PX := Prim.Vertex[V].X;
+                            if (not Use) or (Prim.Vertex[V].Y < PY) then PY := Prim.Vertex[V].Y;
+                            Use := True;
+                        end;
+                    end
+                    else if (ObjId = eArc) or (ObjId = ePie) then
+                    begin
+                        Use := True;
+                        PX := Prim.Location.X - Prim.Radius;
+                        PY := Prim.Location.Y - Prim.Radius;
+                    end
+                    else if (ObjId = eEllipticalArc) or (ObjId = eEllipse) then
+                    begin
+                        Use := True;
+                        PX := Prim.Location.X - Prim.Radius;
+                        PY := Prim.Location.Y - Prim.SecondaryRadius;
+                    end;
+                end;
+                if Use then
+                begin
+                    if (not Found) or (PX < MinX) then MinX := PX;
+                    if (not Found) or (PY < MinY) then MinY := PY;
+                    Found := True;
+                end;
+                Prim := Iter.NextSchObject;
+            end;
+            Comp.SchIterator_Destroy(Iter);
+        end;
+    end;
+    Result := IntToStr(MinX) + '|' + IntToStr(MinY);
+end;
+
+// Apply edit records to a symbol, as one undo step:
+//   COMMENT|<text>[|<visible 1/0>]               set the Comment (hidden unless visible is 1)
+//   DESCRIPTION|<text>                           set the Description
+//   SYMPARAM|<name>|<value>|<visible 1/0>[|x|y[|justification[|font name:size]]]
+//                                                add or replace a symbol parameter;
+//                                                one the tool positions gets
+//                                                Autoposition off, so it stays put
+//   PINPARAM|<pin number>|<name>|<value>         add or replace a hidden pin
+//                                                parameter on every pin with that number
+//   PINDESC|<pin number>|<text>                  set the Description of every pin with
+//                                                that number
+//   PINSYMBOL|<pin number>|<edge>|<symbol>       set an IEEE symbol of every pin with that
+//                                                number; edge inside, inside_edge,
+//                                                outside_edge or outside
+// By default, visible symbol parameters without x|y go below the body's
+// bottom-left corner, 100 mil apart, in record order. Problems (e.g. no pin with that
+// number) are added to Problems as JSON strings. Returns the records applied.
+function ApplySymbolEdits(Lib: ISch_Lib; Comp: ISch_Component; Edits: TStringList; Problems: TStringList): Integer;
+var
+    i, Placed : Integer;
+    Line      : String;
+    Kind      : String;
+    Name      : String;
+    Value     : String;
+    PinNum    : String;
+    Visible   : Boolean;
+    Matched   : Boolean;
+    Param     : ISch_Parameter;
+    Iter      : ISch_Iterator;
+    Pin       : ISch_Pin;
+    Corner    : String;
+    X, Y      : Integer;
+    Just      : Integer;
+    Sym       : Integer;
+    Edge      : String;
+    FontID    : Integer;
+    FontSpec  : String;
+begin
+    Result := 0;
+    if (Edits.Count = 0) then Exit;
+    Corner := SymbolBodyCorner(Comp);
+    Placed := 0;
+
+    SchServer.ProcessControl.PreProcess(Lib, '');
+    for i := 0 to Edits.Count - 1 do
+    begin
+        Line := Edits[i];
+        Kind := UpperCase(Trim(GetFieldFromPipeString(Line, 0)));
+        if (Kind = 'COMMENT') then
+        begin
+            // Hidden unless the optional visible field is 1
+            SetSymbolComment(Lib, Comp, GetFieldFromPipeString(Line, 1),
+                             Trim(GetFieldFromPipeString(Line, 2)) = '1');
+            Result := Result + 1;
+        end
+        else if (Kind = 'DESCRIPTION') then
+        begin
+            SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+            Comp.ComponentDescription := GetFieldFromPipeString(Line, 1);
+            SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+            Result := Result + 1;
+        end
+        else if (Kind = 'SYMPARAM') then
+        begin
+            Name := Trim(GetFieldFromPipeString(Line, 1));
+            Value := GetFieldFromPipeString(Line, 2);
+            Visible := (Trim(GetFieldFromPipeString(Line, 3)) = '1');
+            // Optional justification; omitted keeps the parameter's own
+            Just := -1;
+            if (Trim(GetFieldFromPipeString(Line, 6)) <> '') then
+            begin
+                Just := JustificationValue(GetFieldFromPipeString(Line, 6));
+                if (Just < 0) then
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': unknown justification ' +
+                        Trim(GetFieldFromPipeString(Line, 6)) + ' for SYMPARAM ' + Name) + '"');
+            end;
+            // Optional font as <name>:<size>; omitted keeps the parameter's own
+            FontID := -1;
+            FontSpec := Trim(GetFieldFromPipeString(Line, 7));
+            if (FontSpec <> '') then
+            begin
+                FontID := FontIDFromSpec(FontSpec);
+                if (FontID < 0) then
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': font ' + FontSpec +
+                        ' for SYMPARAM ' + Name + ' is not <font name>:<size>') + '"');
+            end;
+            if (Trim(GetFieldFromPipeString(Line, 4)) <> '') then
+            begin
+                X := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 4))));
+                Y := MilsToCoord(SafeStrToFloat(Trim(GetFieldFromPipeString(Line, 5))));
+            end
+            else
+            begin
+                if Visible then
+                    Placed := Placed + 1;
+                X := StrToInt(GetFieldFromPipeString(Corner, 0));
+                Y := StrToInt(GetFieldFromPipeString(Corner, 1)) - MilsToCoord(100) * Placed;
+            end;
+            Param := FindChildParameter(Comp, Name);
+            if (Param = nil) then
+            begin
+                Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                Param.Name := Name;
+                Param.Text := Value;
+                Param.IsHidden := not Visible;
+                Param.ShowName := False;
+                // Autoposition would let Altium re-stack the parameter away
+                // from the location given here
+                Param.Autoposition := False;
+                Param.Location := Point(X, Y);
+                if (Just >= 0) then
+                    Param.Justification := Just;
+                if (FontID >= 0) then
+                    Param.FontID := FontID;
+                Comp.AddSchObject(Param);
+                SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+            end
+            else
+            begin
+                SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                Param.Text := Value;
+                Param.IsHidden := not Visible;
+                if Visible or (Trim(GetFieldFromPipeString(Line, 4)) <> '') then
+                begin
+                    Param.Autoposition := False;
+                    Param.Location := Point(X, Y);
+                end;
+                if (Just >= 0) then
+                    Param.Justification := Just;
+                if (FontID >= 0) then
+                    Param.FontID := FontID;
+                SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+            end;
+            Result := Result + 1;
+        end
+        else if (Kind = 'PINPARAM') or (Kind = 'PINDESC') or (Kind = 'PINSYMBOL') then
+        begin
+            PinNum := Trim(GetFieldFromPipeString(Line, 1));
+            Name := Trim(GetFieldFromPipeString(Line, 2));
+            Value := GetFieldFromPipeString(Line, 3);
+            Matched := False;
+            Sym := 0;
+            Edge := LowerCase(Name);
+            if (Kind = 'PINSYMBOL') then
+            begin
+                Sym := IeeeSymbolValue(Value);
+                if (Edge <> 'inside') and (Edge <> 'inside_edge') and (Edge <> 'outside_edge') and (Edge <> 'outside') then
+                begin
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': unknown pin edge ' + Name +
+                        ' for PINSYMBOL (inside, inside_edge, outside_edge or outside)') + '"');
+                    Sym := -1;
+                end
+                else if (Sym < 0) then
+                    Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': unknown IEEE symbol ' + Trim(Value) +
+                        ' for PINSYMBOL') + '"');
+            end;
+            Iter := Comp.SchIterator_Create;
+            Iter.AddFilter_ObjectSet(MkSet(ePin));
+            Pin := Iter.FirstSchObject;
+            while (Pin <> nil) and (Sym >= 0) do
+            begin
+                if (Pin.Designator = PinNum) and (Kind <> 'PINPARAM') then
+                begin
+                    Matched := True;
+                    SchServer.RobotManager.SendMessage(Pin.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                    if (Kind = 'PINDESC') then
+                        Pin.Description := GetFieldFromPipeString(Line, 2)
+                    else if (Edge = 'inside') then
+                        Pin.Symbol_Inner := Sym
+                    else if (Edge = 'inside_edge') then
+                        Pin.Symbol_InnerEdge := Sym
+                    else if (Edge = 'outside_edge') then
+                        Pin.Symbol_OuterEdge := Sym
+                    else
+                        Pin.Symbol_Outer := Sym;
+                    SchServer.RobotManager.SendMessage(Pin.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                end
+                else if (Pin.Designator = PinNum) then
+                begin
+                    Matched := True;
+                    Param := FindChildParameter(Pin, Name);
+                    if (Param = nil) then
+                    begin
+                        Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+                        Param.Name := Name;
+                        Param.Text := Value;
+                        Param.IsHidden := True;
+                        Param.Location := Pin.Location;
+                        Pin.AddSchObject(Param);
+                        SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+                    end
+                    else
+                    begin
+                        SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+                        Param.Text := Value;
+                        Param.IsHidden := True;
+                        SchServer.RobotManager.SendMessage(Param.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+                    end;
+                end;
+                Pin := Iter.NextSchObject;
+            end;
+            Comp.SchIterator_Destroy(Iter);
+            if Matched then
+                Result := Result + 1
+            else if (Kind = 'PINPARAM') then
+                Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': no pin ' + PinNum + ' for PINPARAM ' + Name) + '"')
+            else if (Sym >= 0) then
+                Problems.Add('"' + JSONEscapeString(Comp.LibReference + ': no pin ' + PinNum + ' for ' + Kind) + '"');
+        end;
+    end;
+    SchServer.ProcessControl.PostProcess(Lib, '');
+    Lib.GraphicallyInvalidate;
+end;
+
+// Add a pin's parameters (name, value) to its JSON properties, when it has any
+procedure AddPinParametersJSON(Props: TStringList; Pin: ISch_Pin);
+var
+    Iter   : ISch_Iterator;
+    Param  : ISch_Parameter;
+    Items  : TStringList;
+    PProps : TStringList;
+begin
+    Items := TStringList.Create;
+    try
+        Iter := Pin.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eParameter));
+        Param := Iter.FirstSchObject;
+        while (Param <> nil) do
+        begin
+            if IsOwnParameter(Param, Pin) then
+            begin
+                PProps := TStringList.Create;
+                try
+                    AddJSONProperty(PProps, 'name', Param.Name);
+                    AddJSONProperty(PProps, 'value', Param.Text);
+                    Items.Add(BuildJSONObject(PProps, 3));
+                finally
+                    PProps.Free;
+                end;
+            end;
+            Param := Iter.NextSchObject;
+        end;
+        Pin.SchIterator_Destroy(Iter);
+        if (Items.Count > 0) then
+            Props.Add(BuildJSONArray(Items, 'parameters', 2));
+    finally
+        Items.Free;
+    end;
+end;
+
+// Add a symbol's Comment (text, visible) and its parameters (name, value,
+// visible, location in mils) to its JSON properties
+procedure AddSymbolPropertiesJSON(Props: TStringList; Comp: ISch_Component);
+var
+    Iter   : ISch_Iterator;
+    Param  : ISch_Parameter;
+    Items  : TStringList;
+    PProps : TStringList;
+begin
+    PProps := TStringList.Create;
+    try
+        AddJSONProperty(PProps, 'text', Comp.Comment.Text);
+        AddJSONBoolean(PProps, 'visible', not Comp.Comment.IsHidden);
+        Props.Add('"comment": ' + BuildJSONObject(PProps, 2));
+    finally
+        PProps.Free;
+    end;
+
+    Items := TStringList.Create;
+    try
+        Iter := Comp.SchIterator_Create;
+        Iter.AddFilter_ObjectSet(MkSet(eParameter));
+        Param := Iter.FirstSchObject;
+        while (Param <> nil) do
+        begin
+            // The Comment is reported above; pin parameters are reported
+            // with their pins
+            if (UpperCase(Param.Name) <> 'COMMENT') and IsOwnParameter(Param, Comp) then
+            begin
+                PProps := TStringList.Create;
+                try
+                    AddJSONProperty(PProps, 'name', Param.Name);
+                    AddJSONProperty(PProps, 'value', Param.Text);
+                    AddJSONBoolean(PProps, 'visible', not Param.IsHidden);
+                    AddJSONNumber(PProps, 'x', CoordToMils(Param.Location.X));
+                    AddJSONNumber(PProps, 'y', CoordToMils(Param.Location.Y));
+                    AddJSONProperty(PProps, 'justification', JustificationName(Param.Justification));
+                    AddJSONBoolean(PProps, 'autoposition', Param.Autoposition);
+                    PProps.Add('"font": ' + FontJSON(Param.FontID));
+                    Items.Add(BuildJSONObject(PProps, 2));
+                finally
+                    PProps.Free;
+                end;
+            end;
+            Param := Iter.NextSchObject;
+        end;
+        Comp.SchIterator_Destroy(Iter);
+        Props.Add(BuildJSONArray(Items, 'parameters', 1));
+    finally
+        Items.Free;
+    end;
+end;
+
+// True when the focused document is the schematic library at Path (compared
+// with NormalizedPath, so spelling differences do not matter)
+function SchLibIsFocused(Path: String): Boolean;
+var
+    Lib : ISch_Lib;
+begin
+    Result := False;
+    Lib := SchServer.GetCurrentSchDocument;
+    if (Lib <> nil) then
+        if (Lib.ObjectID = eSchLib) then
+            Result := (NormalizedPath(Lib.DocumentName) = NormalizedPath(Path));
+end;
+
+// The file path of the focused schematic library, or ''
+function LibPathOfFocusedSchLib(Dummy: Integer): String;
+var
+    Lib : ISch_Lib;
+begin
+    Result := '';
+    Lib := SchServer.GetCurrentSchDocument;
+    if (Lib <> nil) then
+        if (Lib.ObjectID = eSchLib) then
+            Result := Lib.DocumentName;
+end;
+
+// TIeeeSymbol names without the leading 'e', in enum order: a name's
+// position is its value (eNoSymbol = 0 ... eBidirectionalSignalFlow = 34)
+function IeeeSymbolNames(Dummy: Integer): String;
+begin
+    Result := 'NOSYMBOL|DOT|RIGHTLEFTSIGNALFLOW|CLOCK|ACTIVELOWINPUT|ANALOGSIGNALIN|' +
+              'NOTLOGICCONNECTION|SHIFTRIGHT|POSTPONEDOUTPUT|OPENCOLLECTOR|HIZ|HIGHCURRENT|' +
+              'PULSE|SCHMITT|DELAY|GROUPLINE|GROUPBIN|ACTIVELOWOUTPUT|PISYMBOL|GREATEREQUAL|' +
+              'LESSEQUAL|SIGMA|OPENCOLLECTORPULLUP|OPENEMITTER|OPENEMITTERPULLUP|' +
+              'DIGITALSIGNALIN|AND|INVERTOR|OR|XOR|SHIFTLEFT|INPUTOUTPUT|OPENCIRCUITOUTPUT|' +
+              'LEFTRIGHTSIGNALFLOW|BIDIRECTIONALSIGNALFLOW';
+end;
+
+// The TIeeeSymbol value of a name (case-insensitive, no leading 'e'; 'none'
+// is eNoSymbol), or -1 for an unknown name
+function IeeeSymbolValue(Name: String): Integer;
+var
+    i   : Integer;
+    Key : String;
+begin
+    Result := -1;
+    Key := UpperCase(Trim(Name));
+    if (Key = 'NONE') then
+        Key := 'NOSYMBOL';
+    if (Key = '') then Exit;
+    for i := 0 to 34 do
+        if (GetFieldFromPipeString(IeeeSymbolNames(0), i) = Key) then
+        begin
+            Result := i;
+            Exit;
+        end;
+end;
+
+// The lower-case name of a TIeeeSymbol value; 'none' for eNoSymbol
+function IeeeSymbolName(Value: Integer): String;
+begin
+    if (Value = 0) then
+        Result := 'none'
+    else
+        Result := LowerCase(GetFieldFromPipeString(IeeeSymbolNames(0), Value));
+end;
+
+// Text justification names in TTextJustification order: a name's position
+// is its value (eJustify_BottomLeft = 0 ... eJustify_TopRight = 8)
+function JustificationNames(Dummy: Integer): String;
+begin
+    Result := 'bottom_left|bottom_center|bottom_right|center_left|center|' +
+              'center_right|top_left|top_center|top_right';
+end;
+
+// The TTextJustification value of a name (case-insensitive), or -1
+function JustificationValue(Name: String): Integer;
+var
+    i : Integer;
+begin
+    Result := -1;
+    for i := 0 to 8 do
+        if (GetFieldFromPipeString(JustificationNames(0), i) = LowerCase(Trim(Name))) then
+        begin
+            Result := i;
+            Exit;
+        end;
+end;
+
+// The name of a TTextJustification value
+function JustificationName(Value: Integer): String;
+begin
+    Result := GetFieldFromPipeString(JustificationNames(0), Value);
+end;
+
+// The font ID for '<font name>:<size>' (e.g. 'Times New Roman:9'), adding
+// the font to the font table when it is missing; -1 when the text is not of
+// that form. Fonts are always given by name and size: font IDs differ
+// between documents.
+function FontIDFromSpec(Spec: String): Integer;
+var
+    i, Cut   : Integer;
+    FontName : String;
+    SizeText : String;
+begin
+    Result := -1;
+    Cut := 0;
+    for i := 1 to Length(Spec) do
+        if (Copy(Spec, i, 1) = ':') then
+            Cut := i;
+    if (Cut < 2) then Exit;
+    FontName := Trim(Copy(Spec, 1, Cut - 1));
+    SizeText := Trim(Copy(Spec, Cut + 1, Length(Spec)));
+    if (FontName = '') or (SizeText = '') or (Length(SizeText) > 3) then Exit;
+    for i := 1 to Length(SizeText) do
+        if (Pos(Copy(SizeText, i, 1), '0123456789') = 0) then Exit;
+    if (StrToInt(SizeText) < 1) then Exit;
+    Result := SchServer.FontManager.GetFontID(StrToInt(SizeText), 0, False, False, False, False, FontName);
+end;
+
+// A font as JSON: {"name": ..., "size": ...}
+function FontJSON(FontID: Integer): String;
+var
+    Props : TStringList;
+begin
+    Props := TStringList.Create;
+    try
+        AddJSONProperty(Props, 'name', SchServer.FontManager.FontName[FontID]);
+        AddJSONInteger(Props, 'size', SchServer.FontManager.Size[FontID]);
+        Result := BuildJSONObject(Props, 3);
+    finally
+        Props.Free;
+    end;
+end;
+
+
+// ---------------------------------------------------------------------------
+// edit_schematic: change an existing sheet. Every edit is reported to
+// Altium's undo system - one PreProcess/PostProcess around the whole edit,
+// SCHM_BeginModify/EndModify around each change to an existing object,
+// SCHM_PrimitiveRegistration for each object added or removed - so a single
+// Undo in Altium takes the whole edit back and the user's own edits stay
+// undoable.
+
+// The component with this designator (and part, when Part > 0); nil when
+// there is none. Ambiguous is set when several parts share the designator
+// and no part was given.
+function FindSchComponent(Doc: ISch_Document; Designator: String; Part: Integer; var Ambiguous: Boolean): ISch_Component;
+var
+    Iterator : ISch_Iterator;
+    Comp     : ISch_Component;
+begin
+    Result := nil;
+    Ambiguous := False;
+    Iterator := Doc.SchIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eSchComponent));
+    Comp := Iterator.FirstSchObject;
+    while Comp <> nil do
+    begin
+        if (UpperCase(Comp.Designator.Text) = UpperCase(Designator)) and
+           ((Part <= 0) or (Comp.CurrentPartID = Part)) then
+        begin
+            if Result <> nil then Ambiguous := True;
+            Result := Comp;
+        end;
+        Comp := Iterator.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iterator);
+end;
+
+// The designator, comment or named parameter of Comp; nil when absent
+function FindSchText(Comp: ISch_Component; Name: String): ISch_GraphicalObject;
+var
+    Iterator : ISch_Iterator;
+    Param    : ISch_Parameter;
+begin
+    Result := nil;
+    if UpperCase(Name) = 'DESIGNATOR' then
+    begin
+        Result := Comp.Designator;
+        Exit;
+    end;
+    if UpperCase(Name) = 'COMMENT' then
+    begin
+        Result := Comp.Comment;
+        Exit;
+    end;
+    Iterator := Comp.SchIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eParameter));
+    Param := Iterator.FirstSchObject;
+    while (Param <> nil) and (Result = nil) do
+    begin
+        if UpperCase(Param.Name) = UpperCase(Name) then Result := Param;
+        Param := Iterator.NextSchObject;
+    end;
+    Comp.SchIterator_Destroy(Iterator);
+end;
+
+procedure SchBeginModify(Obj: ISch_GraphicalObject);
+begin
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+end;
+
+procedure SchEndModify(Obj: ISch_GraphicalObject);
+begin
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+end;
+
+procedure SchRegister(Doc: ISch_Document; Obj: ISch_GraphicalObject);
+begin
+    Doc.RegisterSchObjectInContainer(Obj);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+end;
+
+procedure SchRemove(Doc: ISch_Document; Obj: ISch_GraphicalObject);
+begin
+    Doc.RemoveSchObject(Obj);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+end;
+
+// Does the wire pass through or end at (X, Y), within Tol (internal units)?
+function WireTouches(Wire: ISch_Wire; X: Integer; Y: Integer; Tol: Integer): Boolean;
+var
+    k, X1, Y1, X2, Y2 : Integer;
+begin
+    Result := False;
+    for k := 1 to Wire.VerticesCount - 1 do
+    begin
+        X1 := Wire.Vertex[k].X; Y1 := Wire.Vertex[k].Y;
+        X2 := Wire.Vertex[k + 1].X; Y2 := Wire.Vertex[k + 1].Y;
+        if (X >= Min(X1, X2) - Tol) and (X <= Max(X1, X2) + Tol) and
+           (Y >= Min(Y1, Y2) - Tol) and (Y <= Max(Y1, Y2) + Tol) then
+            // axis-aligned and diagonal segments alike: distance to the line
+            if Abs((X - X1) * (Y2 - Y1) - (Y - Y1) * (X2 - X1)) <=
+               Tol * Sqrt(Sqr(X2 - X1) + Sqr(Y2 - Y1)) + Tol then
+                Result := True;
+    end;
+end;
+
+// Remove the objects of Kind at (X, Y): a wire passing through the point,
+// or a label, port, junction or no-ERC whose location is the point. Text,
+// when given, must match too. Returns how many were removed.
+function DeleteSchObjectsAt(Doc: ISch_Document; Kind: String; X: Integer; Y: Integer; Text: String): Integer;
+var
+    Iterator : ISch_Iterator;
+    Obj      : ISch_GraphicalObject;
+    Hits     : TList;
+    i, Tol   : Integer;
+    Match    : Boolean;
+begin
+    Result := 0;
+    Tol := MilsToCoord(1);
+    Hits := TList.Create;
+    try
+        Iterator := Doc.SchIterator_Create;
+        if Kind = 'wire' then Iterator.AddFilter_ObjectSet(MkSet(eWire))
+        else if Kind = 'net_label' then Iterator.AddFilter_ObjectSet(MkSet(eNetLabel))
+        else if Kind = 'power_port' then Iterator.AddFilter_ObjectSet(MkSet(ePowerObject))
+        else if Kind = 'junction' then Iterator.AddFilter_ObjectSet(MkSet(eJunction))
+        else if Kind = 'no_erc' then Iterator.AddFilter_ObjectSet(MkSet(eNoERC))
+        else if Kind = 'port' then Iterator.AddFilter_ObjectSet(MkSet(ePort))
+        else Iterator.AddFilter_ObjectSet(MkSet(eLabel));
+        Obj := Iterator.FirstSchObject;
+        while Obj <> nil do
+        begin
+            if Kind = 'wire' then
+                Match := WireTouches(Obj, X, Y, Tol)
+            else
+                Match := (Abs(Obj.Location.X - X) <= Tol) and (Abs(Obj.Location.Y - Y) <= Tol);
+            if Match and (Text <> '') then
+            begin
+                if Kind = 'port' then Match := UpperCase(Obj.Name) = UpperCase(Text)
+                else if Kind <> 'wire' then Match := UpperCase(Obj.Text) = UpperCase(Text);
+            end;
+            if Match then Hits.Add(Obj);
+            Obj := Iterator.NextSchObject;
+        end;
+        Doc.SchIterator_Destroy(Iterator);
+        // Removed after the walk, not during it
+        for i := 0 to Hits.Count - 1 do
+        begin
+            SchRemove(Doc, Hits[i]);
+            Result := Result + 1;
+        end;
+    finally
+        Hits.Free;
+    end;
+end;
+
+// Place a symbol from a .SchLib on Doc. Opening the library makes it the
+// current document, so Doc is held by reference throughout.
+function PlaceSchComponent(Doc: ISch_Document; Rec: String; var Msg: String): Boolean;
+var
+    LibDoc   : ISch_Document;
+    Iterator : ISch_Iterator;
+    Prim     : ISch_GraphicalObject;
+    Found, Replica : ISch_Component;
+    LibPath  : String;
+begin
+    Result := False;
+    LibPath := GetFieldFromPipeString(Rec, 2);
+    if not FileExists(LibPath) then
+    begin
+        Msg := 'library not found: ' + LibPath;
+        Exit;
+    end;
+    OpenLibraryDocument('SchLib', LibPath);
+    LibDoc := SchServer.GetSchDocumentByPath(LibPath);
+    if (LibDoc = nil) or (LibDoc.ObjectID <> eSchLib) then
+    begin
+        Msg := 'could not open the symbol library ' + LibPath;
+        Exit;
+    end;
+    Found := nil;
+    Iterator := LibDoc.SchLibIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eSchComponent));
+    Prim := Iterator.FirstSchObject;
+    while Prim <> nil do
+    begin
+        if Prim.LibReference = GetFieldFromPipeString(Rec, 3) then Found := Prim;
+        Prim := Iterator.NextSchObject;
+    end;
+    LibDoc.SchIterator_Destroy(Iterator);
+    if Found = nil then
+    begin
+        Msg := GetFieldFromPipeString(Rec, 3) + ' not found in ' + LibPath;
+        Exit;
+    end;
+    Replica := ReplicateLibSymbol(Found);
+    Replica.Designator.Text := GetFieldFromPipeString(Rec, 1);
+    Replica.LibraryPath := LibPath;
+    Replica.SourceLibraryName := ExtractFileName(LibPath);
+    Replica.Orientation := StrToInt(GetFieldFromPipeString(Rec, 6));
+    SchRegister(Doc, Replica);
+    if GetFieldFromPipeString(Rec, 7) = '1' then
+        Replica.Mirror(Replica.Location);
+    Replica.MoveByXY(StrToInt(GetFieldFromPipeString(Rec, 4)) - Replica.Location.X,
+                     StrToInt(GetFieldFromPipeString(Rec, 5)) - Replica.Location.Y);
+    if GetFieldFromPipeString(Rec, 8) <> '' then Replica.Comment.Text := GetFieldFromPipeString(Rec, 8);
+    Result := True;
+end;
+
+// One edit record; Msg says why it failed
+function ApplySchEdit(Doc: ISch_Document; Rec: String; var Msg: String): Boolean;
+var
+    Kind, Name : String;
+    Comp       : ISch_Component;
+    Obj        : ISch_GraphicalObject;
+    Param      : ISch_Parameter;
+    Ambiguous  : Boolean;
+    fld, vtx, n, Want : Integer;
+begin
+    Result := False;
+    Msg := '';
+    Kind := GetFieldFromPipeString(Rec, 0);
+
+    if (Kind = 'MOVE') or (Kind = 'DELETE') or (Kind = 'PARAM') or (Kind = 'TEXT') then
+    begin
+        // MOVE|des|part|x|y|rot|mirror  DELETE|des|part  PARAM|des|part|name|value|visible
+        // TEXT|des|part|name|x|y|justification|orientation|visible   (-1: keep)
+        Comp := FindSchComponent(Doc, GetFieldFromPipeString(Rec, 1),
+                                 StrToInt(GetFieldFromPipeString(Rec, 2)), Ambiguous);
+        if Comp = nil then
+        begin
+            Msg := 'no component ' + GetFieldFromPipeString(Rec, 1) + ' on the sheet';
+            Exit;
+        end;
+        if Ambiguous then
+        begin
+            Msg := GetFieldFromPipeString(Rec, 1) + ' has several parts on the sheet; give "part"';
+            Exit;
+        end;
+    end;
+
+    if Kind = 'MOVE' then
+    begin
+        SchBeginModify(Comp);
+        Want := StrToInt(GetFieldFromPipeString(Rec, 5));
+        if Want >= 0 then Comp.Orientation := Want;
+        Want := StrToInt(GetFieldFromPipeString(Rec, 6));
+        // Mirror is the editor's X key; IsMirrored alone only changes the flag
+        if (Want >= 0) and ((Want = 1) <> Comp.IsMirrored) then Comp.Mirror(Comp.Location);
+        // MoveByXY, not Location, so the part's text travels with it
+        if GetFieldFromPipeString(Rec, 3) <> '' then
+            Comp.MoveByXY(StrToInt(GetFieldFromPipeString(Rec, 3)) - Comp.Location.X,
+                          StrToInt(GetFieldFromPipeString(Rec, 4)) - Comp.Location.Y);
+        SchEndModify(Comp);
+        Result := True;
+    end
+    else if Kind = 'DELETE' then
+    begin
+        SchRemove(Doc, Comp);
+        Result := True;
+    end
+    else if Kind = 'PARAM' then
+    begin
+        Name := GetFieldFromPipeString(Rec, 3);
+        Obj := FindSchText(Comp, Name);
+        if Obj = nil then
+        begin
+            Param := SchServer.SchObjectFactory(eParameter, eCreate_Default);
+            Param.Name := Name;
+            Param.Text := GetFieldFromPipeString(Rec, 4);
+            Param.IsHidden := GetFieldFromPipeString(Rec, 5) <> '1';
+            Param.Location := Comp.Location;
+            Comp.AddSchObject(Param);
+            SchServer.RobotManager.SendMessage(Comp.I_ObjectAddress, c_BroadCast, SCHM_PrimitiveRegistration, Param.I_ObjectAddress);
+        end
+        else
+        begin
+            SchBeginModify(Obj);
+            Obj.Text := GetFieldFromPipeString(Rec, 4);
+            Want := StrToInt(GetFieldFromPipeString(Rec, 5));
+            if Want >= 0 then Obj.IsHidden := Want = 0;
+            SchEndModify(Obj);
+        end;
+        Result := True;
+    end
+    else if Kind = 'TEXT' then
+    begin
+        Obj := FindSchText(Comp, GetFieldFromPipeString(Rec, 3));
+        if Obj = nil then
+        begin
+            Msg := GetFieldFromPipeString(Rec, 1) + ' has no ' + GetFieldFromPipeString(Rec, 3);
+            Exit;
+        end;
+        SchBeginModify(Obj);
+        Obj.Autoposition := False;
+        if GetFieldFromPipeString(Rec, 4) <> '' then
+            Obj.MoveToXY(StrToInt(GetFieldFromPipeString(Rec, 4)), StrToInt(GetFieldFromPipeString(Rec, 5)));
+        Want := StrToInt(GetFieldFromPipeString(Rec, 6));
+        if Want >= 0 then Obj.Justification := Want;
+        Want := StrToInt(GetFieldFromPipeString(Rec, 7));
+        if Want >= 0 then Obj.Orientation := Want;
+        Want := StrToInt(GetFieldFromPipeString(Rec, 8));
+        if Want >= 0 then Obj.IsHidden := Want = 0;
+        SchEndModify(Obj);
+        Result := True;
+    end
+    else if Kind = 'WIRE' then
+    begin
+        // WIRE|x1|y1|x2|y2|...
+        Obj := SchServer.SchObjectFactory(eWire, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        fld := 1;
+        vtx := 0;
+        while GetFieldFromPipeString(Rec, fld) <> '' do
+        begin
+            vtx := vtx + 1;
+            Obj.InsertVertex := vtx;
+            Obj.SetState_Vertex(vtx, Point(StrToInt(GetFieldFromPipeString(Rec, fld)),
+                                           StrToInt(GetFieldFromPipeString(Rec, fld + 1))));
+            fld := fld + 2;
+        end;
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if Kind = 'LABEL' then
+    begin
+        // LABEL|x|y|orientation|justification|text
+        Obj := SchServer.SchObjectFactory(eNetLabel, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
+        Obj.Justification := StrToInt(GetFieldFromPipeString(Rec, 4));
+        Obj.Text := GetFieldFromPipeString(Rec, 5);
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if Kind = 'POWER' then
+    begin
+        // POWER|x|y|orientation|style|show name|text
+        Obj := SchServer.SchObjectFactory(ePowerObject, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        Obj.Orientation := StrToInt(GetFieldFromPipeString(Rec, 3));
+        Obj.Style := StrToInt(GetFieldFromPipeString(Rec, 4));
+        Obj.ShowNetName := GetFieldFromPipeString(Rec, 5) = '1';
+        Obj.Text := GetFieldFromPipeString(Rec, 6);
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if (Kind = 'JUNCTION') or (Kind = 'NOERC') then
+    begin
+        if Kind = 'JUNCTION' then
+            Obj := SchServer.SchObjectFactory(eJunction, eCreate_GlobalCopy)
+        else
+            Obj := SchServer.SchObjectFactory(eNoERC, eCreate_GlobalCopy);
+        Obj.Location := Point(StrToInt(GetFieldFromPipeString(Rec, 1)), StrToInt(GetFieldFromPipeString(Rec, 2)));
+        SchRegister(Doc, Obj);
+        Result := True;
+    end
+    else if Kind = 'DELETE_AT' then
+    begin
+        // DELETE_AT|kind|x|y|text
+        n := DeleteSchObjectsAt(Doc, GetFieldFromPipeString(Rec, 1), StrToInt(GetFieldFromPipeString(Rec, 2)),
+                                StrToInt(GetFieldFromPipeString(Rec, 3)), GetFieldFromPipeString(Rec, 4));
+        if n = 0 then
+            Msg := 'nothing of kind ' + GetFieldFromPipeString(Rec, 1) + ' at that point'
+        else
+            Result := True;
+    end
+    else if Kind = 'PLACE' then
+        Result := PlaceSchComponent(Doc, Rec, Msg)
+    else
+        Msg := 'unknown edit ' + Kind;
+end;
+
+function EditSchematic(SheetPath: String; SpecPath: String; Save: Boolean): String;
+var
+    Doc       : ISch_Document;
+    ServerDoc : IServerDocument;
+    Spec, Errors, Props : TStringList;
+    i, Applied : Integer;
+    Msg       : String;
+    Ok        : Boolean;
+begin
+    if not FileExists(SpecPath) then
+    begin
+        Result := 'ERROR: edit spec not found';
+        Exit;
+    end;
+    Doc := SchServer.GetSchDocumentByPath(SheetPath);
+    if Doc = nil then
+    begin
+        if not FileExists(SheetPath) then
+        begin
+            Result := 'ERROR: Sheet not found: ' + SheetPath;
+            Exit;
+        end;
+        ServerDoc := Client.OpenDocument('SCH', SheetPath);
+        if ServerDoc <> nil then Client.ShowDocument(ServerDoc);
+        Doc := SchServer.GetSchDocumentByPath(SheetPath);
+    end;
+    if (Doc = nil) or (Doc.ObjectID <> eSheet) then
+    begin
+        Result := 'ERROR: ' + SheetPath + ' is not a schematic sheet that could be opened';
+        Exit;
+    end;
+
+    Spec := TStringList.Create;
+    Errors := TStringList.Create;
+    Props := TStringList.Create;
+    try
+        Spec.LoadFromFile(SpecPath);
+        Applied := 0;
+        // PostProcess must run whatever happens, or Altium's undo stays broken
+        SchServer.ProcessControl.PreProcess(Doc, '');
+        try
+            for i := 0 to Spec.Count - 1 do
+            begin
+                if Trim(Spec[i]) = '' then Continue;
+                Ok := False;
+                Msg := '';
+                try
+                    Ok := ApplySchEdit(Doc, Spec[i], Msg);
+                except
+                    Msg := 'failed: ' + ExceptionMessage;
+                end;
+                if Ok then
+                    Applied := Applied + 1
+                else
+                    Errors.Add('"' + JSONEscapeString('operation ' + IntToStr(i + 1) + ': ' + Msg) + '"');
+            end;
+        finally
+            SchServer.ProcessControl.PostProcess(Doc, '');
+        end;
+        Doc.GraphicallyInvalidate;
+        if Save then
+        begin
+            ServerDoc := Client.GetDocumentByPath(SheetPath);
+            if ServerDoc <> nil then
+            begin
+                ServerDoc.SetModified(True);
+                ServerDoc.DoFileSave('');
+            end;
+        end
+        else
+            MarkDocumentModified(SheetPath);
+
+        // The run itself succeeded; the server marks the result failed when
+        // an operation did, keeping these details
+        AddJSONBoolean(Props, 'success', True);
+        AddJSONProperty(Props, 'sheet', Doc.DocumentName);
+        AddJSONInteger(Props, 'applied', Applied);
+        AddJSONBoolean(Props, 'saved', Save);
+        Props.Add(BuildJSONArray(Errors, 'errors'));
+        Result := BuildJSONObject(Props);
+    finally
+        Spec.Free;
+        Errors.Free;
+        Props.Free;
+    end;
+end;

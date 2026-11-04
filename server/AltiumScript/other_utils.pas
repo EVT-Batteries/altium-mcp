@@ -1,10 +1,64 @@
 const
     DEFAULT = 'Blank';
     SCRIPT_ERROR_LOG = 'C:\Users\Public\altium_mcp\script_errors.log';
+    PROGRESS_FILE = 'C:\Users\Public\altium_mcp\progress.txt';
+    // The board the PCB tools last ran on, see FocusBoardForCommand
+    LAST_BOARD_FILE = 'C:\Users\Public\altium_mcp\last_board.txt';
+    PROGRESS_FILE = 'C:\Users\Public\altium_mcp\progress.txt';
+    // The board the PCB tools last ran on, see FocusBoardForCommand
+    LAST_BOARD_FILE = 'C:\Users\Public\altium_mcp\last_board.txt';
 
 var
     // Why the last EnsureDocumentFocused call failed; reported to the server.
     FocusFailure : String;
+    // When ReportProgress last wrote PROGRESS_FILE
+    LastProgress : Double;
+    // The last message passed to LogScriptError during this run. A command
+    // that gives up with an empty result has logged why; Run replies with it.
+    LastScriptError : String;
+
+// Tell the server a long command is still working. The server waits as long
+// as this file keeps changing, instead of stopping the command after a fixed
+// time. Writes at most once a second, so it is cheap to call on every item
+// of a batch.
+procedure ReportProgress;
+var
+    L : TStringList;
+begin
+    if Now - LastProgress < 1 / 86400 then Exit;
+    LastProgress := Now;
+    L := TStringList.Create;
+    try
+        L.Text := FormatDateTime('yyyy-mm-dd hh:nn:ss', Now);
+        L.SaveToFile(PROGRESS_FILE);
+    except
+    end;
+    L.Free;
+end;
+    // When ReportProgress last wrote PROGRESS_FILE
+    LastProgress : Double;
+    // The last message passed to LogScriptError during this run. A command
+    // that gives up with an empty result has logged why; Run replies with it.
+    LastScriptError : String;
+
+// Tell the server a long command is still working. The server waits as long
+// as this file keeps changing, instead of stopping the command after a fixed
+// time. Writes at most once a second, so it is cheap to call on every item
+// of a batch.
+procedure ReportProgress;
+var
+    L : TStringList;
+begin
+    if Now - LastProgress < 1 / 86400 then Exit;
+    LastProgress := Now;
+    L := TStringList.Create;
+    try
+        L.Text := FormatDateTime('yyyy-mm-dd hh:nn:ss', Now);
+        L.SaveToFile(PROGRESS_FILE);
+    except
+    end;
+    L.Free;
+end;
 
 // Errors must never be modal. The server is driven by an agent with no hands:
 // a ShowMessage box blocks this script before it writes its response, every
@@ -14,6 +68,8 @@ procedure LogScriptError(Msg: String);
 var
     L : TStringList;
 begin
+    LastScriptError := Msg;
+    LastScriptError := Msg;
     L := TStringList.Create;
     try
         if FileExists(SCRIPT_ERROR_LOG) then L.LoadFromFile(SCRIPT_ERROR_LOG);
@@ -183,6 +239,7 @@ begin
         Result := Copy(S, FieldStart, Length(S) - FieldStart + 1);
 end;
 
+<<<<<<< HEAD
 // A file path in one canonical spelling for comparisons: lower case,
 // backslashes, and doubled separators collapsed (a leading \\ of a UNC path
 // is kept)
@@ -305,6 +362,219 @@ begin
     end;
 end;
 
+// The focused PCB document when it is a board. A focused PCB library also
+// has a board, which the PCB server reports as current; it does not count.
+function FocusedBoard(Dummy: Integer): IPCB_Board;
+var
+    Board : IPCB_Board;
+begin
+    Result := nil;
+    Board := GetBoardSafe(0);
+    if (Board <> nil) and (UpperCase(ExtractFileExt(Board.FileName)) = '.PCBDOC') then
+        Result := Board;
+end;
+
+procedure RememberBoard(Path: String);
+var
+    Store : TStringList;
+begin
+    Store := TStringList.Create;
+    try
+        Store.Text := Path;
+        try
+            Store.SaveToFile(LAST_BOARD_FILE);
+        except
+        end;
+    finally
+        Store.Free;
+    end;
+end;
+
+function RememberedBoard(Dummy: Integer): String;
+var
+    Store : TStringList;
+begin
+    Result := '';
+    if not FileExists(LAST_BOARD_FILE) then Exit;
+    Store := TStringList.Create;
+    try
+        try
+            Store.LoadFromFile(LAST_BOARD_FILE);
+            if Store.Count > 0 then Result := Trim(Store[0]);
+        except
+        end;
+    finally
+        Store.Free;
+    end;
+end;
+
+// The net named Name on Board (not case-sensitive), or nil
+function FindBoardNet(Board: IPCB_Board; Name: String): IPCB_Net;
+var
+    Iterator : IPCB_BoardIterator;
+    Net      : IPCB_Net;
+begin
+    Result := nil;
+    Iterator := Board.BoardIterator_Create;
+    Iterator.AddFilter_ObjectSet(MkSet(eNetObject));
+    Iterator.AddFilter_LayerSet(AllLayers);
+    Iterator.AddFilter_Method(eProcessAll);
+    Net := Iterator.FirstPCBObject;
+    while (Net <> nil) and (Result = nil) do
+    begin
+        if UpperCase(Net.Name) = UpperCase(Name) then Result := Net;
+        Net := Iterator.NextPCBObject;
+    end;
+    Board.BoardIterator_Destroy(Iterator);
+end;
+
+// The copper layer of Board called Name: its name in the layer stack
+// ("Inner 1") or Altium's layer name ("Mid Layer 1"), not case-sensitive.
+// eNoLayer when the board has no such copper layer. Not String2Layer alone:
+// it accepts layers the board does not have ("Mid Layer 30" on a four-layer
+// board) and does not know names given in the stack.
+function ResolveBoardLayer(Board: IPCB_Board; Name: String): Integer;
+var
+    Iterator : IPCB_LayerObjectIterator;
+    Layer    : IPCB_LayerObject;
+begin
+    Result := eNoLayer;
+    Name := UpperCase(Trim(Name));
+    Iterator := Board.ElectricalLayerIterator;
+    while (Result = eNoLayer) and Iterator.Next do
+    begin
+        Layer := Iterator.LayerObject;
+        if (UpperCase(Layer.Name) = Name) or (UpperCase(Layer2String(Layer.LayerID)) = Name) then
+            Result := Layer.LayerID;
+    end;
+end;
+
+// Bring a board to the front for a PCB command when none is focused: the
+// board the PCB tools last ran on while it is still open, else the only
+// board in the focused project (or, when that has none, in all open
+// projects). With several to choose from it does not guess: a project often
+// holds a panel or assembly drawing besides the board, and a command run on
+// the wrong one returns empty or wrong data (#33).
+function FocusBoardForCommand(CommandName: String): Boolean;
+var
+    P, I    : Integer;
+    Project : IProject;
+    Doc     : IDocument;
+    Only    : IDocument;
+    Last    : String;
+    Names   : String;
+    Count   : Integer;
+    Shown   : IServerDocument;
+begin
+    Result := False;
+    Last := RememberedBoard(0);
+    if Last <> '' then
+    begin
+        // The path as Altium reported it, so an exact lookup finds it. Not
+        // FindOpenDocument: it is defined further down this unit, and a
+        // routine can only call those defined above it.
+        Shown := Client.GetDocumentByPath(Last);
+        if Shown <> nil then
+        begin
+            Client.ShowDocument(Shown);
+            if FocusedBoard(0) <> nil then
+            begin
+                Result := True;
+                Exit;
+            end;
+        end;
+    end;
+
+    Count := 0;
+    Names := '';
+    Only := nil;
+    for P := -1 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        if P < 0 then
+            Project := GetWorkspace.DM_FocusedProject
+        else
+        begin
+            // The focused project's boards come first; only without any
+            // are the other open projects searched
+            if Count > 0 then Break;
+            Project := GetWorkspace.DM_Projects(P);
+            if Project = GetWorkspace.DM_FocusedProject then Continue;
+        end;
+        if Project = nil then Continue;
+        for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+        begin
+            Doc := Project.DM_LogicalDocuments(I);
+            if Doc.DM_DocumentKind = 'PCB' then
+            begin
+                Count := Count + 1;
+                Only := Doc;
+                if Count <= 6 then
+                    Names := Names + ', ' + ExtractFileName(Doc.DM_FullPath);
+            end;
+        end;
+    end;
+
+    if Count = 1 then
+    begin
+        Only.DM_OpenAndFocusDocument;
+        Sleep(500);
+        if FocusedBoard(0) <> nil then
+        begin
+            RememberBoard(FocusedBoard(0).FileName);
+            Result := True;
+            Exit;
+        end;
+        FocusFailure := 'Found a PCB document but could not focus it';
+    end
+    else if Count = 0 then
+        FocusFailure := 'No PCB document found in any open project'
+    else
+    begin
+        if Count > 6 then Names := Names + ', ...';
+        FocusFailure := 'The focused document is not a PCB, and ' + IntToStr(Count) +
+            ' PCB documents could be meant (' + Copy(Names, 3, Length(Names)) + '). ' +
+            'Not guessing: click the board''s tab in Altium (or ask the user to), then retry; ' +
+            'the PCB tools then keep using that board.';
+    end;
+    LogScriptError('EnsureDocumentFocused(' + CommandName + '): ' + FocusFailure);
+end;
+
+// Bring the board at Path to the front, opening it when it is not open, for a
+// command whose request names its board (board_path) instead of acting on
+// whichever board has focus. That is what keeps an edit meant for one board,
+// say a copy being tested, off another. '' when it worked, else why not.
+function FocusBoardByPath(Path: String): String;
+var
+    Doc   : IServerDocument;
+    Board : IPCB_Board;
+begin
+    Result := '';
+    Doc := Client.GetDocumentByPath(Path);
+    if Doc = nil then
+    begin
+        if not FileExists(Path) then
+        begin
+            Result := 'Board not found: ' + Path;
+            Exit;
+        end;
+        Doc := Client.OpenDocument('PCB', Path);
+    end;
+    if Doc = nil then
+    begin
+        Result := 'Could not open the board ' + Path;
+        Exit;
+    end;
+    Client.ShowDocument(Doc);
+    Board := FocusedBoard(0);
+    // Remembered like a board focused any other way, so a later command
+    // that names no board uses this one
+    if (Board = nil) or
+       (UpperCase(ExpandFileName(Board.FileName)) <> UpperCase(ExpandFileName(Path))) then
+        Result := 'Could not bring the board ' + Path + ' to the front'
+    else
+        RememberBoard(Board.FileName);
+end;
+
 // Modify the EnsureDocumentFocused function to handle all document types
 // and return more detailed information.
 // ViewTypeHint is only consulted by commands that can target more than one
@@ -330,6 +600,7 @@ begin
     // Commands that handle their own document management - skip focusing
     if (CommandName = 'search_library_symbol') or
        (CommandName = 'build_circuit') or
+<<<<<<< HEAD
        (CommandName = 'add_harness_wiring') or
        (CommandName = 'edit_harness_layout') or
        (CommandName = 'get_active_document') or
@@ -337,7 +608,7 @@ begin
        (CommandName = 'get_sheet_style') or
        (CommandName = 'multiboard_document') or
        (CommandName = 'import_harness_changes') or
-       (CommandName = 'take_view_screenshot') or
+       (CommandName = 'edit_schematic') or
        (CommandName = 'get_symbol_primitives') or
        (CommandName = 'create_symbols_batch') or
        (CommandName = 'get_footprint_primitives') or
@@ -359,6 +630,8 @@ begin
        (CommandName = 'get_component_pins')                  or
        (CommandName = 'get_pcb_layers')                      or
        (CommandName = 'get_pcb_rules')                       or
+       (CommandName = 'run_drc')                             or
+       (CommandName = 'run_drc')                             or
        (CommandName = 'get_selected_components_coordinates') or
        (CommandName = 'layout_duplicator')                   or
        (CommandName = 'layout_duplicator_apply')             or
@@ -366,10 +639,28 @@ begin
        (CommandName = 'place_components')                    or
        (CommandName = 'check_placement')                     or
        (CommandName = 'get_net_connections')                 or
+       (CommandName = 'export_silkscreen_data')              or
+       (CommandName = 'place_designators')                   or
+       (CommandName = 'edit_silk_graphics')                  or
+       (CommandName = 'check_silkscreen')                    or
+       (CommandName = 'auto_place_silkscreen')               or
+       (CommandName = 'export_silkscreen_data')              or
+       (CommandName = 'place_designators')                   or
+       (CommandName = 'edit_silk_graphics')                  or
+       (CommandName = 'check_silkscreen')                    or
+       (CommandName = 'auto_place_silkscreen')               or
        (CommandName = 'set_component_position')              or
+       (CommandName = 'create_vias')                         or
+       (CommandName = 'create_vias')                         or
        (CommandName = 'set_pcb_layer_visibility')            or
        (CommandName = 'get_pcb_layer_stackup')               or
+       (CommandName = 'create_pcb_rule')                     or
+       (CommandName = 'create_pcb_rule')                     or
        (CommandName = 'get_board_summary')                   or
+       (CommandName = 'create_polygon_pour')                 or
+       (CommandName = 'create_cutout')                       or
+       (CommandName = 'create_polygon_pour')                 or
+       (CommandName = 'create_cutout')                       or
        (CommandName = 'get_component_primitives')            then
     begin
         DocumentKind := 'PCB';
@@ -432,11 +723,20 @@ begin
     // Check if the correct document type is already focused first
     if (DocumentKind = 'PCB') and (PCBServer <> Nil) then
     begin
-        if GetBoardSafe(0) <> Nil then
+        if FocusedBoard(0) <> Nil then
+        if FocusedBoard(0) <> Nil then
         begin
+            RememberBoard(FocusedBoard(0).FileName);
+            RememberBoard(FocusedBoard(0).FileName);
             Result := True;
-            Exit;
-        end;
+        end
+        else
+            Result := FocusBoardForCommand(CommandName);
+        Exit;
+        end
+        else
+            Result := FocusBoardForCommand(CommandName);
+        Exit;
     end
     else if (DocumentKind = 'SCH') then
     begin

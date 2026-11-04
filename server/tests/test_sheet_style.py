@@ -62,8 +62,11 @@ class TestGetSheetStyle(unittest.IsolatedAsyncioTestCase):
         res = json.loads(
             await main.get_sheet_style(None, document_path=str(self.wirdoc))
         )
-        self.mock_bridge.assert_awaited_once_with(
-            "get_sheet_style", {"document_path": str(self.wirdoc.resolve())}
+        self.mock_bridge.assert_awaited_once()
+        # (command, params[, timeout]): the bridge passes its response timeout
+        self.assertEqual(
+            self.mock_bridge.await_args.args[:2],
+            ("get_sheet_style", {"document_path": str(self.wirdoc.resolve())}),
         )
         self.assertTrue(res["success"])
         self.assertEqual(res["sheet_style"], "D")

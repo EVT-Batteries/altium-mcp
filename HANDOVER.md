@@ -1,7 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-10-30 (session 16: `import_harness_changes`; session 15: Draftsman harness
-drawings, `.HarDwf`) for a fresh agent session.
+Updated 2026-11-03 (session 17: upstream v0.6.1 merged; session 16: `import_harness_changes`;
+session 15: Draftsman harness drawings, `.HarDwf`) for a fresh agent session.
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything. The harness projects the tools were
 developed and tested on (P42C-1 workspace) have their own handover: `../HANDOVER.md` in the
@@ -32,7 +32,7 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `1a93e86` (sessions 10-16 committed) | 2026-10-30 doc pass: README tool list, `references/wirdoc-format.md`, this file |
+| `altium-mcp/` | `feature/harness-support` | `3e7e2c7` (sessions 10-16 committed) | session 17: merge of `origin/main` (upstream v0.6.1) in progress, all conflicts resolved and staged, not committed (the user commits) |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
@@ -44,6 +44,79 @@ The user commits themselves. **Do not commit or push unless asked.** Test on ren
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 17 (2026-11-03): upstream v0.6.1 merged (uncommitted merge)
+Asked: merge upstream release v0.6.1 (synced to `origin/main`, 119 commits since our 0.5.1
+merge base `9ad05d3`) into `feature/harness-support`, keep every harness / multi-board
+feature working, regression-test all our tools.
+- **What upstream brought**: the bridge runs the units merged into ONE script file
+  (`script_bundle.py`, `RunScriptFile`; running the script project leaked ~100 window
+  handles per call), a cross-server exchange lock (`exchange_lock.py`), progress-aware
+  timeouts and `MUTATING_COMMANDS`, `_lift_failed_result` (a command's own
+  `success: false` becomes the failure), `ensure_paths` (no file dialog before the client's
+  initialize), `sandbox.altium_hung` / `ALTIUM_HUNG_ERROR`, sandbox lint (refuses known
+  crash calls, e.g. freeing `List1`), Altium resource guard (`altium_limit_problem`),
+  rotating log, `_tool(read_only=...)` decorator (tool annotations, `structured_output=False`),
+  screenshots that bring Altium to the front for ~1 s and hand the foreground back, PCB
+  tools (`run_drc`, `create_pcb_rule`, `place_vias`, `place_polygon_pour`, `place_cutout`,
+  `check_routing`, `route_track`, silkscreen and label-block tools), `edit_schematic`,
+  `check_schematic`, `get_project_components` filters / pages, `get_outjob_settings` sections.
+- **Resolution decisions**:
+  - mcp stays on **2.x** (`MCPServer`; upstream pins 1.30, `<2`): `pyproject`, lock and
+    `requirements.txt` are ours (unchanged, so the server venv key is unchanged); upstream's
+    `_tool()` works on mcp 2.2 (`annotations`, `structured_output`, `instructions` exist).
+    Every tool is registered with `_tool()`; our read-only ones (`get_harness_data`,
+    `check_harness_wiring`, `get_multiboard_data`, `get_harness_drawing_data`,
+    `get_sheet_style`) with `read_only=True`.
+  - `AltiumBridge.exclusive()` (our multi-run hold used by `add_harness_wiring`,
+    `edit_harness_layout`) is rebuilt on upstream's pieces: asyncio lock, `ensure_paths`,
+    `ExchangeLock(BRIDGE_LOCK_FILE)` (path re-read at each hold, tests patch it) with
+    `LOCK_TIMEOUT`, `altium_hung`. It raises `BridgeUnavailable` (a `TimeoutError`, so the
+    old callers' `except TimeoutError` still report it); `execute_command` = exclusive +
+    `_execute_command_locked(..., timeout)` + `_lift_failed_result`.
+  - `get_screenshot`: upstream's function plus our `document_path`, `mbs` / `dwf` kinds
+    and harness kinds (`sch` accepts wiring diagrams and layout drawings, `pcb` a PcbLib),
+    `.PrjHar` / `.PrjMbd` window titles; upstream's strict focus check kept (our 2026-10-16
+    "capture whatever is focused" fallback dropped); PrintWindow dropped for upstream's
+    bring-to-front + BitBlt. Pascal: `take_view_screenshot` left the focus skip-list;
+    `ExecuteCommand` skips `EnsureDocumentFocused` only when the request names a
+    `document_path` or the view is `mbs` / `dwf` (`OwnFocus`), so a plain PCB screenshot
+    focuses the board again.
+  - `get_project_components`: upstream's filters / paging, plus our harness fallback (its
+    `parameters` are a dict: names filtered before `project_components.select`).
+  - Bundle compatibility: our `schematic_utils.pas` redeclared `const REPLACEALL` (also in
+    `Altium_API.pas`); harmless across project units, a redeclaration in one file: removed.
+    Routine names are unique across units and the call graph has no cycle (the bundler
+    checks both); every unit is still CRLF.
+  - `tkinter` import guarded (upstream imports it at module top; the uv 3.10 test Python
+    has no Tk): without Tk, `verify_paths` reports instead of asking.
+  - `MUTATING_COMMANDS` += `add_harness_wiring`, `edit_harness_layout`,
+    `convert_netlabels_to_text`. Manifest: was stale (listed the removed
+    `reroute_harness_wiring`, lacked 7 of our tools); now equal to the registered tools.
+- **Unit tests**: 369 passed, 7 skipped, 13 failed = exactly the 13 pre-existing failures
+  (compared test by test with a worktree of the pre-merge HEAD placed beside `altium-mcp/`,
+  where the sample paths resolve). Two tests updated for upstream behaviour
+  (`get_project_components` pages at ~60 kB: walk `next_offset`; the bridge passes a timeout
+  argument). New `tests/test_bridge_exclusive.py` (6): lock held by another server, hung
+  Altium, missing Altium, failure inside a result, `add_harness_wiring` on a busy bridge.
+- **Live regression** (renamed scratch copies of `HVIL_Harness_HVSL1200` as
+  `MCP_Test_Reg` / `MCP_Test_Reg2` and of `P42C-1_System.MbsDoc` as `MCP_Test_Mbs`, merged
+  code called directly with the server venv; scratchpad of session
+  `321510b5-e4a4-4867-bb9b-baa57eb1c7bc`): the merged 746 kB bundle compiles and runs;
+  `get_server_status`, `get_project_info`, `run_altium_script` (incl. lint refusal and
+  clean recovery from a script error), `get_screenshot` (`sch` WirDoc / LdrDoc, `dwf`,
+  `mbs`; reported kinds right), `add_harness_wiring` (copy, wires, no-connects, text,
+  twist + relink, wire_updates; then reroute, splice, wire break, designator_updates by
+  UniqueID, label_updates, component_updates, associated_parts), `sync_harness_library`,
+  `sync_harness_wires`, `get_sheet_style`, `convert_netlabels_to_text`,
+  `import_harness_changes` (layout + drawing), `edit_harness_layout` (connector move, CPs
+  holding no-connects, bundles with lengths, covering, label, fixed wire length, text,
+  physical view with project reload + render + pin repair), `edit_harness_drawing` (closed
+  and open document), `edit_multiboard_schematic` (closed and open), all readers, every
+  harness fallback of the generic tools and the PCB-only error explanation. Each write
+  checked on disk (`wirdoc_diff.py`, parsers): UniqueIDs kept, no duplicate parameters.
+  Real documents untouched (mtimes). Findings that are NOT from the merge (each reproduced
+  with the pre-merge code): §8 item 8.
 
 ### Session 16 (2026-10-29/30): `import_harness_changes` (`1a93e86`)
 Asked: run Altium's "Import Changes From ..." for layout and Draftsman drawings (the three HVIL
@@ -514,6 +587,18 @@ lengths":
 ### General
 - **One Altium operation at a time.** Recovery is automatic; if a result still says
   `executor_wedged: true`, stop and ask the user.
+- **The bridge runs one merged script file** (since session 17, upstream's
+  `script_bundle.py`; `C:\Users\Public\altium_mcp\bridge\Altium_API_<hash>.pas`): global
+  `var` / `const` names and routine names must be unique across ALL units, routines start
+  at column 0 and end at a column-0 `end;`, no code outside routines / var / const blocks,
+  and no two routines may call each other (cycle). Check a Pascal change with
+  `script_bundle.bundle_text(script_bundle.project_units('server/AltiumScript/Altium_API.PrjScr'))`
+  before running it. The bundler orders routines callees-first, so "define a function above
+  its caller" only matters for the project fallback (used when the bundle cannot be built).
+- **Register new tools with `_tool()`** (`_tool(read_only=True)` for readers), never bare
+  `mcp.tool()`: it sets `structured_output=False` (otherwise mcp sends each result twice).
+- Upstream's sandbox lint refuses e.g. `List1 := TStringList.Create` / `List1.Free` (the
+  sandbox owns `List1..List3`: use `.Clear`).
 - **DelphiScript: define a function above its first caller in the same unit** (calling one defined
   further down pauses at runtime). Units in `Altium_API.PrjScr` order: ... `other_utils.pas` (Doc3),
   `schematic_utils.pas` (Doc4), `Altium_API.pas` (Doc5); later units may call earlier ones.
@@ -677,7 +762,9 @@ Decompiled with ILSpy (`ilspycmd` 9.0 NuGet package run with the installed .NET 
   part object with visible pins, cavity / associated parts, wires, twists, shields, cables, wire
   breaks), `extract_ole_records`.
 - `multiboard.py` / `multiboard_edit.py` - `.MbsDoc` review (`review_multiboard`) and edits.
-- `sandbox.py` - upstream sandbox runner and script recovery.
+- `sandbox.py` - upstream sandbox runner, lint and script recovery; `script_bundle.py`
+  (bridge units -> one script file), `exchange_lock.py` (cross-server lock under
+  `AltiumBridge.exclusive`), `win_processes.py`, `altium_install.py` - upstream (0.6.x).
 - `harness_layout.py` - `.LdrDoc` reader `parse_ldrdoc`, spec builder `build_layout_spec`, check
   `check_layout`, helpers `_follow_end`, `_wire_length`, `_shortest_route`.
 - `harness_check.py` - `check_harness_wiring` and `label_positions`.
@@ -778,17 +865,46 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    job today (build123d session); a helper that takes footprint + side and returns the lines
    would save steps. Cavity numbers on face views would need Text items (no op yet); page
    navigation / zoom to a view for screenshots (only `ViewFit`, all sheets).
-7. `import_harness_changes` (session 16): find why a save from a bridge run drops the import
+7. `import_harness_changes` (session 16; since session 17 bridge runs are a script FILE like
+   the sandbox's, not the script project, which may be what made the difference: retest a
+   bridge-run open / import / save): find why a save from a bridge run drops the import
    (probe the harness model's active project, `HarnessChangesWatcher.ActiveProjectFilePath`,
    in a bridge run vs a sandbox run); if fixed, the open / import / save could move into the
    bridge. The pin repair also runs when a connector's unassigned pins carry no wire (Main J3 /
    J4 pins 3-6: one extra save cycle, 0 pins synced): repair only for pins with wires. Not
    tried yet: a layout whose import adds or removes connectors / wires (expect new
-   connectors placed by Altium at its default spot).
+   connectors placed by Altium at its default spot). Tried in session 17: new connectors
+   arrive with their own CP at Altium's default spot, new wires to free ends are unrouted
+   (`success: false` with `newly_unrouted_wires`) until CPs hold their no-connects.
+8. **Pre-existing bugs found by the session 17 regression** (each reproduced with the
+   pre-merge code on a second scratch project, so not from the merge):
+   - `add_harness_wiring(copy_objects=...)` from the **same** sheet moves the source
+     connector's cavity parts and associated parts to the copy (`J1` lost its crimps and
+     wedgelock, `J2` got them; RECORD 106 count +1 only). A copy from another sheet is fine,
+     also after the source is saved. Probably `Replicate` shares the cavity / associated
+     part objects; fix in `CopyHarnessObjects` (replicate them per connector) or refuse a
+     same-sheet copy of connectors with cavity parts. Workaround: `sync_harness_library`
+     with a `cavity_map` + `associated_parts` on the source connector.
+   - `edit_harness_layout` coverings: `start_offset_mm` / `end_offset_mm` never reach the
+     saved file (only `Length` / `PhysicalLength` = covered length; read back 0 / 0).
+   - Layout routing: after an import that added `J2` and CPs that the tool made to hold the
+     new wires' no-connects, the parser (and the tool's `unrouted_wires`) report W3 / W4
+     routed through B4 / B5, but Altium's `GetBundleContent` gives 0 sub-lines for B4 / B5
+     and its compiler reports "Orphaned Wire ... not routed via any bundle". The CP stream
+     entries look like those of the GUI-made CPs that do route. Find what differs (wire
+     data end links after the import?) and make the parser agree with Altium.
+   - `check_harness_wiring` reports a wire ending on a no-connect (pigtail free end, e.g.
+     HVSL1200 TERM1 / TERM2) as `dangling_end` (error).
+   - `get_screenshot`: while this session ran (late evening, Windows probably idle/locked)
+     the canvas came back stale (another document's picture) with both the old PrintWindow
+     and upstream's BitBlt capture, though the document metadata was right. Re-check
+     visually when the desktop is in use.
+   - `get_harness_data` reports sheet texts (RECORD 4) under `net_labels` /
+     `net_label_count` and `get_all_nets` lists them as nets (naming only).
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 158 passed, 7 skipped, 13 pre-existing failures (§3)
+# unit tests (altium-mcp root) - 375 passed, 7 skipped, 13 pre-existing failures (§3, session 17)
 cd C:\evt_gits\electrical-p42c-1\altium-mcp
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py

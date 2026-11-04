@@ -409,8 +409,22 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         data = json.loads(raw)
         self.assertIn("components", data)
         self.assertGreaterEqual(data.get("component_count", 0), 9)
+        self.assertEqual(data.get("source"), "harness_file")
+        # A reply holds about 60,000 characters: walk the pages
         des_list = [c["designator"] for c in data["components"]]
+        while data.get("next_offset") is not None:
+            data = json.loads(await main.get_project_components(
+                None, include_parameters=True, offset=data["next_offset"]))
+            des_list += [c["designator"] for c in data["components"]]
+        self.assertEqual(len(des_list), data["matched"])
         self.assertIn("P1", des_list)
+        # Filters and named parameters work on harness parts too
+        only = json.loads(await main.get_project_components(
+            None, designators=["P1"], parameter_names=["PartNumber"]))
+        self.assertTrue(only["components"])
+        self.assertTrue(all(c["designator"] == "P1" for c in only["components"]))
+        self.assertTrue(all(set(c.get("parameters", {})) <= {"PartNumber"}
+                            for c in only["components"]))
 
     async def test_fallback_get_harness_data(self):
         import main

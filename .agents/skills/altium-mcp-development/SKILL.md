@@ -24,14 +24,25 @@ real document.
 ## 1. How a tool call flows
 
 ```
-MCP tool (server/main.py)
-  -> AltiumBridge.exclusive()        asyncio lock + OS lock on C:\Users\Public\altium_mcp\bridge.lock
+MCP tool (server/main.py, registered with _tool() / _tool(read_only=True))
+  -> AltiumBridge.exclusive()        asyncio lock, ensure_paths, ExchangeLock on
+                                     C:\Users\Public\altium_mcp\bridge.lock (shared by every
+                                     server process), hung-Altium check; raises
+                                     BridgeUnavailable (a TimeoutError) before anything is sent
   -> request.json (+ spec files)     in C:\Users\Public\altium_mcp\
-  -> X2.EXE -RScriptingSystem:RunScript(Altium_API.PrjScr | Altium_API>Run)
-  -> Altium_API.pas ExecuteCommand   EnsureDocumentFocused (skip-list!) then `case CommandName of`
-  -> response.json                   polled by Python (120 s timeout)
+  -> X2.EXE -RScriptingSystem:RunScriptFile(bridge\Altium_API_<hash>.pas | Run)
+                                     every unit of Altium_API.PrjScr merged into one file by
+                                     script_bundle.py (the project itself is only the fallback)
+  -> ExecuteCommand (Altium_API.pas) EnsureDocumentFocused (skip-list!) then `case CommandName of`
+  -> response.json                   polled by Python (120 s without progress, up to 30 min
+                                     while the script reports progress); a command's own
+                                     "success": false becomes the failure (_lift_failed_result)
 ```
 
+- The single-file bundle needs unique routine and global `var` / `const` names across all
+  units and no routines that call each other in a cycle. After a Pascal change, build it once:
+  `script_bundle.bundle_text(script_bundle.project_units('server/AltiumScript/Altium_API.PrjScr'))`
+  (from `server/`); it raises on each of those problems.
 - Pure-Python tools (`get_harness_data`, parser, router, `dblib.py`) read **saved files** with
   olefile and never touch Altium; unsaved Altium edits are invisible to them.
 - `add_harness_wiring` writes `harness_wiring_spec.txt`: one record per line, `|`-separated,
@@ -148,7 +159,10 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   `run_altium_script` description (`S1..S9`, `I1..I9`, `B1..B3`, `F1..F4`, `Obj1..Obj9`,
   `List1..List3`).
 - Within one `.pas` unit, define a function above its first caller; calling one defined further
-  down pauses the script at runtime.
+  down pauses the script at runtime. (The bridge bundle reorders routines callees-first, but
+  keep the order: the script-project fallback and sandbox scripts do not.)
+- The sandbox owns `List1..List3`: `.Clear` them, never `TStringList.Create` / `.Free` them
+  (the pre-run lint refuses that, and other calls known to crash Altium).
 - Prototype unknown API calls with the `run_altium_script` sandbox first. Log a step before each
   risky statement (`SandboxLog('...')`); the last logged step tells you what died. Create your own
   `TStringList` objects rather than relying on provided ones. No inline variable declarations.
@@ -232,7 +246,11 @@ Tests must never reach the live bridge. Follow the existing fixtures in
 `server/tests/test_harness_parser.py`:
 
 - mock `main.altium_bridge._execute_command_locked` (what both `execute_command` and
-  `add_harness_wiring` call), not `execute_command`;
+  `add_harness_wiring` call), not `execute_command`; it is awaited as
+  `(command, params, timeout)` from `execute_command`, so compare `await_args.args[:2]`.
+  `exclusive()` also calls `ensure_paths` and `sandbox.altium_hung` (real checks of the
+  machine): patch them, as `tests/test_bridge_exclusive.py` does, when a test must not
+  depend on an installed or running Altium;
 - patch `main.HARNESS_SPEC_FILE` (layout tool: `main.HARNESS_LAYOUT_SPEC_FILE`) and
   `main.BRIDGE_LOCK_FILE` into a temp folder; for the layout tool also patch
   `main.parse_ldrdoc` with synthetic layouts (`tests/test_harness_layout.py`), and give the
