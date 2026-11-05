@@ -70,7 +70,8 @@ class TestHarnessParser(unittest.TestCase):
         self.assertEqual(res["summary"], {
             "connector_count": 2, "wire_count": 5, "splice_count": 1,
             "no_connect_count": 1, "total_pins": 8, "connected_pins": 7,
-            "net_label_count": 1, "unique_net_count": 4, "twist_count": 1,
+            "text_count": 1, "net_label_count": 0, "unique_net_count": 3,
+            "twist_count": 1,
             "shield_count": 0, "cable_count": 0, "wire_break_count": 0,
         })
         conns = {c["designator"]: c for c in res["connectors"]}
@@ -147,7 +148,29 @@ class TestHarnessParser(unittest.TestCase):
         self.assertEqual(pin["net"], "NET1")
         self.assertEqual(res["wires"][0]["points"], [120, 200, 300, 200.5])
         self.assertEqual(res["wires"][0]["design_item_id"], "WIRE-1")
-        self.assertEqual([n["text"] for n in res["net_labels"]], ["Sheet note"])
+        self.assertEqual([n["text"] for n in res["texts"]], ["Sheet note"])
+        self.assertEqual(res["net_labels"], [])
+
+    def test_sheet_text_is_no_net_but_net_label_is_reported(self):
+        from harness_parser import parse_wirdoc_records
+        recs = [
+            {"HEADER": "Protel for Windows - Harness"},
+            {"RECORD": "106", "LibReference": "CONN", "Location.X": "100", "Location.Y": "200", "UniqueID": "C1"},
+            {"RECORD": "34", "OwnerIndex": "0", "Name": "Designator", "Text": "P1"},
+            {"RECORD": "113", "OwnerIndex": "0", "Designator": "1", "Name": "SIG",
+             "Location.X": "100", "Location.Y": "200", "PinLength": "20", "UniqueID": "PIN1"},
+            {"RECORD": "4", "Text": "Just a note", "Location.X": "120", "Location.Y": "200"},
+        ]
+        res = parse_wirdoc_records(recs, "sheet.WirDoc")
+        self.assertIsNone(res["connectors"][0]["pins"][0]["net"])
+        self.assertNotIn("Just a note", res["nets"])
+        self.assertEqual(res["summary"]["text_count"], 1)
+        self.assertEqual(res["summary"]["net_label_count"], 0)
+        recs.append({"RECORD": "25", "Text": "NET_X", "Location.X": "120", "Location.Y": "200"})
+        res = parse_wirdoc_records(recs, "sheet.WirDoc")
+        self.assertEqual([n["text"] for n in res["net_labels"]], ["NET_X"])
+        self.assertEqual([n["text"] for n in res["texts"]], ["Just a note"])
+        self.assertEqual(res["summary"]["net_label_count"], 1)
 
     def test_parse_multipart_connector(self):
         """Each part of a multi-part connector is its own object with all pins;

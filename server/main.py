@@ -38,7 +38,12 @@ from altium_files import long_path, read_altium_text, write_altium_text
 from altium_install import find_altium_exe
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from exchange_lock import ExchangeLock
-from harness_layout import build_layout_spec, check_layout, parse_ldrdoc
+from harness_layout import (
+    build_layout_spec,
+    check_layout,
+    parse_ldrdoc,
+    unrouted_reasons,
+)
 from harness_parser import (
     COMPONENT_KIND_NAMES,
     get_harness_component_data,
@@ -1898,7 +1903,9 @@ async def run_altium_script(ctx: Context, script: str, timeout_seconds: int = 12
     - Helpers: MM(mm) converts millimetres to internal units;
       OpenSchDoc(path) returns the ISch_Document, opening the file if needed
       (GetSchDocumentByPath alone returns nil for a closed file, and a call on
-      nil stops the script); SaveDoc(path) marks a document modified and saves it.
+      nil stops the script; a .WirDoc / .LdrDoc opens as a harness document,
+      once its harness project is open); SaveDoc(path) marks a document
+      modified and saves it.
     - Errors inside the script (undeclared identifiers, calls on nil, bad
       conversions) are caught by the sandbox and come back as "script error"
       with Altium's message and the last step; no try/except is needed.
@@ -3426,7 +3433,9 @@ async def edit_harness_layout(
     bundle the call drew or moved with its ends and lengths, "problems" what did not connect
     or lost a connection (success is false then), "unrouted_wires" the wires with no bundle
     path between the connection points of their two ends ("newly_unrouted_wires": those
-    this call left without one).
+    this call left without one). The wires of a twist are routed together: twisted wires
+    whose routes share no bundle are all unrouted ("unrouted_reasons" says so); give them a
+    common bundle before they part.
 
     Args:
         document_path (str): Target .LdrDoc. Required.
@@ -3634,6 +3643,9 @@ async def edit_harness_layout(
             result["newly_unrouted_wires"] = sorted(
                 set(after["unrouted_wires"]) - set(layout["unrouted_wires"])
             )
+            reasons = unrouted_reasons(after)
+            if reasons:
+                result["unrouted_reasons"] = reasons
             if problems:
                 result["problems"] = problems
                 result["success"] = False
@@ -7356,10 +7368,12 @@ async def get_harness_data(
 
     Returns:
         str: JSON with file_path, summary (connector_count, total_pins,
-             connected_pins, net_label_count), connectors (designator,
+             connected_pins, text_count, net_label_count), connectors (designator,
              lib_reference, description, location, unique_id, associated_parts, pins
              with nets and cavity_parts), wires, splices, twists, shields, cables,
-             wire_breaks, no_connects, net_labels and source.
+             wire_breaks, no_connects, texts (sheet texts; never nets), net_labels
+             (net labels, invalid in a harness project; convert_netlabels_to_text
+             fixes them) and source.
     """
     try:
         p: Path | None = None
@@ -7448,6 +7462,7 @@ async def get_harness_data(
                     }
                     for w in data["wires"]
                 ]
+                data.pop("texts", None)
                 data.pop("net_labels", None)
                 data.pop("net_connections", None)
         else:
@@ -8075,6 +8090,7 @@ def _layout_import_report(
         "newly_unrouted_wires": sorted(
             set(after["unrouted_wires"]) - set(before["unrouted_wires"])
         ),
+        "unrouted_reasons": unrouted_reasons(after),
         "unassigned_pins": {
             c["designator"]: c["unassigned_pins"]
             for c in after["connectors"]
@@ -8252,13 +8268,15 @@ def _layout_sync_gaps(layout: dict[str, Any], project: Path) -> list[str]:
 HARNESS_IMPORT_WAITS = (1.0, 5.0)
 
 # Standalone scripts (run_altium_script) that open, import and save, each a run
-# of its own. Not from the bridge: a save in a bridge run wrote the layout
-# without the import Altium held in memory (2026-10-29, cause not found; the
-# bridge runs as a script project, which takes the project focus), while the
-# same save as a standalone script wrote it. Every script first focuses the
-# document as the Projects panel does - a closed one is opened through its
-# project (IDocument.DM_OpenAndFocusDocument), an open one only shown: on an
-# open document DM_OpenAndFocusDocument reloads it from disk once the run
+# of its own. Written so because a save in a bridge run wrote the layout
+# without the import Altium held in memory (2026-10-29), while the same save
+# as a standalone script wrote it. The bridge then ran as a script project;
+# since it runs a script file (upstream v0.6.1) a bridge save keeps the import
+# (verified 2026-11-04), so these steps could move into the bridge. Every
+# script first focuses the document as the Projects panel does - a closed one
+# is opened through its project (IDocument.DM_OpenAndFocusDocument), an open
+# one only shown: on an open document DM_OpenAndFocusDocument reloads it from
+# disk once the run
 # returns, discarding its unsaved changes - and checks that the document and
 # its project are focused; S2 holds the error if not.
 _FOCUS_PRELUDE = """S1 := '{path}';
@@ -8430,7 +8448,14 @@ async def _report_harness_import(
             entry["success"] = False
         return
     after = parse_ldrdoc(doc)
-    if any(c.get("unassigned_pins") for c in after["connectors"]):
+    # Repair only pins that carry a wire: an unassigned pin without one routes
+    # nothing, and the repair costs a save and reload of the drawing
+    wired = {w.get(end) for w in after["wires"] for end in ("end1", "end2")}
+    if any(
+        f"{c['designator']}.{p}" in wired
+        for c in after["connectors"]
+        for p in c.get("unassigned_pins", [])
+    ):
         repair = json.loads(await edit_harness_layout(ctx, str(doc)))
         entry["pin_repair"] = {
             k: repair.get(k)

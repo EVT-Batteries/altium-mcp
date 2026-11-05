@@ -22,8 +22,20 @@ import main
 def _layout(part="", unassigned=(), unrouted=()):
     return {
         "wires": [
-            {"designator": "W1", "part_number": part, "description": part or "*"},
-            {"designator": "W2", "part_number": "5876 BR005", "description": "Brown"},
+            {
+                "designator": "W1",
+                "part_number": part,
+                "description": part or "*",
+                "end1": "J1.1",
+                "end2": "SP1",
+            },
+            {
+                "designator": "W2",
+                "part_number": "5876 BR005",
+                "description": "Brown",
+                "end1": "J1.2",
+                "end2": "SP1",
+            },
         ],
         "connectors": [{"designator": "J1", "unassigned_pins": list(unassigned)}],
         "unrouted_wires": list(unrouted),
@@ -220,6 +232,22 @@ class TestImportHarnessChanges(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(doc["unassigned_pins"], {})
         repair.assert_awaited_once_with(None, str(self.layout.resolve()))
         self.assertNotIn("closed", doc)
+
+    async def test_unassigned_pins_without_wires_are_not_repaired(self):
+        self.mock_bridge.side_effect = [_opened()]
+        self.mock_script.side_effect = [IMPORTED, SAVED]
+        repair = AsyncMock()
+        unwired = _layout("5876 BR005", unassigned=["3", "4"])
+        with (
+            patch("main.parse_ldrdoc", side_effect=[_layout(), unwired, unwired]),
+            patch("main.edit_harness_layout", repair),
+        ):
+            data = json.loads(await main.import_harness_changes(None, str(self.layout)))
+        self.assertTrue(data["success"], data)
+        doc = data["documents"][0]
+        repair.assert_not_awaited()
+        self.assertNotIn("pin_repair", doc)
+        self.assertEqual(doc["unassigned_pins"], {"J1": ["3", "4"]})
 
     async def test_newly_unrouted_wires_fail(self):
         self.mock_bridge.side_effect = [_opened()]

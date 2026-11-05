@@ -153,7 +153,9 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     Coordinates are DXP units (1 = 10 mils), lengths are given in mils and mm.
     Wire routes are computed the way Altium assigns wires by default: the
     shortest bundle path between the connection points of the wire's two
-    ends (a wire routed differently by hand in Altium is not detected).
+    ends (a wire routed differently by hand in Altium is not detected). The
+    wires of a twist must share a bundle, or Altium routes none of them
+    (their "unrouted_reason" says so).
     """
     raw = extract_ole_records(file_path, "FileHeader")
     records = raw[1:]
@@ -425,17 +427,45 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
             graph.setdefault(b["end1_uid"], []).append((weight, b["end2_uid"], b))
             graph.setdefault(b["end2_uid"], []).append((weight, b["end1_uid"], b))
 
-    for b in bundles.values():
-        b["wires"] = []
-    unrouted = []
-    for w in wires.values():
+    routes: dict[int, list[dict[str, Any]] | None] = {}
+    for idx, w in wires.items():
         (end1, cp1), (end2, cp2) = end_of(w["end1_uid"]), end_of(w["end2_uid"])
         w["end1"], w["end2"] = end1, end2
         w["via_bundles"] = [
             (bundle_by_uid[u]["designator"] or u) if u in bundle_by_uid else u
             for u in w.pop("via_bundle_uids")
         ]
-        route = _shortest_route(graph, cp1, cp2)
+        routes[idx] = _shortest_route(graph, cp1, cp2)
+
+    # Altium routes the wires of a twist together: when their routes share no
+    # bundle (they part at the connection point they start from), it routes
+    # none of them ("Orphaned Wire ... not routed via any bundle"; verified
+    # live, 2026-11-04). Twisted wires may part after a shared bundle.
+    twist_members: dict[str, list[int]] = {}
+    for idx, w in wires.items():
+        for uid in w["twist_uids"]:
+            twist_members.setdefault(uid, []).append(idx)
+    for members in twist_members.values():
+        routed = [i for i in members if routes[i] is not None]
+        if len(routed) < 2:
+            continue
+        shared = set.intersection(*({b["unique_id"] for b in routes[i]} for i in routed))
+        if shared:
+            continue
+        names = [wires[i]["designator"] for i in routed]
+        for i in routed:
+            routes[i] = None
+            others = ", ".join(n for n in names if n != wires[i]["designator"])
+            wires[i]["unrouted_reason"] = (
+                f"twisted with {others}, but their routes share no bundle "
+                "(Altium routes the wires of a twist together)"
+            )
+
+    for b in bundles.values():
+        b["wires"] = []
+    unrouted = []
+    for idx, w in wires.items():
+        route = routes[idx]
         if route is None:
             w["route"] = None
             w["routed_length"] = None
@@ -520,6 +550,16 @@ CP_DESIGNATOR_OFFSET = (200, 400)
 # A designator further than this from its connection point (mils) was left
 # behind by an earlier move and is put back at CP_DESIGNATOR_OFFSET
 CP_DESIGNATOR_MAX_OFFSET = 1500
+
+
+def unrouted_reasons(layout: dict[str, Any]) -> dict[str, str]:
+    """Why a wire of parse_ldrdoc output is unrouted, where it is not just a
+    missing bundle path (twisted wires that share no bundle)."""
+    return {
+        w["designator"]: w["unrouted_reason"]
+        for w in layout.get("wires", [])
+        if w.get("unrouted_reason")
+    }
 
 
 def _mils(point: dict[str, float]) -> tuple[int, int]:
@@ -1122,6 +1162,8 @@ def build_layout_spec(
             expect[uid] = [bundle.get("end1_uid") or "", bundle.get("end2_uid") or ""]
 
     covering_records: list[list[Any]] = []
+    # covering (UniqueID, or designator of a new one) -> {"start"/"end": mm}
+    expect_cov_offsets: dict[str, dict[str, float]] = {}
     for item in coverings or []:
         key = item_key(item)
         if ambiguous(key):
@@ -1153,6 +1195,13 @@ def build_layout_spec(
         def offset(name: str, item: dict[str, Any] = item) -> Any:
             return "" if item.get(name) is None else mm_to_coord(float(item[name]))
 
+        offsets = {
+            side: float(item[f"{side}_offset_mm"])
+            for side in ("start", "end")
+            if item.get(f"{side}_offset_mm") is not None
+        }
+        if offsets:
+            expect_cov_offsets[key if cov is None else cov["unique_id"]] = offsets
         covering_records.append(
             [
                 "COVERING",
@@ -1266,6 +1315,7 @@ def build_layout_spec(
             "bundles": expect,
             "views": expect_views,
             "wire_lengths": expect_lengths,
+            "covering_offsets": expect_cov_offsets,
         },
     }
 
@@ -1376,6 +1426,19 @@ def check_layout(
             w["length_type"] != "mcad" or abs(w["fixed_length"]["mm"] - mm) > 0.01
         ):
             problems.append(f"wire {des}: length not set to {mm} mm")
+    coverings = {c["unique_id"]: c for c in layout.get("coverings", [])}
+    coverings.update({c["designator"]: c for c in layout.get("coverings", []) if c["designator"]})
+    for key, offsets in expect.get("covering_offsets", {}).items():
+        c = coverings.get(key)
+        if c is None:
+            problems.append(f"covering {key}: not in the saved drawing")
+            continue
+        for side, mm in offsets.items():
+            if abs(c[f"{side}_offset"]["mm"] - mm) > 0.01:
+                problems.append(
+                    f"covering {c['designator'] or key}: {side} offset is "
+                    f"{c[f'{side}_offset']['mm']} mm in the saved drawing, not {mm} mm"
+                )
     return problems, found
 
 

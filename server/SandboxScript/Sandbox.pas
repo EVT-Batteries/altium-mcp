@@ -154,12 +154,20 @@ end;
 // calling anything on nil stops the script.
 function OpenSchDoc(Path : String) : IDispatch;
 var
-    D : IDispatch;
+    D    : IDispatch;
+    Kind : String;
 begin
     Result := SchServer.GetSchDocumentByPath(Path);
     if Result = nil then
     begin
-        D := Client.OpenDocument('SCH', Path);
+        // Harness documents open as their own kind: a .WirDoc opened as 'SCH'
+        // loads as an empty plain schematic (its harness project must be open)
+        Kind := 'SCH';
+        if UpperCase(ExtractFileExt(Path)) = '.WIRDOC' then
+            Kind := 'HarnessWiringDiagram'
+        else if UpperCase(ExtractFileExt(Path)) = '.LDRDOC' then
+            Kind := 'HarnessLayoutDrawing';
+        D := Client.OpenDocument(Kind, Path);
         if D <> nil then Client.ShowDocument(D);
         Result := SchServer.GetSchDocumentByPath(Path);
     end;

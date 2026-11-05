@@ -2798,6 +2798,7 @@ end;
 // Gives Obj and every object it holds (pins, parameters, texts) fresh
 // UniqueIds. Replicate keeps the originals, so a copy would share its pins'
 // ids with the source sheet (wires and layout drawings link pins by them).
+// Cavity and associated parts are not reached: see CopyOwnedHarnessParts.
 procedure RenewUniqueIds(Obj: ISch_BasicContainer);
 var
     Queue : TList;
@@ -2825,6 +2826,83 @@ begin
         end;
     finally
         Queue.Free;
+    end;
+end;
+
+// Pins (88) of a connector, in iteration order.
+procedure ListConnectorPins(Conn: ISch_BasicContainer; Pins: TList);
+var
+    Iter : ISch_Iterator;
+    Pin  : ISch_BasicContainer;
+begin
+    Iter := Conn.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(88));
+    Pin := Iter.FirstSchObject;
+    while (Pin <> nil) do
+    begin
+        Pins.Add(Pin);
+        Pin := Iter.NextSchObject;
+    end;
+    Conn.SchIterator_Destroy(Iter);
+end;
+
+// Gives Rep, a Replicate of the connector (81) or splice (83) Src, its own
+// cavity parts (crimp, seal, plug, other, on its pins) and associated parts
+// (boot, backshell, ...). Replicate hands the copy the source's part objects
+// themselves, which then belong to the copy: a sheet holding both saves the
+// parts on the copy only, and the source loses its crimps and boots (found
+// on a copy within one sheet). Each part is replaced on Rep by a replica;
+// SetItem / SetAssociatedPart give it a fresh UniqueId. Returns False when
+// the pins of Src and Rep do not pair up (nothing changed on the pins then).
+function CopyOwnedHarnessParts(Src, Rep: ISch_BasicContainer): Boolean;
+var
+    SrcPins, RepPins : TList;
+    SrcPin, RepPin   : ISch_BasicContainer;
+    Part, NewPart    : ISch_BasicContainer;
+    i, t, k          : Integer;
+begin
+    Result := True;
+    for k := 0 to Rep.GetAssociatedPartsCount - 1 do
+    begin
+        Part := Src.GetAssociatedPart(k);
+        if (Part <> nil) then
+        begin
+            NewPart := Part.Replicate;
+            RenewUniqueIds(NewPart);
+            Rep.SetAssociatedPart(k, NewPart);
+        end;
+    end;
+    if (Rep.ObjectId <> 81) then Exit;
+
+    SrcPins := TList.Create;
+    RepPins := TList.Create;
+    try
+        ListConnectorPins(Src, SrcPins);
+        ListConnectorPins(Rep, RepPins);
+        if (SrcPins.Count <> RepPins.Count) then
+        begin
+            Result := False;
+            Exit;
+        end;
+        for i := 0 to RepPins.Count - 1 do
+        begin
+            SrcPin := SrcPins[i];
+            RepPin := RepPins[i];
+            for t := 0 to 3 do
+                for k := 0 to RepPin.GetCount(t) - 1 do
+                begin
+                    Part := SrcPin.GetItem(t, k);
+                    if (Part <> nil) then
+                    begin
+                        NewPart := Part.Replicate;
+                        RenewUniqueIds(NewPart);
+                        RepPin.SetItem(t, k, NewPart);
+                    end;
+                end;
+        end;
+    finally
+        SrcPins.Free;
+        RepPins.Free;
     end;
 end;
 
@@ -2897,6 +2975,9 @@ begin
                 Misses.Add('copy:' + Obj.UniqueId)
             else
             begin
+                if (Rep.ObjectId = 81) or (Rep.ObjectId = 83) then
+                    if not CopyOwnedHarnessParts(Obj, Rep) then
+                        Misses.Add('copy_parts:' + Obj.UniqueId);
                 RenewUniqueIds(Rep);
                 Rep.MoveByXY(MilsToCoord(DX), MilsToCoord(DY));
                 if (Rep.ObjectId = 81) or (Rep.ObjectId = 82) or (Rep.ObjectId = 83) then
@@ -5008,6 +5089,14 @@ begin
                         SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
                             SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
                     end;
+                    // A new covering (or new items) has length 0 until an
+                    // EndUpdate computes it, and that first EndUpdate resets
+                    // the start / end offsets: let it run before setting them
+                    if IsNew or (SpecField(Rec, 8) <> '') then
+                    begin
+                        Obj.BeginUpdate;
+                        Obj.EndUpdate;
+                    end;
                     Obj.BeginUpdate;
                     if (SpecField(Rec, 6) <> '') then
                         Obj.SetState_PhysicalStartPointDistance(StrToInt(SpecField(Rec, 6)));
@@ -5300,9 +5389,9 @@ end;
 // Refused while a document of the project has unsaved changes, so only the
 // import is saved. The server opens, imports and saves afterwards as
 // standalone scripts (sandbox) that focus the document through its project,
-// not from this script project: a save here wrote the layout without the
-// import Altium held in memory, while the same save as a standalone script
-// wrote it (2026-10-29).
+// written so when the bridge ran as a script project, whose save wrote the
+// layout without the import Altium held in memory (2026-10-29). Since the
+// bridge runs a script file, its save keeps the import (2026-11-04).
 function ExecuteImportHarnessChanges(DocPath: String): String;
 var
     PrjPath   : String;

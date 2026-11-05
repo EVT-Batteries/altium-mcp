@@ -34,7 +34,7 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `767380c` (upstream v0.6.1 merge, committed with conflict markers) | session 18: the resolved files restored from the stash of session 17's resolution, fixture-based tests, project-agnostic pass (not committed; the user commits) |
+| `altium-mcp/` | `feature/harness-support` | `64a409c` (sessions 17-18: v0.6.1 merge, fixture tests, project-agnostic pass) | session 19: fixes of the six regression bugs (§8 item 8), not committed; the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
@@ -46,6 +46,18 @@ The user commits themselves. **Do not commit or push unless asked.** Test on ren
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 19 (2026-11-04): the six bugs of the session 17 regression
+All six of §8 item 8 fixed (details there), each reproduced and verified live on scratch
+projects, unit tests 392 -> 399 passed: same-sheet `copy_objects` (cavity / associated parts
+replicated per copy), covering offsets on new coverings, twisted-wire routing in the layout
+parser, `import_harness_changes` (bridge save verified; pin repair only for wired pins),
+no-connect wire ends in `check_harness_wiring`, sheet texts under `texts`. Also: the sandbox
+helper `OpenSchDoc` opens a `.WirDoc` / `.LdrDoc` as a harness document (as `SCH` it loaded
+an empty plain schematic). The Rt_Schematic interfaces were listed by .NET reflection on
+`Altium.Edp.Interfaces.dll` (`[Reflection.Assembly]::LoadFrom` with an `AssemblyResolve`
+handler to the System folder), no decompiler needed: `ISch_HarnessCavityPartsOwner` has
+`GetItem` / `GetFirst` / `SetItem`, `ISch_HarnessAssociatedPartsOwner` `GetAssociatedPart`.
 
 ### Session 17 (2026-11-03): upstream v0.6.1 merged (uncommitted merge)
 Asked: merge upstream release v0.6.1 (synced to `origin/main`, 119 commits since our 0.5.1
@@ -830,44 +842,47 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    job today (build123d session); a helper that takes footprint + side and returns the lines
    would save steps. Cavity numbers on face views would need Text items (no op yet); page
    navigation / zoom to a view for screenshots (only `ViewFit`, all sheets).
-7. `import_harness_changes` (session 16; since session 17 bridge runs are a script FILE like
-   the sandbox's, not the script project, which may be what made the difference: retest a
-   bridge-run open / import / save): find why a save from a bridge run drops the import
-   (probe the harness model's active project, `HarnessChangesWatcher.ActiveProjectFilePath`,
-   in a bridge run vs a sandbox run); if fixed, the open / import / save could move into the
-   bridge. The pin repair also runs when a connector's unassigned pins carry no wire (Main J3 /
-   J4 pins 3-6: one extra save cycle, 0 pins synced): repair only for pins with wires. Not
-   tried yet: a layout whose import adds or removes connectors / wires (expect new
-   connectors placed by Altium at its default spot). Tried in session 17: new connectors
-   arrive with their own CP at Altium's default spot, new wires to free ends are unrouted
-   (`success: false` with `newly_unrouted_wires`) until CPs hold their no-connects.
+7. `import_harness_changes`: (fixed, session 19) a save from a bridge run keeps the import
+   now that the bridge runs a script file (verified: sandbox import, bridge save, the saved
+   layout carries the imported parameter); the open / import / save may move into the bridge
+   (optional, the sandbox flow works). (fixed, session 19) the pin repair runs only when an
+   unassigned pin carries a wire. Tried in session 17: new connectors arrive with their own
+   CP at Altium's default spot, new wires to free ends are unrouted (`success: false` with
+   `newly_unrouted_wires`) until CPs hold their no-connects.
 8. **Pre-existing bugs found by the session 17 regression** (each reproduced with the
    pre-merge code on a second scratch project, so not from the merge):
-   - `add_harness_wiring(copy_objects=...)` from the **same** sheet moves the source
-     connector's cavity parts and associated parts to the copy (`J1` lost its crimps and
-     wedgelock, `J2` got them; RECORD 106 count +1 only). A copy from another sheet is fine,
-     also after the source is saved. Probably `Replicate` shares the cavity / associated
-     part objects; fix in `CopyHarnessObjects` (replicate them per connector) or refuse a
-     same-sheet copy of connectors with cavity parts. Workaround: `sync_harness_library`
-     with a `cavity_map` + `associated_parts` on the source connector.
-   - `edit_harness_layout` coverings: `start_offset_mm` / `end_offset_mm` never reach the
-     saved file (only `Length` / `PhysicalLength` = covered length; read back 0 / 0).
-   - Layout routing: after an import that added `J2` and CPs that the tool made to hold the
-     new wires' no-connects, the parser (and the tool's `unrouted_wires`) report W3 / W4
-     routed through B4 / B5, but Altium's `GetBundleContent` gives 0 sub-lines for B4 / B5
-     and its compiler reports "Orphaned Wire ... not routed via any bundle". The CP stream
-     entries look like those of the GUI-made CPs that do route. Find what differs (wire
-     data end links after the import?) and make the parser agree with Altium.
-   - `check_harness_wiring` reports a wire ending on a no-connect (a pigtail's free end) as
-     `dangling_end` (error).
+   - (fixed, session 19) `add_harness_wiring(copy_objects=...)` from the **same** sheet
+     moved the source connector's cavity and associated parts to the copy. `Replicate`
+     hands the copy the source's part objects themselves (the object iterator never reaches
+     them, so `RenewUniqueIds` did not either); in the saved file the source's parts named
+     the copy's containers as owner. `CopyOwnedHarnessParts` now replaces each part on the
+     copy by a replica (`Pin.GetItem` / `SetItem`, `GetAssociatedPart` /
+     `SetAssociatedPart`; the setters give a fresh UniqueId). Verified: source keeps its
+     crimps and boot, copy has its own with identical parameters.
+   - (fixed, session 19) `edit_harness_layout` coverings: offsets of a **new** covering were
+     lost (an existing covering kept them): its length is 0 until the first `EndUpdate`,
+     which resets the offsets. The tool now runs an empty update first, and checks the
+     saved offsets (`problems` when they differ).
+   - (fixed, session 19) Layout routing: the parser routed W3 / W4 through B4 / B5 while
+     Altium routed neither. They were twisted, and Altium routes the wires of a twist
+     together: when their routes share no bundle (they part at their first CP) it routes
+     none of them; twisted wires may part after a shared bundle (both verified with
+     `GetBundleContent`). `parse_ldrdoc` follows that rule and gives the wires an
+     `unrouted_reason`; `edit_harness_layout` / `import_harness_changes` report
+     `unrouted_reasons`.
+   - (fixed, session 19) `check_harness_wiring` reported a wire ending on a no-connect (a
+     pigtail's free end) as `dangling_end` (error). No-connect locations now count as valid
+     wire ends.
    - (resolved) `get_screenshot` returned a stale canvas during session 17 with old and new
      capture code alike: the desktop was idle. In normal use (session 18) captures are right.
-   - `get_harness_data` reports sheet texts (RECORD 4) under `net_labels` /
-     `net_label_count` and `get_all_nets` lists them as nets (naming only).
+   - (fixed, session 19) `get_harness_data` reported sheet texts (RECORD 4) under
+     `net_labels` / `net_label_count` and `get_all_nets` listed them as nets. Texts now go
+     under `texts` / `summary.text_count` and never become nets; `net_labels` holds only
+     RECORD 25 (invalid) net labels.
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 392 passed, 7 skipped, 0 failed (session 18)
+# unit tests (altium-mcp root) - 399 passed, 7 skipped, 0 failed (session 19)
 cd <altium-mcp checkout>
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py

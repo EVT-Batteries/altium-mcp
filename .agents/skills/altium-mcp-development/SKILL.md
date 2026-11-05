@@ -189,12 +189,13 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   panel does) on a document that is already open reloads it from disk once the run returns,
   discarding unsaved changes: call it only for a closed document, `Client.ShowDocument`
   otherwise.
-- A save from a bridge run (the `Altium_API.PrjScr` script project) wrote a layout without
-  the import (`Sch:ImportChangesFromWiringDiagram`) Altium held in memory; the same save
-  from a standalone sandbox script wrote it (cause not found). `import_harness_changes`
-  therefore opens, imports and saves through `run_altium_script` and only checks through
-  the bridge. Verify any process-driven change (`RunProcess`) on the saved file, not by the
-  `Modified` flag.
+- A save from a bridge run wrote a layout without the import
+  (`Sch:ImportChangesFromWiringDiagram`) Altium held in memory while the bridge ran as the
+  `Altium_API.PrjScr` script project; since it runs a bundled script file, as the sandbox
+  does, the save keeps the import (verified 2026-11-04). `import_harness_changes` still
+  opens, imports and saves through `run_altium_script` (it works; moving it into the bridge
+  is optional). Verify any process-driven change (`RunProcess`) on the saved file, not by
+  the `Modified` flag.
 - `Replicate` keeps every UniqueId (the object, its pins, its parameters). Renew them on a copy
   (`RenewUniqueIds` in `schematic_utils.pas`) before registering it, or wires and layout
   drawings cannot tell copy and source apart. `add_harness_wiring(copy_objects=...)` does this;

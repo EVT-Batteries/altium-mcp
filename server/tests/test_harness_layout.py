@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -24,6 +25,7 @@ from harness_layout import (
     coord_to_mm,
     mm_to_coord,
     parse_ldrdoc,
+    unrouted_reasons,
 )
 
 
@@ -340,6 +342,28 @@ class TestBuildLayoutSpec(unittest.TestCase):
         (lbl,) = records_of(spec, "LABEL")
         # the omitted x is filled in from the current location
         self.assertEqual(lbl[:6], ["LABEL", "UL1", "", "NEW", 15000, 16000])
+        # the saved offsets are checked afterwards (a new covering once lost them)
+        self.assertEqual(spec["expect"]["covering_offsets"], {"COV2": {"start": -10.0}})
+
+    def test_check_covering_offsets(self):
+        layout = make_layout()
+        cov = {
+            "designator": "COV2",
+            "unique_id": "UCOV2",
+            "start_offset": {"mils": 0.0, "mm": 0.0},
+            "end_offset": {"mils": 0.0, "mm": 0.0},
+        }
+        layout["coverings"] = [cov]
+        expect = {"covering_offsets": {"COV2": {"start": -10.0, "end": 0.0}}}
+        problems, _ = check_layout(layout, expect)
+        self.assertEqual(
+            problems,
+            ["covering COV2: start offset is 0.0 mm in the saved drawing, not -10.0 mm"],
+        )
+        cov["start_offset"] = {"mils": -393.7008, "mm": -10.0}
+        self.assertEqual(check_layout(layout, expect)[0], [])
+        problems, _ = check_layout(layout, {"covering_offsets": {"UCOV9": {"end": 1.0}}})
+        self.assertEqual(problems, ["covering UCOV9: not in the saved drawing"])
 
     def test_delete_and_record_order(self):
         spec = build_layout_spec(
@@ -718,6 +742,85 @@ class TestParseTexts(unittest.TestCase):
         self.assertFalse(cp2["show_name"])
         self.assertEqual(cp1["texts"]["Designator"]["justification"], "bottom_left")
         self.assertEqual(cp2["texts"]["Designator"]["justification"], "bottom_right")
+
+
+class TestTwistRouting(unittest.TestCase):
+    """Altium routes the wires of a twist together: twisted wires whose routes
+    share no bundle are not routed at all (verified live, 2026-11-04)."""
+
+    def parse(self, bundle_ends, twisted=True):
+        twist = {"ConnectedTwistsUniqueIdsCount": "1", "ConnectedTwistUniqueId1": "UTW"}
+        records = [
+            {"RECORD": "106", "UniqueID": "UJ1"},
+            {"RECORD": "113", "OwnerIndex": "0", "UniqueID": "UP1", "Designator": "1"},
+            {"RECORD": "113", "OwnerIndex": "0", "UniqueID": "UP2", "Designator": "2"},
+            {"RECORD": "120", "UniqueID": "UNC1", "Designator": "NC1"},
+            {"RECORD": "120", "UniqueID": "UNC2", "Designator": "NC2"},
+            *[{"RECORD": "110", "UniqueID": cp} for cp in ("UCPJ", "UCP4", "UCP5", "UCP6")],
+            {
+                "RECORD": "115",
+                "Name": "W1",
+                "UniqueID": "UW1",
+                "EndVertex1ConnectedObjectUniqueID": "UP1",
+                "EndVertex2ConnectedObjectUniqueID": "UNC1",
+                **(twist if twisted else {}),
+            },
+            {
+                "RECORD": "115",
+                "Name": "W2",
+                "UniqueID": "UW2",
+                "EndVertex1ConnectedObjectUniqueID": "UP2",
+                "EndVertex2ConnectedObjectUniqueID": "UNC2",
+                **(twist if twisted else {}),
+            },
+            *[
+                {
+                    "RECORD": "111",
+                    "UniqueID": uid,
+                    "LengthLong": "1000000",
+                    "EndVertex1ConnectedObjectUniqueID": a,
+                    "EndVertex2ConnectedObjectUniqueID": b,
+                }
+                for uid, (a, b) in bundle_ends.items()
+            ],
+        ]
+        streams = {
+            "UCPJ": [{"uid": "UJ1", "pin_count": 2, "pins": ["UP1", "UP2"]}],
+            "UCP4": [{"uid": "UNC1", "pin_count": 0, "pins": []}],
+            "UCP5": [{"uid": "UNC2", "pin_count": 0, "pins": []}],
+        }
+        with (
+            patch("harness_layout.extract_ole_records", return_value=[{}, *records]),
+            patch("harness_layout.read_connection_point_streams", return_value=streams),
+        ):
+            layout = parse_ldrdoc("x.LdrDoc")
+        return layout, {w["designator"]: w for w in layout["wires"]}
+
+    PARTING_AT_START: ClassVar = {"UB4": ("UCPJ", "UCP4"), "UB5": ("UCPJ", "UCP5")}
+
+    def test_twisted_wires_without_a_common_bundle_are_unrouted(self):
+        layout, wires = self.parse(self.PARTING_AT_START)
+        self.assertEqual(layout["unrouted_wires"], ["W1", "W2"])
+        self.assertIsNone(wires["W1"]["route"])
+        self.assertIn("twisted with W2", wires["W1"]["unrouted_reason"])
+        self.assertEqual(
+            sorted(unrouted_reasons(layout)), ["W1", "W2"]
+        )
+        self.assertTrue(all(b["wires"] == [] for b in layout["bundles"]))
+
+    def test_same_wires_untwisted_are_routed(self):
+        layout, wires = self.parse(self.PARTING_AT_START, twisted=False)
+        self.assertEqual(layout["unrouted_wires"], [])
+        self.assertEqual(wires["W1"]["route"], ["UB4"])
+        self.assertEqual(unrouted_reasons(layout), {})
+
+    def test_twisted_wires_may_part_after_a_shared_bundle(self):
+        layout, wires = self.parse(
+            {"UB6": ("UCPJ", "UCP6"), "UB7": ("UCP6", "UCP4"), "UB8": ("UCP6", "UCP5")}
+        )
+        self.assertEqual(layout["unrouted_wires"], [])
+        self.assertEqual(wires["W1"]["route"], ["UB6", "UB7"])
+        self.assertEqual(wires["W2"]["route"], ["UB6", "UB8"])
 
 
 class TestCheckLayout(unittest.TestCase):

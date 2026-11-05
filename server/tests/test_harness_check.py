@@ -82,6 +82,15 @@ class TestHarnessCheck(unittest.TestCase):
         res = self.check(_sheet([_wire("W1", [120, 500, 300, 500])], breaks=[{"x": 300, "y": 500}]))
         self.assertNotIn("dangling_end", self.types(res))
 
+    def test_no_connect_is_a_valid_end(self):
+        wire = _wire("W1", [120, 500, 300, 500])
+        res = self.check({**_sheet([wire]), "no_connects": [{"x": 300, "y": 500}]})
+        self.assertNotIn("dangling_end", self.types(res))
+        res = self.check({**_sheet([wire]), "no_connects": [{"x": 310, "y": 500}]})
+        self.assertIn("dangling_end", self.types(res))
+        res = self.check(_sheet([wire]))
+        self.assertIn("dangling_end", self.types(res))
+
     def test_overlap_is_an_error(self):
         res = self.check(_sheet([
             _wire("W1", [120, 500, 300, 500, 300, 300, 500, 300]),

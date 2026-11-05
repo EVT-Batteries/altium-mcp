@@ -173,6 +173,7 @@ def parse_wirdoc_records(
     splices_dict: dict[int, dict[str, Any]] = {}
     no_connects_list: list[dict[str, Any]] = []
     net_labels: list[dict[str, Any]] = []
+    texts_list: list[dict[str, Any]] = []
     pins_by_index: dict[int, dict[str, Any]] = {}
     # Components nested in pin cavities (RECORD 106 owned by a RECORD 131
     # cavity container owned by the pin) or attached to a connector/splice
@@ -404,11 +405,11 @@ def parse_wirdoc_records(
         elif rtype in [
             "4",
             "25",
-        ]:  # Net Label (4: Harness/Text Label, 25: Standard Net Label)
+        ]:  # 4: sheet text (valid), 25: net label (invalid in a harness project)
             text = props.get("Text", "").strip()
             # Text owned by a connector (e.g. its title) belongs to it, not the sheet
             if text and "OwnerIndex" not in props:
-                net_labels.append(
+                (texts_list if rtype == "4" else net_labels).append(
                     {
                         "text": text,
                         "x": _coord(props, "Location.X"),
@@ -678,6 +679,7 @@ def parse_wirdoc_records(
             "no_connect_count": len(no_connects_list),
             "total_pins": total_pins,
             "connected_pins": connected_pins,
+            "text_count": len(texts_list),
             "net_label_count": len(net_labels),
             "unique_net_count": len(unique_nets),
             "twist_count": len(rect_lists["twists"]),
@@ -693,6 +695,7 @@ def parse_wirdoc_records(
         "cables": sorted(rect_lists["cables"], key=lambda c: c["designator"]),
         "wire_breaks": wire_breaks,
         "no_connects": no_connects_list,
+        "texts": texts_list,
         "net_labels": net_labels,
         "nets": unique_nets,
         "net_connections": nets_to_pins,

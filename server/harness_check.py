@@ -146,7 +146,7 @@ def _pins(parsed: dict[str, Any]) -> list[dict[str, Any]]:
     front of it (pin name and sheet text next to the pin, + NAME_CLEARANCE)."""
     texts = [
         (_mils(t["x"]), _mils(t["y"]), len(t.get("text", "")))
-        for t in parsed.get("net_labels", [])
+        for t in [*parsed.get("texts", []), *parsed.get("net_labels", [])]
     ]
     out = []
     for c in parsed.get("connectors", []):
@@ -238,6 +238,8 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
     splices = {
         (_mils(s["location"]["x"]), _mils(s["location"]["y"])) for s in parsed.get("splices", [])
     } | {(_mils(b["x"]), _mils(b["y"])) for b in parsed.get("wire_breaks", [])}
+    # ... and on no-connect directives (a pigtail's free end)
+    splices |= {(_mils(n["x"]), _mils(n["y"])) for n in parsed.get("no_connects", [])}
 
     # Geometry of each wire on its own
     for w in wires:
@@ -251,7 +253,7 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
                 report("error", "diagonal", [des], "segment is neither horizontal nor vertical", s[:2])
         for end in ((pts[0], pts[1]), (pts[-2], pts[-1])):
             if end not in hot_ends and end not in splices:
-                report("error", "dangling_end", [des], "end is on no pin, splice or wire break", end)
+                report("error", "dangling_end", [des], "end is on no pin, splice, wire break or no-connect", end)
 
     # Wires that run through a connector's pins (other than the segment that
     # ends on one of its pins)
@@ -336,7 +338,7 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
             label_boxes.append((w["designator"], _text_box(_mils(pos["x"]), _mils(pos["y"]), text)))
     text_boxes = [
         (t["text"], _text_box(_mils(t["x"]), _mils(t["y"]), t["text"], TEXT_HEIGHT))
-        for t in parsed.get("net_labels", [])
+        for t in [*parsed.get("texts", []), *parsed.get("net_labels", [])]
     ]
     pin_boxes = []
     for p in pins:
