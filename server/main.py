@@ -2679,6 +2679,49 @@ def _wire_extra_lines(des: str, item: dict) -> list[str]:
 # and wire breaks
 WIRING_OBJECT_IDS = (82, 83, 94, 92, 93, 98, 106)
 
+# remove_objects types and their REMOVE record kinds
+REMOVE_KINDS = {
+    "wire": "WIRE",
+    "splice": "SPLICE",
+    "no_connect": "NOCONNECT",
+    "noconnect": "NOCONNECT",
+}
+
+
+def _remove_object_lines(items: list | None) -> list[str]:
+    """REMOVE records for remove_objects: REMOVE|UID|<unique id>,
+    REMOVE|WIRE / SPLICE / NOCONNECT|<designator or no-connect name> or
+    REMOVE|TEXT|x|y|<text>."""
+    lines = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            # ValueError: the caller turns it into the tool's error result
+            raise ValueError(f"remove_objects entries must be objects: {item!r}")  # noqa: TRY004
+        uid = str(item.get("unique_id") or "").strip()
+        if uid:
+            lines.append(_spec_line("REMOVE", "UID", uid))
+            continue
+        kind_name = str(item.get("type") or "").strip().lower()
+        if kind_name == "text":
+            text = str(item.get("text") or "")
+            if item.get("x") is None or item.get("y") is None or not text:
+                raise ValueError(
+                    f"remove_objects text entry needs x, y (mils) and text: {item!r}"
+                )
+            lines.append(
+                _spec_line("REMOVE", "TEXT", int(item["x"]), int(item["y"]), text)
+            )
+            continue
+        kind = REMOVE_KINDS.get(kind_name)
+        name = str(item.get("designator") or item.get("name") or "").strip()
+        if kind is None or not name:
+            raise ValueError(
+                "remove_objects entry needs a unique_id, or a type (wire, splice, "
+                f"no_connect) and a designator, or a text with x / y: {item!r}"
+            )
+        lines.append(_spec_line("REMOVE", kind, name))
+    return lines
+
 
 def _copy_object_lines(copies: list | None) -> list[str]:
     """COPYDES / COPYTEXT / COPYFROM records for copy_objects. The renames and
@@ -2827,9 +2870,10 @@ async def add_harness_wiring(
     designator_updates: list | None = None,
     clear_hidden_cavity_parts: list | None = None,
     copy_objects: list | None = None,
+    remove_objects: list | None = None,
 ) -> str:
     """
-    Add or update wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
+    Add, update or remove wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
 
     document_path is required: the target is always named explicitly, matched by full path,
     and saved to disk afterwards.
@@ -2977,6 +3021,19 @@ async def add_harness_wiring(
             out unless "include_wiring": True. Copies get new UniqueIds (pins included)
             and are placed before the call's connector moves and wires, so those can
             use them. The result counts them under "copied".
+        remove_objects (list): Delete harness wires, splices or no-connects, found by
+            designator (a no-connect by its name) or by the unique_id get_harness_data
+            reports, and sheet texts, found by location (mils) and text, e.g.
+            [{"type": "wire", "designator": "W3"}, {"type": "splice", "designator": "SP1"},
+             {"type": "no_connect", "designator": "NC9"}, {"unique_id": "QOWDFIRS"},
+             {"type": "text", "x": 4300, "y": 11600, "text": "OLD NOTE"}]
+            Connectors are never removed (a unique_id naming one is not_found). Removed
+            before the call's copies and
+            wires (which may reuse the designators), after designator_updates; the
+            result counts them under "removed", a missing one is listed in not_found.
+            Wires that ended on a removed splice are left with a free end: reroute or
+            remove them too. A removed wire's links from a layout drawing (.LdrDoc)
+            go with it; import the changes into the layout afterwards.
         component_updates (list): Parameters to upsert on placed connectors/components, and
             names of parameters to delete from them, e.g.:
             [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"},
@@ -3028,8 +3085,10 @@ async def add_harness_wiring(
         )
     for conn in clear_hidden_cavity_parts or []:
         lines.append(_spec_line("CLEARHIDDEN", str(conn).strip()))
-    # Copies come before connector moves and wires, which may then use them
+    # Removals come before copies and wires, which may reuse their designators;
+    # copies come before connector moves and wires, which may then use them
     try:
+        lines.extend(_remove_object_lines(remove_objects))
         lines.extend(_copy_object_lines(copy_objects))
     except ValueError as e:
         return json.dumps({"success": False, "error": str(e)})

@@ -765,6 +765,61 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         # Renames come before records that address the new designators
         self.assertGreater(lines.index("UPDATE_WIREPARAM|W1|PartNumber|X"), 3)
 
+    async def test_add_harness_wiring_remove_objects(self):
+        """Removals serialise after the renames and before copies and wires,
+        which may reuse the removed designators."""
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            wires=[{"designator": "W3", "net": "N", "points": [0, 0, 100, 0]}],
+            designator_updates=[{"unique_id": "ABCDEFGH", "designator": "W9"}],
+            remove_objects=[
+                {"type": "wire", "designator": " W3 "},
+                {"type": "Splice", "designator": "SP1"},
+                {"type": "no_connect", "name": "NC|2"},
+                {"unique_id": "QOWDFIRS", "type": "wire"},
+                {"type": "text", "x": 4300.0, "y": 11600, "text": "OLD|NOTE"},
+            ],
+        )
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertEqual(lines[1], "DESIGNATOR|ABCDEFGH|W9|")
+        self.assertEqual(
+            lines[2:7],
+            [
+                "REMOVE|WIRE|W3",
+                "REMOVE|SPLICE|SP1",
+                "REMOVE|NOCONNECT|NC%7C2",
+                "REMOVE|UID|QOWDFIRS",
+                "REMOVE|TEXT|4300|11600|OLD%7CNOTE",
+            ],
+        )
+        self.assertGreater(
+            next(i for i, ln in enumerate(lines) if ln.startswith("WIRE|W3|")), 6
+        )
+
+    async def test_add_harness_wiring_remove_objects_invalid(self):
+        """An entry without a unique_id needs a known type and a designator;
+        nothing is sent to Altium otherwise."""
+        import main
+        for bad in (
+            [{"type": "connector", "designator": "P1"}],
+            [{"type": "wire"}],
+            [{"type": "text", "x": 10, "text": "A"}],
+            [{"type": "text", "x": 10, "y": 20}],
+            ["W3"],
+        ):
+            result = json.loads(
+                await main.add_harness_wiring(
+                    None, document_path=r"C:\test\sheet.WirDoc", remove_objects=bad
+                )
+            )
+            self.assertFalse(result["success"])
+            self.assertIn("remove_objects", result["error"])
+        self.mock_bridge.assert_not_called()
+
     async def test_add_harness_wiring_copy_objects(self):
         """A copy serialises its renames and text replacements before its
         COPYFROM (normalised region, wiring excluded by default), and comes

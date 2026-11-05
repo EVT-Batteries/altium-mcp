@@ -47,6 +47,23 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 21 (2026-11-05): `add_harness_wiring(remove_objects=...)` (uncommitted)
+Wiring could be moved and renamed but not deleted (a splice that became unnecessary had to be
+deleted in the GUI). `remove_objects` deletes harness wires, splices and no-connects by
+designator / name, any of them by `unique_id` (a connector's is refused, `not_found`), and
+sheet texts by location (mils) + exact text (`FindLabelAt`). Spec record
+`REMOVE|WIRE|SPLICE|NOCONNECT|UID|<key>` / `REMOVE|TEXT|x|y|<text>`, written after the
+`DESIGNATOR` records and before copies and wires (which may reuse the designators); the
+result counts `removed`. New `FindHarnessNoConnect` (schematic_utils.pas). Unit tests 402
+passed (2 new: record order / encoding, invalid entries never reach the bridge). Live on a
+renamed scratch copy of a real sheet with `call_tool.py`: a wire, a splice (its associated part
+goes with it) and a no-connect removed, a missing designator and a connector UniqueID listed in
+`not_found`, a text removed by location + text and one with the wrong text refused;
+`wirdoc_diff` showed only the intended records gone, no wire UniqueID changed. Then used on a
+real sheet together with `reroutes` and `wire_updates` (`Comment`); the layout import
+afterwards dropped the removed wires and kept every other wire routed. The running MCP server
+needs a restart to expose the argument.
+
 ### Session 20 (2026-11-05): connection tables for new connectors (uncommitted)
 `edit_harness_drawing` `copy_item` takes `component` for a connection table (its `<Component>`;
 Draftsman stores no rows and fills them from the layout on update), and the review reports each

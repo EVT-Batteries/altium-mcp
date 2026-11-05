@@ -2552,6 +2552,28 @@ begin
     Doc.SchIterator_Destroy(Iter);
 end;
 
+// First harness no-connect (94) on Doc with the given name, or nil.
+function FindHarnessNoConnect(Doc: ISch_Document; NcName: String): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(94));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (AnsiUpperCase(Obj.Text) = AnsiUpperCase(NcName)) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
 function MinInt(A, B: Integer): Integer;
 begin
     if (A < B) then Result := A else Result := B;
@@ -3088,6 +3110,7 @@ var
     UnchangedCount: Integer;
     LabelsUpdated : Integer;
     DesUpdated    : Integer;
+    RemovedCount  : Integer;
     RX1, RY1      : Integer;
     RX2, RY2      : Integer;
     GeoChanged    : Boolean;
@@ -3224,6 +3247,7 @@ begin
         UnchangedCount := 0;
         LabelsUpdated := 0;
         DesUpdated := 0;
+        RemovedCount := 0;
         HiddenCleared := 0;
         BreaksUpdated := 0;
         KindCount := 0;
@@ -4100,6 +4124,50 @@ begin
                     DesUpdated := DesUpdated + 1;
                 end;
             end
+            else if (Kind = 'REMOVE') then
+            begin
+                // REMOVE|UID|<UniqueId>, REMOVE|WIRE / SPLICE / NOCONNECT|<designator
+                // or no-connect name> or REMOVE|TEXT|x|y|<text> - deletes one
+                // harness wire, splice, no-connect or sheet text (never a connector)
+                PName := SpecField(Rec, 1);
+                PVal := SpecField(Rec, 2);
+                Obj := nil;
+                if (PName = 'TEXT') then
+                begin
+                    Obj := FindLabelAt(TargetDoc, StrToInt(SpecField(Rec, 2)), StrToInt(SpecField(Rec, 3)), SpecField(Rec, 4));
+                    PVal := SpecField(Rec, 2) + ',' + SpecField(Rec, 3) + ':' + SpecField(Rec, 4);
+                end
+                else if (PName = 'UID') then
+                begin
+                    Obj := FindHarnessObjectByUid(TargetDoc, PVal);
+                    if (Obj <> nil) and (Obj.ObjectId = 81) then
+                        Obj := nil;
+                end
+                else if (PName = 'WIRE') then
+                    Obj := FindHarnessWire(TargetDoc, PVal)
+                else if (PName = 'SPLICE') then
+                    Obj := FindHarnessSplice(TargetDoc, PVal)
+                else if (PName = 'NOCONNECT') then
+                    Obj := FindHarnessNoConnect(TargetDoc, PVal);
+                if (Obj = nil) then
+                    Misses.Add('remove:' + LowerCase(PName) + ':' + PVal)
+                else
+                begin
+                    if (CachedWireObj = Obj) then
+                    begin
+                        CachedWireObj := nil;
+                        CachedWireDes := '';
+                    end;
+                    if (LastWire = Obj) then
+                        LastWire := nil;
+                    Obj.GraphicallyInvalidate;
+                    TargetDoc.RemoveSchObject(Obj);
+                    SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
+                        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+                    RemovedCount := RemovedCount + 1;
+                    GeoChanged := True;
+                end;
+            end
             else if (Kind = 'WIREBREAK') then
             begin
                 // WIREBREAK|x|y[|<style 0 left, 1 right>|<orientation 0-3>] - on a
@@ -4225,6 +4293,7 @@ begin
                   ', "already_placed": ' + IntToStr(UnchangedCount) +
                   ', "labels_updated": ' + IntToStr(LabelsUpdated) +
                   ', "designators_updated": ' + IntToStr(DesUpdated) +
+                  ', "removed": ' + IntToStr(RemovedCount) +
                   ', "relinked": ' + LowerCase(BoolToStr(Relinked, True)) +
                   ', "components_updated": ' + IntToStr(CompsUpdated) +
                   ', "connectors_moved": ' + IntToStr(MovedCount) +
