@@ -386,6 +386,8 @@ class DrawingItem:
                 if side and side.isdigit() and int(side) < len(VIEW_SIDES)
                 else side
             )
+        if self.type == "ConnectionTableData":
+            out["component"] = _child_text(e, "Component")
         if self.type == "Callout":
             out["text"] = _child_text(e, "Sources", "CalloutSource", "CustomText")
             out["target_item"] = _child_text(e, "TargetAnchor", "SnapTargetItemId")
@@ -894,11 +896,18 @@ def _op_move_item(doc: HarnessDrawing, op: dict) -> dict:
 
 
 def _op_copy_item(doc: HarnessDrawing, op: dict) -> dict:
-    """Copy an item onto its page under a new id; optional x_mm / y_mm, and
-    for a component view designator / view_side / scale."""
+    """Copy an item onto its page under a new id; optional x_mm / y_mm, for a
+    component view designator / view_side / scale, and for a connection table
+    component (the connector it lists; Draftsman fills its rows from the
+    layout, none are stored)."""
     item = doc.item(op.get("item_id"))
     if item.from_template:
         raise DrawingEditError(f"item {item.id} comes from the sheet template")
+    if "component" in op and item.type != "ConnectionTableData":
+        raise DrawingEditError(
+            f"item {item.id} is a {item.type}; component only applies to a "
+            "connection table"
+        )
     ids = [int(i.id) for i in doc.items()] + [int(p["id"]) for p in doc.pages()]
     new_id = str(max(ids) + 1)
     text = doc.xml[item.start : item.end]
@@ -914,6 +923,9 @@ def _op_copy_item(doc: HarnessDrawing, op: dict) -> dict:
         }
         _op_move_item(doc, move)
         out["x_mm"], out["y_mm"] = move["x_mm"], move["y_mm"]
+    if op.get("component"):
+        doc._set_child(doc.item(new_id), ["Component"], str(op["component"]))
+        out["component"] = str(op["component"])
     view = {k: op[k] for k in ("designator", "view_side", "scale") if k in op}
     if view:
         out.update(

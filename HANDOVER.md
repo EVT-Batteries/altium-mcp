@@ -47,6 +47,13 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 20 (2026-11-05): connection tables for new connectors (uncommitted)
+`edit_harness_drawing` `copy_item` takes `component` for a connection table (its `<Component>`;
+Draftsman stores no rows and fills them from the layout on update), and the review reports each
+connection table's `component`. Used after connectors were added to a layout by an import: copy
+an existing table per new connector, then `import_harness_changes` on the drawing. Unit tests
+400 passed. Live-tested on a real drawing (the tables filled with the right height).
+
 ### Session 19 (2026-11-04): the six bugs of the session 17 regression
 All six of §8 item 8 fixed (details there), each reproduced and verified live on scratch
 projects, unit tests 392 -> 399 passed: same-sheet `copy_objects` (cavity / associated parts
@@ -830,7 +837,7 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
 2. (done, session 18) The 13 old test failures were replaced by tests on the synthetic fixture
    project (`server/tests/harness_fixture.py`).
 3. Open question: should view options (side, zoom) be copied from a template connector?
-4. Not supported yet: LdrDoc notes / text frames; wire `LengthOffset` / user length / manual wire
+4. Not supported yet: LdrDoc notes / text frames (scope in item 9); wire `LengthOffset` / user length / manual wire
    paths (no script setter, §5).
 5. `copy_objects` was tested within one harness project only: try a source sheet of another open
    project before relying on it. A `get_harness_data` option listing the objects inside a region
@@ -879,6 +886,47 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
      `net_labels` / `net_label_count` and `get_all_nets` listed them as nets. Texts now go
      under `texts` / `summary.text_count` and never become nets; `net_labels` holds only
      RECORD 25 (invalid) net labels.
+9. **Gaps found reworking a sheet (session 20)**: after a rework (copy a contactor frame,
+   move lugs, reroute, import, re-branch the layout) these steps were left to the user in the
+   GUI, or needed a read-only olefile scratch script. Each object below is addressed by the
+   unique_id the reader reports.
+   - **WirDoc reader** (`get_harness_data`): report notes (RECORD 209: text, colour, corners),
+     frames / rectangles (RECORD 14: corners, line style) and pictures (RECORD 30: corners, file
+     name), each with its unique_id. Today they are invisible to the tools, so choosing a
+     `copy_objects` region or finding a stale note needed a raw record dump (see also item 5).
+   - **WirDoc delete** (`add_harness_wiring` `delete`: unique_ids, or designators for connectors
+     / wires / splices): remove notes, texts, frames, pictures, and connectors no wire touches
+     (refused when one does; a stale connector otherwise stays in the BOM). Today only
+     `clear_existing` removes anything, and only wiring. Never delete a whole object tree by
+     index: the owner indexes of the remaining records must be renumbered (let Altium do it,
+     `RemoveSchObject` in the bridge).
+   - **WirDoc notes** (`note_updates` / `notes`): change a note's text (keep its size, colour
+     and font), add a note (copy the style of a given one), move it. `label_updates` covers
+     only texts (eLabel). Stale "TODO" notes and notes that no longer match the drawing were
+     left to the user.
+   - **Text style**: `labels` place a new text in the sheet's default font, so a new frame
+     title is smaller than the copied ones next to it. Add `font_from` (unique_id of a text whose
+     FontID, colour and justification are copied) or `font_id`.
+   - **`copy_objects` filters**: `exclude` (unique_ids) and/or `types` (connector, frame, text,
+     note, picture), so a copied frame does not bring along notes for lugs it no longer has.
+   - **LdrDoc notes and pictures** (item 4): read them in `get_harness_data` (`notes`,
+     `pictures`, with unique_id and corners); in `edit_harness_layout` change a note's text, move
+     / delete notes and pictures, and copy a note + picture group from a region with an offset,
+     like `copy_objects`. Needed when a connector's role changes (a note naming the wrong part)
+     and when a new connector needs the note and picture its neighbours have. Check whether the
+     layout note is the same record type as the WirDoc one (RECORD 209) first.
+   - **Import report**: `import_harness_changes` should list `connectors_added` /
+     `connectors_removed` with where Altium put them (they land at their wiring-diagram
+     coordinates, their own CP offset from the connector and its name shown), so the agent knows
+     what to place.
+   - **Bend-only connection points**: after a re-branch a CP can be left joining just two
+     bundles (a bend). Add `edit_harness_layout` `merge_bundles` (join two bundles through a CP
+     that holds nothing, deleting it, keeping the first bundle's designator and texts; manual
+     lengths added).
+   - **Drawing review**: report the layout connectors that no connection table lists
+     (`connector_without_table`), since Draftsman's update adds none for new connectors; the fix is
+     `copy_item` with `component` (session 20). A screenshot of a given page (item 6) would
+     let the agent check where the new tables sit.
 
 ## 9. How to verify
 ```powershell

@@ -246,6 +246,35 @@ class DrawingTests(unittest.TestCase):
         self.assertEqual(r["pages"][0]["items"][0]["text"], "Notes & <done>")
         self.assertTrue(all(p["template_exists"] for p in r["pages"]))
 
+    def test_copy_connection_table_for_another_component(self):
+        table = (
+            '<Item i:type="ConnectionTableData"><Id>30</Id><Anchor>Top Left</Anchor>'
+            "<OriginatedFromTemplate>false</OriginatedFromTemplate>"
+            "<Columns/><Component>X1</Component><Location><X>100</X><Y>200</Y>"
+            "</Location><Size><Height>40</Height><Width>600</Width></Size></Item>"
+        )
+        xml = (
+            hd.read_drawing_xml(self.path)
+            .decode()
+            .replace("<Items>", "<Items>" + table, 1)
+        )
+        self.path.write_bytes(hd.encode_stream(xml.encode("utf-8")))
+        doc = hd.HarnessDrawing(self.path)
+        res = hd.apply_operations(
+            doc,
+            [{"op": "copy_item", "item_id": 30, "component": "X9", "y_mm": 10}],
+        )
+        self.assertEqual(res[0]["component"], "X9")
+        doc.save()
+        items = hd.review_drawing(self.path)["pages"][0]["items"]
+        tables = [(i["id"], i["component"]) for i in items if "component" in i]
+        self.assertEqual(tables, [("30", "X1"), (res[0]["new_item_id"], "X9")])
+        with self.assertRaises(hd.DrawingEditError):
+            hd.apply_operations(
+                hd.HarnessDrawing(self.path),
+                [{"op": "copy_item", "item_id": 20, "component": "X9"}],
+            )
+
     def test_view_scale(self):
         doc = hd.HarnessDrawing(self.path)
         res = hd.apply_operations(

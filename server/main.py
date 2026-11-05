@@ -7923,8 +7923,13 @@ async def edit_harness_drawing(
           JSON file with that list or {side: list}. Replaces the stored one.
       remove_component_projection {designator, view_side?}
           Drop stored projections so Draftsman computes them again on update.
-      copy_item {item_id, x_mm?, y_mm?, designator?, view_side?, scale?}
-          Copy an item on its page under a new id (e.g. a second view).
+      copy_item {item_id, x_mm?, y_mm?, designator?, view_side?, scale?,
+                 component?}
+          Copy an item on its page under a new id (e.g. a second view);
+          component: the connector a copied connection table lists (e.g.
+          a table for a connector added to the layout; Draftsman fills
+          its rows from the layout, the review reports each table's
+          component).
       add_callout {item_id, text, point_mm, leader_mm?}
           Custom-text callout on a component view (e.g. "Pin 1"), snapped
           to point_mm [x, y] of its projection (same frame as the lines);
