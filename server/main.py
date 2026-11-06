@@ -8108,9 +8108,23 @@ async def edit_harness_drawing(
 
 def _harness_import_targets(path: Path) -> list[Path]:
     """The documents import_harness_changes updates for path: the document
-    itself, or a harness project's layout drawings followed by its Draftsman
-    drawings (a drawing shows its layout, so the layout goes first)."""
-    if path.suffix.lower() != ".prjhar":
+    itself, a harness project's layout drawings followed by its Draftsman
+    drawings (a drawing shows its layout, so the layout goes first), or every
+    child harness subproject of a multi-board project (.PrjMbd)."""
+    suffix = path.suffix.lower()
+    if suffix == ".prjmbd":
+        subprojects = [
+            (path.parent / line.split("=", 1)[1].strip()).resolve()
+            for line in read_altium_text(path).splitlines()
+            if line.startswith("DocumentPath=")
+        ]
+        return [
+            target
+            for sub in subprojects
+            if sub.suffix.lower() == ".prjhar" and sub.exists()
+            for target in _harness_import_targets(sub)
+        ]
+    if suffix != ".prjhar":
         return [path]
     docs = [
         (path.parent / line.split("=", 1)[1].strip()).resolve()
@@ -8225,7 +8239,8 @@ async def import_harness_changes(ctx: Context, document_path: str) -> str:
     <layout>): BOM, wiring list, connection tables, layout view; the component
     projections stored with edit_harness_drawing are kept.
 
-    document_path may be a .PrjHar: its layout drawings are imported first, then its
+    document_path may be a .PrjHar (or a .PrjMbd to import all of its child
+    .PrjHar subprojects): its layout drawings are imported first, then its
     Draftsman drawings. The harness project must be open in Altium with no
     unsaved changes in any of its documents (only the import is saved; a layout
     is checked against the saved wiring diagrams afterwards and imported again
@@ -8234,7 +8249,7 @@ async def import_harness_changes(ctx: Context, document_path: str) -> str:
     sandbox recovery may follow a script error.
 
     Args:
-        document_path: Full path to a .LdrDoc, .HarDwf or .PrjHar.
+        document_path: Full path to a .LdrDoc, .HarDwf, .PrjHar or .PrjMbd.
 
     Returns:
         JSON with success and, per document, changed / saved and a report: for a
@@ -8249,12 +8264,15 @@ async def import_harness_changes(ctx: Context, document_path: str) -> str:
     if (
         not path
         or not path.exists()
-        or path.suffix.lower() not in (".ldrdoc", ".hardwf", ".prjhar")
+        or path.suffix.lower() not in (".ldrdoc", ".hardwf", ".prjhar", ".prjmbd")
     ):
         return json.dumps(
             {
                 "success": False,
-                "error": f"document_path to a .LdrDoc, .HarDwf or .PrjHar is required: {document_path!r}",
+                "error": (
+                    "document_path to a .LdrDoc, .HarDwf, .PrjHar or .PrjMbd "
+                    f"is required: {document_path!r}"
+                ),
             }
         )
     targets = _harness_import_targets(path)
@@ -8558,12 +8576,15 @@ async def get_project_info(ctx: Context) -> str:
     generating outputs, and to read project parameters and variants.
 
     Returns:
-        str: JSON with project_path, parameters [{name, value}],
-             schematic_sheet_count, modified_document_count, documents
-             [{path, kind, state}] where state is "closed", "open" or
-             "modified" (unsaved changes in memory), and variants
-             [{name, variations [{designator, kind}]}] where kind is
-             "not_fitted" or "alternate"
+        str: JSON with project_path, optional parent_project_path (when the
+             focused project is a child subproject of an open .PrjMbd),
+             parameters [{name, value}], schematic_sheet_count,
+             modified_document_count, documents [{path, kind, state}] where
+             state is "closed", "open" or "modified" (unsaved changes in
+             memory), optional subprojects [{project_path, kind, state,
+             modified_document_count, documents}] (when the focused project
+             is a .PrjMbd), and variants [{name, variations [{designator,
+             kind}]}] where kind is "not_fitted" or "alternate"
     """
     response = await altium_bridge.execute_command("get_project_info", {})
     if response.get("success", False):

@@ -4,6 +4,8 @@ const
     PROGRESS_FILE = 'C:\Users\Public\altium_mcp\progress.txt';
     // The board the PCB tools last ran on, see FocusBoardForCommand
     LAST_BOARD_FILE = 'C:\Users\Public\altium_mcp\last_board.txt';
+    // The last focused design project, see FocusedDesignProject
+    LAST_PROJECT_FILE = 'C:\Users\Public\altium_mcp\last_project.txt';
 
 var
     // Why the last EnsureDocumentFocused call failed; reported to the server.
@@ -113,6 +115,7 @@ var
     DocKind: String;
 begin
     result := '';
+    EnsureMultiboardSubprojectsOpen;
     for ProjectIdx := 0 to GetWorkspace.DM_ProjectCount - 1 do
     begin
         Project := GetWorkspace.DM_Projects(ProjectIdx);
@@ -252,6 +255,216 @@ function IsHarnessDocumentKind(Kind: String): Boolean;
 begin
     Result := (AnsiUpperCase(Kind) = 'HARNESSWIRINGDIAGRAM') or
               (AnsiUpperCase(Kind) = 'HARNESSLAYOUTDRAWING');
+end;
+
+// True when Project is nil, a script project (.PrjScr), or Altium's
+// synthetic "Free Documents" container rather than a real design project.
+function IsNonDesignProject(Project: IProject): Boolean;
+var
+    PrjPath : String;
+begin
+    Result := True;
+    if (Project = nil) then Exit;
+    PrjPath := Trim(Project.DM_ProjectFullPath);
+    Result := (PrjPath = '') or
+              (UpperCase(PrjPath) = 'FREE DOCUMENTS') or
+              (UpperCase(ExtractFileExt(PrjPath)) = '.PRJSCR');
+end;
+
+// True when a logical document entry of a multi-board project (.PrjMbd) is a
+// child subproject (.PrjHar or .PrjPcb) rather than a document tab.
+function IsChildProjectEntry(Kind: String; Path: String): Boolean;
+var
+    Ext : String;
+begin
+    Ext := UpperCase(ExtractFileExt(Path));
+    Result := SameText(Kind, 'HarnessDesign') or
+              SameText(Kind, 'PcbProject') or
+              (Ext = '.PRJHAR') or
+              (Ext = '.PRJPCB');
+end;
+
+// The open project in GetWorkspace.DM_Projects at PrjPath, or nil.
+function FindOpenProjectByPath(PrjPath: String): IProject;
+var
+    P       : Integer;
+    Project : IProject;
+    Want    : String;
+begin
+    Result := nil;
+    Want := NormalizedPath(PrjPath);
+    if (Want = '') or (GetWorkspace = nil) then Exit;
+    for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        Project := GetWorkspace.DM_Projects(P);
+        if (Project <> nil) and (NormalizedPath(Project.DM_ProjectFullPath) = Want) then
+        begin
+            Result := Project;
+            Exit;
+        end;
+    end;
+end;
+
+// Ensure every child subproject (.PrjHar, .PrjPcb) listed by an open
+// multi-board project (.PrjMbd) is also loaded in GetWorkspace.DM_Projects.
+procedure EnsureMultiboardSubprojectsOpen;
+var
+    P, I    : Integer;
+    Project : IProject;
+    Doc     : IDocument;
+    Missing : TStringList;
+begin
+    if (GetWorkspace = nil) then Exit;
+    Missing := TStringList.Create;
+    try
+        for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+        begin
+            Project := GetWorkspace.DM_Projects(P);
+            if (Project = nil) or
+               (UpperCase(ExtractFileExt(Project.DM_ProjectFullPath)) <> '.PRJMBD') then
+                Continue;
+            for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+            begin
+                Doc := Project.DM_LogicalDocuments(I);
+                if (Doc <> nil) and
+                   IsChildProjectEntry(Doc.DM_DocumentKind, Doc.DM_FullPath) and
+                   (FindOpenProjectByPath(Doc.DM_FullPath) = nil) and
+                   FileExists(Doc.DM_FullPath) then
+                    Missing.Add(Doc.DM_FullPath);
+            end;
+        end;
+        for I := 0 to Missing.Count - 1 do
+            if (FindOpenProjectByPath(Missing[I]) = nil) then
+            begin
+                ResetParameters;
+                AddStringParameter('ObjectKind', 'Project');
+                AddStringParameter('FileName', Missing[I]);
+                RunProcess('WorkspaceManager:OpenObject');
+            end;
+    finally
+        Missing.Free;
+    end;
+end;
+
+// Full path of the open multi-board project (.PrjMbd) that owns ChildPrjPath
+// as a subproject, or '' when ChildPrjPath is a top-level project.
+function ParentMultiboardProject(ChildPrjPath: String): String;
+var
+    P, I    : Integer;
+    Project : IProject;
+    Doc     : IDocument;
+    Want    : String;
+begin
+    Result := '';
+    Want := NormalizedPath(ChildPrjPath);
+    if (Want = '') or (GetWorkspace = nil) then Exit;
+    for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        Project := GetWorkspace.DM_Projects(P);
+        if (Project = nil) or
+           (UpperCase(ExtractFileExt(Project.DM_ProjectFullPath)) <> '.PRJMBD') then
+            Continue;
+        for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+        begin
+            Doc := Project.DM_LogicalDocuments(I);
+            if (Doc <> nil) and (NormalizedPath(Doc.DM_FullPath) = Want) then
+            begin
+                Result := Project.DM_ProjectFullPath;
+                Exit;
+            end;
+        end;
+    end;
+end;
+
+// The open project in GetWorkspace.DM_Projects that holds DocPath as a
+// document, or nil. Ensures multi-board child subprojects are open first.
+function FindProjectOfDocument(DocPath: String): IProject;
+var
+    P, I    : Integer;
+    Project : IProject;
+    Doc     : IDocument;
+    Want    : String;
+begin
+    Result := nil;
+    Want := NormalizedPath(DocPath);
+    if (Want = '') or (GetWorkspace = nil) then Exit;
+    EnsureMultiboardSubprojectsOpen;
+    for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        Project := GetWorkspace.DM_Projects(P);
+        if (Project = nil) or IsNonDesignProject(Project) then Continue;
+        for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+        begin
+            Doc := Project.DM_LogicalDocuments(I);
+            if (Doc <> nil) and
+               not IsChildProjectEntry(Doc.DM_DocumentKind, Doc.DM_FullPath) and
+               (NormalizedPath(Doc.DM_FullPath) = Want) then
+            begin
+                Result := Project;
+                Exit;
+            end;
+        end;
+    end;
+end;
+
+// The focused design project: GetWorkspace.DM_FocusedProject when it is a
+// real design project (neither .PrjScr nor "Free Documents"), else the
+// project of the active editor document, else the last remembered design
+// project in LAST_PROJECT_FILE, else the first open design project.
+function FocusedDesignProject(Dummy: Integer): IProject;
+var
+    Project  : IProject;
+    Store    : TStringList;
+    LastPath : String;
+    P        : Integer;
+begin
+    Result := nil;
+    if (GetWorkspace = nil) then Exit;
+    EnsureMultiboardSubprojectsOpen;
+    Project := GetWorkspace.DM_FocusedProject;
+    if not IsNonDesignProject(Project) then
+    begin
+        Result := Project;
+        Exit;
+    end;
+    if (Client <> nil) and (Client.CurrentView <> nil) and
+       (Client.CurrentView.OwnerDocument <> nil) then
+    begin
+        Result := FindProjectOfDocument(Client.CurrentView.OwnerDocument.FileName);
+        if (Result <> nil) then Exit;
+    end;
+    LastPath := '';
+    if FileExists(LAST_PROJECT_FILE) then
+    begin
+        Store := TStringList.Create;
+        try
+            try
+                Store.LoadFromFile(LAST_PROJECT_FILE);
+                if (Store.Count > 0) then LastPath := Trim(Store[0]);
+            except
+            end;
+        finally
+            Store.Free;
+        end;
+    end;
+    if (LastPath <> '') then
+    begin
+        Project := FindOpenProjectByPath(LastPath);
+        if not IsNonDesignProject(Project) then
+        begin
+            Result := Project;
+            Exit;
+        end;
+    end;
+    for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+    begin
+        Project := GetWorkspace.DM_Projects(P);
+        if not IsNonDesignProject(Project) then
+        begin
+            Result := Project;
+            Exit;
+        end;
+    end;
 end;
 
 // The open document for a file, or nil. Paths are compared case-
@@ -428,14 +641,16 @@ end;
 // the wrong one returns empty or wrong data (#33).
 function FocusBoardForCommand(CommandName: String): Boolean;
 var
-    P, I    : Integer;
-    Project : IProject;
-    Doc     : IDocument;
-    Only    : IDocument;
-    Last    : String;
-    Names   : String;
-    Count   : Integer;
-    Shown   : IServerDocument;
+    P, I, Pass   : Integer;
+    Project      : IProject;
+    FocusPrj     : IProject;
+    InFocusScope : Boolean;
+    Doc          : IDocument;
+    Only         : IDocument;
+    Last         : String;
+    Names        : String;
+    Count        : Integer;
+    Shown        : IServerDocument;
 begin
     Result := False;
     Last := RememberedBoard(0);
@@ -456,31 +671,36 @@ begin
         end;
     end;
 
+    EnsureMultiboardSubprojectsOpen;
+    FocusPrj := FocusedDesignProject(0);
     Count := 0;
     Names := '';
     Only := nil;
-    for P := -1 to GetWorkspace.DM_ProjectCount - 1 do
+    // Pass 1: the focused project (and its child subprojects when it is a
+    // .PrjMbd); Pass 2 (only if Pass 1 found none): all other open projects
+    for Pass := 1 to 2 do
     begin
-        if P < 0 then
-            Project := GetWorkspace.DM_FocusedProject
-        else
+        if (Pass = 2) and (Count > 0) then Break;
+        for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
         begin
-            // The focused project's boards come first; only without any
-            // are the other open projects searched
-            if Count > 0 then Break;
             Project := GetWorkspace.DM_Projects(P);
-            if Project = GetWorkspace.DM_FocusedProject then Continue;
-        end;
-        if Project = nil then Continue;
-        for I := 0 to Project.DM_LogicalDocumentCount - 1 do
-        begin
-            Doc := Project.DM_LogicalDocuments(I);
-            if Doc.DM_DocumentKind = 'PCB' then
+            if Project = nil then Continue;
+            InFocusScope := (FocusPrj <> nil) and
+                ((Project = FocusPrj) or
+                 (NormalizedPath(ParentMultiboardProject(Project.DM_ProjectFullPath)) =
+                  NormalizedPath(FocusPrj.DM_ProjectFullPath)));
+            if (Pass = 1) and not InFocusScope then Continue;
+            if (Pass = 2) and InFocusScope then Continue;
+            for I := 0 to Project.DM_LogicalDocumentCount - 1 do
             begin
-                Count := Count + 1;
-                Only := Doc;
-                if Count <= 6 then
-                    Names := Names + ', ' + ExtractFileName(Doc.DM_FullPath);
+                Doc := Project.DM_LogicalDocuments(I);
+                if Doc.DM_DocumentKind = 'PCB' then
+                begin
+                    Count := Count + 1;
+                    Only := Doc;
+                    if Count <= 6 then
+                        Names := Names + ', ' + ExtractFileName(Doc.DM_FullPath);
+                end;
             end;
         end;
     end;
@@ -738,7 +958,8 @@ begin
     end;
 
     // Retrieve the current project if needed for searching
-    Project := GetWorkspace.DM_FocusedProject;
+    EnsureMultiboardSubprojectsOpen;
+    Project := FocusedDesignProject(0);
 
     // Try to find and focus the required document type. The focused project
     // is searched first, then every other open project: after a script run
@@ -747,11 +968,11 @@ begin
     For P := -1 to GetWorkspace.DM_ProjectCount - 1 Do
     Begin
       if P < 0 then
-        Project := GetWorkspace.DM_FocusedProject
+        Project := FocusedDesignProject(0)
       else
       begin
         Project := GetWorkspace.DM_Projects(P);
-        if (Project = Nil) or (Project = GetWorkspace.DM_FocusedProject) then Continue;
+        if (Project = Nil) or (Project = FocusedDesignProject(0)) then Continue;
       end;
       if (Project = Nil) then Continue;
       For I := 0 to Project.DM_LogicalDocumentCount - 1 Do
@@ -1606,27 +1827,37 @@ begin
     end;
 end;
 
-// Focused project: parameters, documents (with unsaved-changes flag) and variants
+// Focused project: parameters, documents (with unsaved-changes flag),
+// child subprojects (when the focused project is a .PrjMbd), parent_project_path
+// (when the focused project is a subproject of an open .PrjMbd) and variants
 function GetProjectInfo(ROOT_DIR: String): String;
 var
-    Project      : IProject;
-    Doc          : IDocument;
-    ServerDoc    : IServerDocument;
-    ProjVariant  : IProjectVariant;
-    Variation    : IComponentVariation;
-    I, J         : Integer;
-    SchCount     : Integer;
-    ModifiedCount: Integer;
-    ResultProps  : TStringList;
-    ParamsArray  : TStringList;
-    DocsArray    : TStringList;
-    VariantsArray: TStringList;
-    VariationsArr: TStringList;
-    ItemProps    : TStringList;
-    OutputLines  : TStringList;
-    OpenState    : String;
+    Project         : IProject;
+    ChildPrj        : IProject;
+    Doc, ChildDoc   : IDocument;
+    ServerDoc       : IServerDocument;
+    ProjVariant     : IProjectVariant;
+    Variation       : IComponentVariation;
+    I, J            : Integer;
+    SchCount        : Integer;
+    ModifiedCount   : Integer;
+    ChildModified   : Integer;
+    ResultProps     : TStringList;
+    ParamsArray     : TStringList;
+    DocsArray       : TStringList;
+    SubprojectsArr  : TStringList;
+    SubProps        : TStringList;
+    SubDocsArray    : TStringList;
+    SubDocProps     : TStringList;
+    VariantsArray   : TStringList;
+    VariationsArr   : TStringList;
+    ItemProps       : TStringList;
+    OutputLines     : TStringList;
+    OpenState       : String;
+    ChildDocState   : String;
+    ParentPath      : String;
 begin
-    Project := GetWorkspace.DM_FocusedProject;
+    Project := FocusedDesignProject(0);
     if Project = Nil then
     begin
         Result := 'ERROR: No focused project';
@@ -1636,9 +1867,13 @@ begin
     ResultProps := TStringList.Create;
     ParamsArray := TStringList.Create;
     DocsArray := TStringList.Create;
+    SubprojectsArr := TStringList.Create;
     VariantsArray := TStringList.Create;
     try
         AddJSONProperty(ResultProps, 'project_path', Project.DM_ProjectFullPath);
+        ParentPath := ParentMultiboardProject(Project.DM_ProjectFullPath);
+        if (ParentPath <> '') then
+            AddJSONProperty(ResultProps, 'parent_project_path', ParentPath);
 
         for I := 0 to Project.DM_ParameterCount - 1 do
         begin
@@ -1657,17 +1892,72 @@ begin
         for I := 0 to Project.DM_LogicalDocumentCount - 1 do
         begin
             Doc := Project.DM_LogicalDocuments(I);
-            if Doc.DM_DocumentKind = 'SCH' then Inc(SchCount);
-            ServerDoc := Client.GetDocumentByPath(Doc.DM_FullPath);
-            if ServerDoc = Nil then
-                OpenState := 'closed'
-            else if ServerDoc.Modified then
+            if IsChildProjectEntry(Doc.DM_DocumentKind, Doc.DM_FullPath) then
             begin
-                OpenState := 'modified';
-                Inc(ModifiedCount);
+                ChildPrj := FindOpenProjectByPath(Doc.DM_FullPath);
+                ChildModified := 0;
+                SubProps := TStringList.Create;
+                SubDocsArray := TStringList.Create;
+                try
+                    if (ChildPrj = Nil) then
+                        OpenState := 'closed'
+                    else
+                    begin
+                        for J := 0 to ChildPrj.DM_LogicalDocumentCount - 1 do
+                        begin
+                            ChildDoc := ChildPrj.DM_LogicalDocuments(J);
+                            if (ChildDoc.DM_DocumentKind = 'SCH') then Inc(SchCount);
+                            ServerDoc := FindOpenDocument(ChildDoc.DM_FullPath);
+                            if (ServerDoc = Nil) then
+                                ChildDocState := 'closed'
+                            else if ServerDoc.Modified then
+                            begin
+                                ChildDocState := 'modified';
+                                Inc(ChildModified);
+                                Inc(ModifiedCount);
+                            end
+                            else
+                                ChildDocState := 'open';
+                            SubDocProps := TStringList.Create;
+                            try
+                                AddJSONProperty(SubDocProps, 'path', ChildDoc.DM_FullPath);
+                                AddJSONProperty(SubDocProps, 'kind', ChildDoc.DM_DocumentKind);
+                                AddJSONProperty(SubDocProps, 'state', ChildDocState);
+                                SubDocsArray.Add(BuildJSONObject(SubDocProps, 2));
+                            finally
+                                SubDocProps.Free;
+                            end;
+                        end;
+                        if (ChildModified > 0) then
+                            OpenState := 'modified'
+                        else
+                            OpenState := 'open';
+                    end;
+                    AddJSONProperty(SubProps, 'project_path', Doc.DM_FullPath);
+                    AddJSONProperty(SubProps, 'kind', Doc.DM_DocumentKind);
+                    AddJSONProperty(SubProps, 'state', OpenState);
+                    AddJSONInteger(SubProps, 'modified_document_count', ChildModified);
+                    SubProps.Add(BuildJSONArray(SubDocsArray, 'documents', 1));
+                    SubprojectsArr.Add(BuildJSONObject(SubProps, 1));
+                finally
+                    SubDocsArray.Free;
+                    SubProps.Free;
+                end;
             end
             else
-                OpenState := 'open';
+            begin
+                if Doc.DM_DocumentKind = 'SCH' then Inc(SchCount);
+                ServerDoc := FindOpenDocument(Doc.DM_FullPath);
+                if ServerDoc = Nil then
+                    OpenState := 'closed'
+                else if ServerDoc.Modified then
+                begin
+                    OpenState := 'modified';
+                    Inc(ModifiedCount);
+                end
+                else
+                    OpenState := 'open';
+            end;
             ItemProps := TStringList.Create;
             try
                 AddJSONProperty(ItemProps, 'path', Doc.DM_FullPath);
@@ -1704,6 +1994,9 @@ begin
         AddJSONInteger(ResultProps, 'schematic_sheet_count', SchCount);
         AddJSONInteger(ResultProps, 'modified_document_count', ModifiedCount);
         ResultProps.Add(BuildJSONArray(DocsArray, 'documents'));
+        if (SubprojectsArr.Count > 0) or
+           (UpperCase(ExtractFileExt(Project.DM_ProjectFullPath)) = '.PRJMBD') then
+            ResultProps.Add(BuildJSONArray(SubprojectsArr, 'subprojects'));
         ResultProps.Add(BuildJSONArray(VariantsArray, 'variants'));
 
         OutputLines := TStringList.Create;
@@ -1717,6 +2010,7 @@ begin
         ResultProps.Free;
         ParamsArray.Free;
         DocsArray.Free;
+        SubprojectsArr.Free;
         VariantsArray.Free;
     end;
 end;
@@ -1735,7 +2029,7 @@ var
     ItemProps   : TStringList;
     OutputLines : TStringList;
 begin
-    Project := GetWorkspace.DM_FocusedProject;
+    Project := FocusedDesignProject(0);
     if Project = Nil then
     begin
         Result := 'ERROR: No focused project';
@@ -1803,7 +2097,7 @@ var
     ResultProps : TStringList;
     OutputLines : TStringList;
 begin
-    Project := GetWorkspace.DM_FocusedProject;
+    Project := FocusedDesignProject(0);
     if Project = Nil then
     begin
         Result := 'ERROR: No focused project';
@@ -1862,22 +2156,24 @@ end;
 
 // Focused document and the project that contains it, without changing focus.
 // The focused PROJECT alone is unreliable: after a script run it is often the
-// script project itself, so the project is looked up from the document.
+// script project itself, so the project is looked up from the document (or
+// FocusedDesignProject when no editor tab is open).
 function GetActiveDocument(ROOT_DIR: String): String;
 var
     ResultProps : TStringList;
     OutputLines : TStringList;
     Project     : IProject;
-    Doc         : IDocument;
-    P, I        : Integer;
     DocPath     : String;
     DocKind     : String;
     PrjPath     : String;
+    ParentPath  : String;
     IsModified  : Boolean;
 begin
+    EnsureMultiboardSubprojectsOpen;
     DocPath := '';
     DocKind := '';
     PrjPath := '';
+    ParentPath := '';
     IsModified := False;
     if (Client.CurrentView <> nil) and (Client.CurrentView.OwnerDocument <> nil) then
     begin
@@ -1887,21 +2183,19 @@ begin
     end;
 
     if (DocPath <> '') then
-        for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
-        begin
-            Project := GetWorkspace.DM_Projects(P);
-            if (Project = nil) then Continue;
-            for I := 0 to Project.DM_LogicalDocumentCount - 1 do
-            begin
-                Doc := Project.DM_LogicalDocuments(I);
-                if (Doc <> nil) and (NormalizedPath(Doc.DM_FullPath) = NormalizedPath(DocPath)) then
-                begin
-                    PrjPath := Project.DM_ProjectFullPath;
-                    Break;
-                end;
-            end;
-            if (PrjPath <> '') then Break;
-        end;
+    begin
+        Project := FindProjectOfDocument(DocPath);
+        if (Project <> nil) then
+            PrjPath := Project.DM_ProjectFullPath;
+    end;
+    if (PrjPath = '') then
+    begin
+        Project := FocusedDesignProject(0);
+        if (Project <> nil) then
+            PrjPath := Project.DM_ProjectFullPath;
+    end;
+    if (PrjPath <> '') then
+        ParentPath := ParentMultiboardProject(PrjPath);
 
     ResultProps := TStringList.Create;
     OutputLines := TStringList.Create;
@@ -1910,6 +2204,8 @@ begin
         AddJSONProperty(ResultProps, 'document_kind', DocKind);
         AddJSONBoolean(ResultProps, 'document_modified', IsModified);
         AddJSONProperty(ResultProps, 'project_path', PrjPath);
+        if (ParentPath <> '') then
+            AddJSONProperty(ResultProps, 'parent_project_path', ParentPath);
         OutputLines.Text := BuildJSONObject(ResultProps);
         Result := WriteJSONToFile(OutputLines, ROOT_DIR + 'temp_active_document.json');
     finally

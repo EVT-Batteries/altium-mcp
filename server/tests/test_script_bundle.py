@@ -13,16 +13,18 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-import script_bundle as sb  # noqa: E402
+import script_bundle as sb
 
 
 def defined_before_use(text):
     """Routines used before their definition in a bundle (should be none)."""
     clean = sb._NOISE.sub(lambda m: " " * len(m.group(0)), text)
     defs = {}
-    for m in re.finditer(r"^(?:function|procedure)\s+(\w+)", text, re.M | re.I):
+    for m in re.finditer(r"^(?:function|procedure)\s+(\w+)", text, re.MULTILINE | re.IGNORECASE):
         defs.setdefault(m.group(1).lower(), m.start())
-    return [n for n, pos in defs.items() if re.search(r"\b" + n + r"\b", clean[:pos], re.I)]
+    return [
+        n for n, pos in defs.items() if re.search(r"\b" + n + r"\b", clean[:pos], re.IGNORECASE)
+    ]
 
 
 class BundleTests(unittest.TestCase):
@@ -33,19 +35,33 @@ class BundleTests(unittest.TestCase):
 
     def test_callees_come_first_and_globals_lead(self):
         with tempfile.TemporaryDirectory() as d:
-            a = self.write(d, "a.pas", "var\n    Counter: Integer;\n\n"
-                                       "// Entry point\nprocedure Run;\nbegin\n    Helper('x');\nend;\n")
-            b = self.write(d, "b.pas", "function Helper(S: String): String;\nbegin\n"
-                                       "    Result := S; // Run is not called here\nend;\n")
+            a = self.write(
+                d,
+                "a.pas",
+                "var\n    Counter: Integer;\n\n"
+                "// Entry point\nprocedure Run;\nbegin\n    Helper('x');\nend;\n",
+            )
+            b = self.write(
+                d,
+                "b.pas",
+                "function Helper(S: String): String;\nbegin\n"
+                "    Result := S; // Run is not called here\nend;\n",
+            )
             text = sb.bundle_text([a, b])
-            self.assertLess(text.index("Counter: Integer"), text.index("function Helper"))
+            self.assertLess(
+                text.index("Counter: Integer"), text.index("function Helper")
+            )
             self.assertLess(text.index("function Helper"), text.index("procedure Run"))
             self.assertIn("// Entry point", text)
             self.assertEqual(defined_before_use(text), [])
 
     def test_cycle_is_reported(self):
         with tempfile.TemporaryDirectory() as d:
-            a = self.write(d, "a.pas", "procedure A;\nbegin\n    B;\nend;\n\nprocedure B;\nbegin\n    A;\nend;\n")
+            a = self.write(
+                d,
+                "a.pas",
+                "procedure A;\nbegin\n    B;\nend;\n\nprocedure B;\nbegin\n    A;\nend;\n",
+            )
             with self.assertRaises(ValueError):
                 sb.bundle_text([a])
 
@@ -54,9 +70,26 @@ class BundleTests(unittest.TestCase):
         self.assertGreater(len(units), 5)
         text = sb.bundle_text(units)
         self.assertEqual(defined_before_use(text), [])
-        count = sum(len(re.findall(r"^(?:function|procedure)\s", p.read_text(encoding="latin-1"), re.M | re.I))
-                    for p in units)
-        self.assertEqual(len(re.findall(r"^(?:function|procedure)\s", text, re.M | re.I)), count)
+        count = sum(
+            len(
+                re.findall(
+                    r"^(?:function|procedure)\s",
+                    p.read_text(encoding="latin-1"),
+                    re.MULTILINE | re.IGNORECASE,
+                )
+            )
+            for p in units
+        )
+        self.assertEqual(
+            len(re.findall(r"^(?:function|procedure)\s", text, re.MULTILINE | re.IGNORECASE)), count
+        )
+        for helper in (
+            "EnsureMultiboardSubprojectsOpen",
+            "ParentMultiboardProject",
+            "FindProjectOfDocument",
+            "FocusedDesignProject",
+        ):
+            self.assertIn(helper, text)
 
     def test_rebuilds_when_a_unit_changes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -65,7 +98,9 @@ class BundleTests(unittest.TestCase):
             out = Path(d) / "bridge"
             first = sb.ensure_bundle(prj, out)
             self.assertEqual(sb.ensure_bundle(prj, out), first)
-            self.write(d, "u.pas", "procedure Run;\nbegin\n    ShowMessage('new');\nend;\n")
+            self.write(
+                d, "u.pas", "procedure Run;\nbegin\n    ShowMessage('new');\nend;\n"
+            )
             later = first.stat().st_mtime + 5
             os.utime(unit, (later, later))
             second = sb.ensure_bundle(prj, out)

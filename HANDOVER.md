@@ -47,6 +47,41 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 22 (2026-11-06): Multi-board (`.PrjMbd`) subproject visibility and lifecycle (uncommitted)
+In Altium's Projects panel, child subprojects (`.PrjHar`, `.PrjPcb`) of an open multi-board project
+(`.PrjMbd`) live nested under the `.PrjMbd` (never at the top level), and `Project.DM_LogicalDocuments`
+on the `.PrjMbd` lists them with `DM_DocumentKind = 'HarnessDesign'` or `'PcbProject'`.
+- **Child subproject visibility in `get_project_info` & `get_active_document` (`other_utils.pas`, `main.py`):**
+  Previously `GetProjectInfo` called `Client.GetDocumentByPath` on every `DM_LogicalDocuments` entry
+  of a `.PrjMbd`, reporting every child `.PrjHar`/`.PrjPcb` as `"state": "closed"`. `GetProjectInfo` now
+  detects child project entries (`IsChildProjectEntry`), looks up each child `IProject` in
+  `GetWorkspace.DM_Projects` (`FindOpenProjectByPath`), reports its state (`open` / `modified` / `closed`),
+  rolls up `modified_document_count` and `schematic_sheet_count` across child subprojects, includes a
+  `subprojects` array (`[{project_path, kind, state, modified_document_count, documents}]`) when the
+  focused project is a `.PrjMbd`, and includes `parent_project_path` (from `ParentMultiboardProject`)
+  when a child subproject is focused (also added to `GetActiveDocument`).
+- **Auto-loading missing child subprojects (`EnsureMultiboardSubprojectsOpen`):**
+  Project and document lookups (`FindProjectOfDocument`, `ProjectPathOfDocument`, `UnsavedProjectDocuments`,
+  `FocusedDesignProject`, `FocusBoardForCommand`, `EnsureDocumentFocused`, `GetOpenOutputJob`,
+  `GetActiveDocument`) ensure every existing child `.PrjHar`/`.PrjPcb` listed by an open `.PrjMbd` is
+  loaded into `GetWorkspace.DM_Projects`. `FocusBoardForCommand` also searches child `.PrjPcb` subprojects
+  of a focused `.PrjMbd` in its first pass.
+- **Preserving `.PrjMbd` hierarchy on `edit_harness_layout` project reload (`schematic_utils.pas`):**
+  Altium's `WorkspaceManager:CloseObject` (`ObjectKind=Project`) on a child subproject of an open `.PrjMbd`
+  closes the entire parent `.PrjMbd` and all of its child subprojects; reopening only the child `.PrjHar`
+  stranded it at the top level and left the `.PrjMbd` and sibling subprojects closed. `RELOADPROJECT` now
+  checks `UnsavedProjectDocuments` across the parent `.PrjMbd` and all its child subprojects before closing,
+  and reopens the parent `.PrjMbd` afterwards so all child subprojects remain nested under it.
+- **Preventing `"Free Documents"` from clobbering focused project tracking (`Altium_API.pas`, `other_utils.pas`):**
+  When all editor tabs are closed in Altium, `GetWorkspace.DM_FocusedProject` can report `"Free Documents"`,
+  which `IsScriptProject` previously treated as a design project and wrote to `last_project.txt`. Added
+  `IsNonDesignProject` and `FocusedDesignProject` so `EnsureDesignProjectFocused`, `GetProjectInfo`,
+  `GetERCViolations`, `GetProjectComponents`, and `GetActiveDocument` resolve the active or remembered
+  design project reliably even when all document tabs are closed.
+- **`import_harness_changes` on `.PrjMbd` (`main.py`):** `_harness_import_targets` and `import_harness_changes`
+  also accept a `.PrjMbd` path, expanding to the layouts and Draftsman drawings of its child `.PrjHar`
+  subprojects.
+
 ### Session 21 (2026-11-05): `add_harness_wiring(remove_objects=...)` (uncommitted)
 Wiring could be moved and renamed but not deleted (a splice that became unnecessary had to be
 deleted in the GUI). `remove_objects` deletes harness wires, splices and no-connects by

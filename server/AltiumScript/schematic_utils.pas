@@ -4632,42 +4632,44 @@ end;
 // Full path of the open project holding DocPath, or ''.
 function ProjectPathOfDocument(DocPath: String): String;
 var
-    p, i    : Integer;
     Project : IProject;
 begin
     Result := '';
-    for p := 0 to GetWorkspace.DM_ProjectCount - 1 do
-    begin
-        Project := GetWorkspace.DM_Projects(p);
-        for i := 0 to Project.DM_LogicalDocumentCount - 1 do
-            if (NormalizedPath(Project.DM_LogicalDocuments(i).DM_FullPath) = NormalizedPath(DocPath)) then
-            begin
-                Result := Project.DM_ProjectFullPath;
-                Exit;
-            end;
-    end;
+    Project := FindProjectOfDocument(DocPath);
+    if (Project <> nil) then
+        Result := Project.DM_ProjectFullPath;
 end;
 
-// File names of the documents of project PrjPath with unsaved changes,
-// comma separated ('' when none).
+// File names of the documents of project PrjPath (and its child subprojects
+// when PrjPath is a .PrjMbd) with unsaved changes, comma separated ('' when none).
 function UnsavedProjectDocuments(PrjPath: String): String;
 var
     p, i    : Integer;
     Project : IProject;
+    Doc     : IDocument;
     SD      : IServerDocument;
+    Want    : String;
 begin
     Result := '';
+    EnsureMultiboardSubprojectsOpen;
+    Want := NormalizedPath(PrjPath);
+    if (Want = '') then Exit;
     for p := 0 to GetWorkspace.DM_ProjectCount - 1 do
     begin
         Project := GetWorkspace.DM_Projects(p);
-        if (NormalizedPath(Project.DM_ProjectFullPath) = NormalizedPath(PrjPath)) then
+        if (Project = nil) then Continue;
+        if (NormalizedPath(Project.DM_ProjectFullPath) = Want) or
+           (NormalizedPath(ParentMultiboardProject(Project.DM_ProjectFullPath)) = Want) then
             for i := 0 to Project.DM_LogicalDocumentCount - 1 do
             begin
-                SD := Client.GetDocumentByPath(Project.DM_LogicalDocuments(i).DM_FullPath);
+                Doc := Project.DM_LogicalDocuments(i);
+                if (Doc = nil) or IsChildProjectEntry(Doc.DM_DocumentKind, Doc.DM_FullPath) then
+                    Continue;
+                SD := FindOpenDocument(Doc.DM_FullPath);
                 if (SD <> nil) and SD.Modified then
                 begin
                     if (Result <> '') then Result := Result + ', ';
-                    Result := Result + ExtractFileName(Project.DM_LogicalDocuments(i).DM_FullPath);
+                    Result := Result + ExtractFileName(Doc.DM_FullPath);
                 end;
             end;
     end;
@@ -4852,6 +4854,7 @@ var
     n            : Integer;
     ChildIter    : ISch_Iterator;
     PrjPath      : String;
+    ParentMbd    : String;
     Unsaved      : String;
     j            : Integer;
     InfoStr      : String;
@@ -4901,13 +4904,24 @@ begin
         end;
 
         // RELOADPROJECT: close the drawing's project and open it again (a
-        // load from disk makes new views the main ones), nothing else
+        // load from disk makes new views the main ones), nothing else. When
+        // the project is a child subproject of an open .PrjMbd, Altium's
+        // CloseObject closes the parent .PrjMbd and all its child projects,
+        // so unsaved changes are checked across the parent .PrjMbd and the
+        // parent .PrjMbd is reopened to keep child projects nested under it.
         if ReloadProject then
         begin
             PrjPath := ProjectPathOfDocument(DocPath);
+            ParentMbd := '';
             Unsaved := '';
             if (PrjPath <> '') then
-                Unsaved := UnsavedProjectDocuments(PrjPath);
+            begin
+                ParentMbd := ParentMultiboardProject(PrjPath);
+                if (ParentMbd <> '') then
+                    Unsaved := UnsavedProjectDocuments(ParentMbd)
+                else
+                    Unsaved := UnsavedProjectDocuments(PrjPath);
+            end;
             if (PrjPath = '') or (Unsaved <> '') then
             begin
                 Result := '{"success": false, "error": "project not reloaded: ' +
@@ -4923,10 +4937,21 @@ begin
             AddStringParameter('FileName', PrjPath);
             AddStringParameter('PromptToSave', 'False');
             RunProcess('WorkspaceManager:CloseObject');
-            ResetParameters;
-            AddStringParameter('ObjectKind', 'Project');
-            AddStringParameter('FileName', PrjPath);
-            RunProcess('WorkspaceManager:OpenObject');
+            if (ParentMbd <> '') and (FindOpenProjectByPath(ParentMbd) = nil) then
+            begin
+                ResetParameters;
+                AddStringParameter('ObjectKind', 'Project');
+                AddStringParameter('FileName', ParentMbd);
+                RunProcess('WorkspaceManager:OpenObject');
+            end;
+            EnsureMultiboardSubprojectsOpen;
+            if (FindOpenProjectByPath(PrjPath) = nil) then
+            begin
+                ResetParameters;
+                AddStringParameter('ObjectKind', 'Project');
+                AddStringParameter('FileName', PrjPath);
+                RunProcess('WorkspaceManager:OpenObject');
+            end;
             ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
             if (ServerDoc <> nil) then
                 Client.ShowDocument(ServerDoc);
@@ -5369,7 +5394,13 @@ begin
         begin
             PrjPath := ProjectPathOfDocument(DocPath);
             if (PrjPath <> '') then
-                Unsaved := UnsavedProjectDocuments(PrjPath);
+            begin
+                ParentMbd := ParentMultiboardProject(PrjPath);
+                if (ParentMbd <> '') then
+                    Unsaved := UnsavedProjectDocuments(ParentMbd)
+                else
+                    Unsaved := UnsavedProjectDocuments(PrjPath);
+            end;
             if (PrjPath = '') then
                 Misses.Add('physical_view_not_rendered:document is in no open project')
             else if (Unsaved <> '') then

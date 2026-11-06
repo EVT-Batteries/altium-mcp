@@ -1603,64 +1603,69 @@ end;
 
 function IsScriptProject(Project: IProject): Boolean;
 begin
-    Result := UpperCase(ExtractFileExt(Project.DM_ProjectFullPath)) = '.PRJSCR';
+    Result := IsNonDesignProject(Project);
 end;
 
-// A script that crashes into the debugger leaves its script project focused,
-// and project-level commands (project info, ERC, ...) would then act on it.
-// Remember the last design project and bring it back to the front instead.
+// A script that crashes into the debugger leaves its script project focused
+// (and closing all tabs leaves "Free Documents" focused), and project-level
+// commands (project info, ERC, ...) would then act on it. Remember the last
+// design project and bring it back to the front instead.
 procedure EnsureDesignProjectFocused();
 var
-    Project, Candidate : IProject;
-    Doc : IDocument;
-    ServerDoc : IServerDocument;
-    LastPath, StoreFile : String;
-    Store : TStringList;
-    P, I : Integer;
+    Project, ChildPrj : IProject;
+    Doc               : IDocument;
+    ServerDoc         : IServerDocument;
+    Store             : TStringList;
+    I, J              : Integer;
 begin
-    StoreFile := ROOT_DIR + 'last_project.txt';
+    EnsureMultiboardSubprojectsOpen;
     Project := GetWorkspace.DM_FocusedProject;
-    Store := TStringList.Create;
-    try
-        if (Project <> Nil) and not IsScriptProject(Project) then
-        begin
+    if not IsNonDesignProject(Project) then
+    begin
+        Store := TStringList.Create;
+        try
             Store.Text := Project.DM_ProjectFullPath;
-            Store.SaveToFile(StoreFile);
+            try
+                Store.SaveToFile(LAST_PROJECT_FILE);
+            except
+            end;
+        finally
+            Store.Free;
+        end;
+        Exit;
+    end;
+
+    Project := FocusedDesignProject(0);
+    if (Project = Nil) then Exit;
+
+    // Showing one of its already open documents (or a child subproject's
+    // open document for a .PrjMbd) makes it the focused project
+    for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+    begin
+        Doc := Project.DM_LogicalDocuments(I);
+        if IsChildProjectEntry(Doc.DM_DocumentKind, Doc.DM_FullPath) then
+        begin
+            ChildPrj := FindOpenProjectByPath(Doc.DM_FullPath);
+            if (ChildPrj <> Nil) then
+                for J := 0 to ChildPrj.DM_LogicalDocumentCount - 1 do
+                begin
+                    ServerDoc := FindOpenDocument(ChildPrj.DM_LogicalDocuments(J).DM_FullPath);
+                    if (ServerDoc <> Nil) then
+                    begin
+                        Client.ShowDocument(ServerDoc);
+                        Exit;
+                    end;
+                end;
         end
         else
         begin
-            LastPath := '';
-            if FileExists(StoreFile) then
+            ServerDoc := FindOpenDocument(Doc.DM_FullPath);
+            if (ServerDoc <> Nil) then
             begin
-                Store.LoadFromFile(StoreFile);
-                if Store.Count > 0 then LastPath := UpperCase(Trim(Store[0]));
+                Client.ShowDocument(ServerDoc);
+                Exit;
             end;
-
-            // The remembered project if it is still open, else the first design project
-            Candidate := Nil;
-            for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
-            begin
-                Project := GetWorkspace.DM_Projects(P);
-                if (Project <> Nil) and not IsScriptProject(Project) then
-                    if (Candidate = Nil) or (UpperCase(Project.DM_ProjectFullPath) = LastPath) then
-                        Candidate := Project;
-            end;
-
-            // Showing one of its already open documents makes it the focused project
-            if Candidate <> Nil then
-                for I := 0 to Candidate.DM_LogicalDocumentCount - 1 do
-                begin
-                    Doc := Candidate.DM_LogicalDocuments(I);
-                    ServerDoc := Client.GetDocumentByPath(Doc.DM_FullPath);
-                    if ServerDoc <> Nil then
-                    begin
-                        Client.ShowDocument(ServerDoc);
-                        Break;
-                    end;
-                end;
         end;
-    finally
-        Store.Free;
     end;
 end;
 

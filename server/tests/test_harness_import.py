@@ -145,6 +145,17 @@ class TestImportHarnessChanges(unittest.IsolatedAsyncioTestCase):
         targets = main._harness_import_targets(self.project)
         self.assertEqual([t.name for t in targets], ["Test.LdrDoc", "Test.HarDwf"])
         self.assertEqual(main._harness_import_targets(self.drawing), [self.drawing])
+        mbd = self.project.parent / "System.PrjMbd"
+        mbd.write_text(
+            "[Document1]\nDocumentPath=System.MbsDoc\n\n"
+            "[Document2]\nDocumentPath=Test.PrjHar\n\n"
+            "[Document3]\nDocumentPath=Board.PrjPcb\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            [t.name for t in main._harness_import_targets(mbd)],
+            ["Test.LdrDoc", "Test.HarDwf"],
+        )
 
     async def test_rejects_other_documents(self):
         data = json.loads(
