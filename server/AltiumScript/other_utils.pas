@@ -512,6 +512,24 @@ begin
             Result := '{"success": false, "error": "document_path is required"}';
             Exit;
         end;
+        if IsChildProjectEntry('', DocPath) or
+           (UpperCase(ExtractFileExt(DocPath)) = '.PRJMBD') then
+        begin
+            if (Action = 'open') and (FindOpenProjectByPath(DocPath) = nil) then
+            begin
+                ResetParameters;
+                AddStringParameter('ObjectKind', 'Project');
+                AddStringParameter('FileName', DocPath);
+                RunProcess('WorkspaceManager:OpenObject');
+            end;
+            EnsureMultiboardSubprojectsOpen;
+            IsOpen := 'false';
+            if (FindOpenProjectByPath(DocPath) <> nil) then
+                IsOpen := 'true';
+            Result := '{"success": true, "action": "' + Action + '", "open": ' + IsOpen +
+                      ', "modified": false}';
+            Exit;
+        end;
         ServerDoc := FindOpenDocument(DocPath);
         if (Action = 'close') and (ServerDoc <> nil) then
         begin

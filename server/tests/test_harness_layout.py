@@ -288,6 +288,29 @@ class TestBuildLayoutSpec(unittest.TestCase):
             [["CPUNASSIGN", "UCP1", "USP1"], ["CPASSIGN", "UCPP1", "USP1"]],
         )
 
+    def test_stale_assigned_object_does_not_block_delete_or_release(self):
+        # Import Changes deletes a removed splice record but leaves its old
+        # UniqueID in ConnectionPointAssignedObjects; parse_ldrdoc then reports
+        # that raw UID in cp["objects"] even though no live object has it.
+        layout = make_layout()
+        layout["splices"] = []
+        layout["bundles"] = []
+        layout["connection_points"][1]["objects"] = ["USTALE"]
+        layout["connection_points"][1]["bundles"] = []
+
+        spec = build_layout_spec(layout, delete=["CP1"])
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(records_of(spec, "DELETE"), [["DELETE", "UCP1"]])
+
+        spec = build_layout_spec(
+            layout,
+            connection_points=[{"designator": "CP1", "release": ["USTALE"]}],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(
+            records_of(spec, "CPUNASSIGN"), [["CPUNASSIGN", "UCP1", "USTALE"]]
+        )
+
     def test_wire_end_no_connect_can_be_held(self):
         # A free wire end (no-connect) is held like a splice, so its wire routes
         self.layout["no_connects"] = [
@@ -358,11 +381,15 @@ class TestBuildLayoutSpec(unittest.TestCase):
         problems, _ = check_layout(layout, expect)
         self.assertEqual(
             problems,
-            ["covering COV2: start offset is 0.0 mm in the saved drawing, not -10.0 mm"],
+            [
+                "covering COV2: start offset is 0.0 mm in the saved drawing, not -10.0 mm"
+            ],
         )
         cov["start_offset"] = {"mils": -393.7008, "mm": -10.0}
         self.assertEqual(check_layout(layout, expect)[0], [])
-        problems, _ = check_layout(layout, {"covering_offsets": {"UCOV9": {"end": 1.0}}})
+        problems, _ = check_layout(
+            layout, {"covering_offsets": {"UCOV9": {"end": 1.0}}}
+        )
         self.assertEqual(problems, ["covering UCOV9: not in the saved drawing"])
 
     def test_delete_and_record_order(self):
@@ -756,7 +783,10 @@ class TestTwistRouting(unittest.TestCase):
             {"RECORD": "113", "OwnerIndex": "0", "UniqueID": "UP2", "Designator": "2"},
             {"RECORD": "120", "UniqueID": "UNC1", "Designator": "NC1"},
             {"RECORD": "120", "UniqueID": "UNC2", "Designator": "NC2"},
-            *[{"RECORD": "110", "UniqueID": cp} for cp in ("UCPJ", "UCP4", "UCP5", "UCP6")],
+            *[
+                {"RECORD": "110", "UniqueID": cp}
+                for cp in ("UCPJ", "UCP4", "UCP5", "UCP6")
+            ],
             {
                 "RECORD": "115",
                 "Name": "W1",
@@ -803,9 +833,7 @@ class TestTwistRouting(unittest.TestCase):
         self.assertEqual(layout["unrouted_wires"], ["W1", "W2"])
         self.assertIsNone(wires["W1"]["route"])
         self.assertIn("twisted with W2", wires["W1"]["unrouted_reason"])
-        self.assertEqual(
-            sorted(unrouted_reasons(layout)), ["W1", "W2"]
-        )
+        self.assertEqual(sorted(unrouted_reasons(layout)), ["W1", "W2"])
         self.assertTrue(all(b["wires"] == [] for b in layout["bundles"]))
 
     def test_same_wires_untwisted_are_routed(self):

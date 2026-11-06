@@ -4240,11 +4240,8 @@ begin
             TargetDoc.SchIterator_Destroy(Iter);
             if (Obj <> nil) or ForceReload then
             begin
-                ResetParameters;
-                AddStringParameter('Action', 'Close');
-                AddStringParameter('FileName', TargetDocPath);
-                AddStringParameter('PromptToSave', 'False');
-                RunProcess('WorkspaceManager:CloseObject');
+                TargetDoc := nil;
+                Client.CloseDocument(ServerDoc);
                 ServerDoc := Client.OpenDocument('HarnessWiringDiagram', TargetDocPath);
                 if (ServerDoc <> nil) then
                 begin
@@ -5419,13 +5416,12 @@ begin
 
         // Bundle ends connect to the connection points under them only when
         // Altium loads the drawing: close it, open it again, save the links.
+        // Client.CloseDocument closes only the document tab (never the owning
+        // project or parent .PrjMbd, which WorkspaceManager:CloseObject closed).
         if Saved and GeoChanged then
         begin
-            ResetParameters;
-            AddStringParameter('Action', 'Close');
-            AddStringParameter('FileName', DocPath);
-            AddStringParameter('PromptToSave', 'False');
-            RunProcess('WorkspaceManager:CloseObject');
+            Doc := nil;
+            Client.CloseDocument(ServerDoc);
             ServerDoc := Client.OpenDocument('HarnessLayoutDrawing', DocPath);
             if (ServerDoc <> nil) then
             begin

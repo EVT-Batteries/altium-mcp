@@ -449,7 +449,9 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         routed = [i for i in members if routes[i] is not None]
         if len(routed) < 2:
             continue
-        shared = set.intersection(*({b["unique_id"] for b in routes[i]} for i in routed))
+        shared = set.intersection(
+            *({b["unique_id"] for b in routes[i]} for i in routed)
+        )
         if shared:
             continue
         names = [wires[i]["designator"] for i in routed]
@@ -798,12 +800,14 @@ def build_layout_spec(
                 f"delete: no bundle, covering, label or connection point '{ref}'"
             )
             continue
-        if ref in cps and cps[ref].get("objects"):
-            errors.append(
-                f"delete: connection point '{ref}' holds {cps[ref]['objects']}; "
-                "assign them to another connection point first"
-            )
-            continue
+        if ref in cps:
+            live_objs = [o for o in cps[ref].get("objects", []) if o in held]
+            if live_objs:
+                errors.append(
+                    f"delete: connection point '{ref}' holds {live_objs}; "
+                    "assign them to another connection point first"
+                )
+                continue
         deleted.add(obj["unique_id"])
         delete_records.append(["DELETE", obj["unique_id"]])
 
@@ -997,14 +1001,11 @@ def build_layout_spec(
         for obj_des in item.get("release") or []:
             obj = held.get(obj_des)
             old = holder.get(obj_des)
-            if (
-                obj is None
-                or old is None
-                or old["designator"] != (cp or {}).get("designator")
-            ):
+            if old is None or cp is None or old["unique_id"] != cp["unique_id"]:
                 errors.append(f"connection point '{des}': does not hold '{obj_des}'")
                 continue
-            assign_records.append(["CPUNASSIGN", old["unique_id"], obj["unique_id"]])
+            obj_uid = obj["unique_id"] if obj is not None else obj_des
+            assign_records.append(["CPUNASSIGN", old["unique_id"], obj_uid])
             holder.pop(obj_des)
 
     # Connector connection points moved above but not listed explicitly
@@ -1427,7 +1428,9 @@ def check_layout(
         ):
             problems.append(f"wire {des}: length not set to {mm} mm")
     coverings = {c["unique_id"]: c for c in layout.get("coverings", [])}
-    coverings.update({c["designator"]: c for c in layout.get("coverings", []) if c["designator"]})
+    coverings.update(
+        {c["designator"]: c for c in layout.get("coverings", []) if c["designator"]}
+    )
     for key, offsets in expect.get("covering_offsets", {}).items():
         c = coverings.get(key)
         if c is None:

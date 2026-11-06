@@ -1,7 +1,7 @@
 # Handover: altium-mcp harness support
 
-Updated 2026-11-03 (session 17: upstream v0.6.1 merged; session 16: `import_harness_changes`;
-session 15: Draftsman harness drawings, `.HarDwf`) for a fresh agent session.
+Updated 2026-11-06 (session 22: multi-board subproject visibility and lifecycle, document reload
+safety in child projects, layout connection point deletion with stale IDs).
 Read this, then the skill `.agents/skills/altium-mcp-development/SKILL.md`
 (+ `references/wirdoc-format.md`) before touching anything, and `AGENTS.md`: this file
 stays project-agnostic like the code (no design, workspace, company or user names, no machine
@@ -34,13 +34,12 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `64a409c` (sessions 17-18: v0.6.1 merge, fixture tests, project-agnostic pass) | session 19: fixes of the six regression bugs (§8 item 8), not committed; the user commits |
+| `altium-mcp/` | `feature/harness-support` | `ef585d9` (session 22: refactor project handling in Altium API) | session 22: document reload project isolation, layout stale ID deletion fix; the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
-`a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`. Unit
-tests (2026-10-29): 192
-passed, 7 skipped, 13 pre-existing failures (§8 item 2).
+`a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`,
+session 21 `3507e5d`, session 22 `ef585d9`. Unit tests: 410 passed, 7 skipped.
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
@@ -66,12 +65,22 @@ on the `.PrjMbd` lists them with `DM_DocumentKind = 'HarnessDesign'` or `'PcbPro
   `GetActiveDocument`) ensure every existing child `.PrjHar`/`.PrjPcb` listed by an open `.PrjMbd` is
   loaded into `GetWorkspace.DM_Projects`. `FocusBoardForCommand` also searches child `.PrjPcb` subprojects
   of a focused `.PrjMbd` in its first pass.
-- **Preserving `.PrjMbd` hierarchy on `edit_harness_layout` project reload (`schematic_utils.pas`):**
+- **Preserving `.PrjMbd` hierarchy on document and project reloads (`schematic_utils.pas`):**
   Altium's `WorkspaceManager:CloseObject` (`ObjectKind=Project`) on a child subproject of an open `.PrjMbd`
   closes the entire parent `.PrjMbd` and all of its child subprojects; reopening only the child `.PrjHar`
   stranded it at the top level and left the `.PrjMbd` and sibling subprojects closed. `RELOADPROJECT` now
   checks `UnsavedProjectDocuments` across the parent `.PrjMbd` and all its child subprojects before closing,
-  and reopens the parent `.PrjMbd` afterwards so all child subprojects remain nested under it.
+  and reopens the parent `.PrjMbd` afterwards so all child subprojects remain nested under it. In addition,
+  the document-reload steps in `ExecuteAddHarnessWiring` and `ExecuteEditHarnessLayout` previously called
+  `RunProcess('WorkspaceManager:CloseObject')` with `FileName=DocPath` and no `ObjectKind`, which in Altium
+  closed the focused project (`.PrjMbd`) and reopened the document under `"Free Documents"`; both now use
+  `Client.CloseDocument(ServerDoc)` (matching `ExecuteMultiboardDocument`), closing only the document tab.
+- **Allowing `edit_harness_layout` to delete or release connection points holding deleted splice/no-connect IDs (`harness_layout.py`):**
+  When Altium's `Import Changes` removes a splice or no-connect from a `.LdrDoc`, it deletes the record
+  (`RECORD=116`/`119`) so the object is no longer in `layout["splices"]`/`layout["no_connects"]`, but leaves
+  the deleted object's `UniqueID` in the connection point's `ConnectionPointAssignedObjects` stream
+  (`cp["objects"]`). `build_layout_spec` now filters `cp["objects"]` to live objects (`[o for o in cps[ref].get("objects", []) if o in held]`)
+  before checking whether `delete` is blocked, and allows `release` to unassign a stale `UniqueID` directly.
 - **Preventing `"Free Documents"` from clobbering focused project tracking (`Altium_API.pas`, `other_utils.pas`):**
   When all editor tabs are closed in Altium, `GetWorkspace.DM_FocusedProject` can report `"Free Documents"`,
   which `IsScriptProject` previously treated as a design project and wrote to `last_project.txt`. Added

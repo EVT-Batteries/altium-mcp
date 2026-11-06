@@ -20,10 +20,14 @@ def defined_before_use(text):
     """Routines used before their definition in a bundle (should be none)."""
     clean = sb._NOISE.sub(lambda m: " " * len(m.group(0)), text)
     defs = {}
-    for m in re.finditer(r"^(?:function|procedure)\s+(\w+)", text, re.MULTILINE | re.IGNORECASE):
+    for m in re.finditer(
+        r"^(?:function|procedure)\s+(\w+)", text, re.MULTILINE | re.IGNORECASE
+    ):
         defs.setdefault(m.group(1).lower(), m.start())
     return [
-        n for n, pos in defs.items() if re.search(r"\b" + n + r"\b", clean[:pos], re.IGNORECASE)
+        n
+        for n, pos in defs.items()
+        if re.search(r"\b" + n + r"\b", clean[:pos], re.IGNORECASE)
     ]
 
 
@@ -81,7 +85,12 @@ class BundleTests(unittest.TestCase):
             for p in units
         )
         self.assertEqual(
-            len(re.findall(r"^(?:function|procedure)\s", text, re.MULTILINE | re.IGNORECASE)), count
+            len(
+                re.findall(
+                    r"^(?:function|procedure)\s", text, re.MULTILINE | re.IGNORECASE
+                )
+            ),
+            count,
         )
         for helper in (
             "EnsureMultiboardSubprojectsOpen",
@@ -90,6 +99,11 @@ class BundleTests(unittest.TestCase):
             "FocusedDesignProject",
         ):
             self.assertIn(helper, text)
+        # WorkspaceManager:CloseObject is only used for RELOADPROJECT
+        # (ObjectKind=Project); document reloads use Client.CloseDocument so
+        # closing a document never closes its owning project or parent .PrjMbd.
+        self.assertEqual(text.count("RunProcess('WorkspaceManager:CloseObject')"), 1)
+        self.assertGreaterEqual(text.count("Client.CloseDocument("), 3)
 
     def test_rebuilds_when_a_unit_changes(self):
         with tempfile.TemporaryDirectory() as d:
