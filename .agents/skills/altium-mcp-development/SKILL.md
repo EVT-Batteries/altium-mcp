@@ -203,7 +203,11 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
 - Sheet-owned objects are those whose `Container.ObjectId` is the document's own ObjectId (79
   on a wiring diagram, 32 on a schematic); everything else travels with its parent.
 - Persist explicitly: `ServerDoc.Modified := True; ServerDoc.DoFileSave('')`, then report
-  `not ServerDoc.Modified` as the real save status.
+  `not DocumentModified(ServerDoc)` as the real save status.
+- Never read `IServerDocument.Modified` directly in a condition or an assignment: in a
+  script it then always reads False, even right after `Modified := True` (verified
+  2026-11-09: `if Doc.Modified` False, `BoolToStr(Doc.Modified, True)` 'True'). Use
+  `DocumentModified(Doc)` (`other_utils.pas`), which reads it through `BoolToStr`.
 - Keep CRLF line endings in `.pas` files (check: every line should end in `\r`).
 - Close a scratch document without saving:
   ```

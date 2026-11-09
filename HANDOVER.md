@@ -34,17 +34,49 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `ef585d9` (session 22: refactor project handling in Altium API) | session 22: document reload project isolation, layout stale ID deletion fix; the user commits |
+| `altium-mcp/` | `feature/harness-support` | `7ec4b71` (session 22) | session 23: upstream v0.6.2 + v0.7.0 merge (`origin/main` `ce74f33`), conflicts resolved; the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
 `a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`,
-session 21 `3507e5d`, session 22 `ef585d9`. Unit tests: 410 passed, 7 skipped.
+session 21 `3507e5d`, session 22 `ef585d9` / `7ec4b71`. Unit tests: 449 passed, 7 skipped (session 23).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 23 (2026-11-09): upstream v0.6.2 + v0.7.0 merged (uncommitted merge)
+`origin/main` (`ce74f33`, 27 commits: PCB layout / routing tools `get_layout`, `place_copper`,
+`get_unrouted_connections`, `fanout_pads`, `route_connections`; `project_path` on
+`get_erc_violations` / `get_project_components`; `board_path` on `place_components`;
+`_bridge_json`; `create_symbols_batch` long library paths, `PINFUNC`) merged into
+`feature/harness-support`. Conflicts: README, manifest, `other_utils.pas`, `main.py`.
+- `get_project_info` keeps our child-subproject listing; `TargetProject` (upstream) falls back
+  to our `FocusedDesignProject` instead of the raw focused project, so harness / multi-board
+  focus still resolves.
+- `get_erc_violations` / `get_project_components`: upstream `project_path` plus our harness
+  fallback. A `.PrjHar` `project_path` is accepted and read from the saved files (never sent
+  to Altium); a `.PrjPcb` goes to Altium; no path compiles the focused project and falls back
+  to the focused harness. Tests: `tests/test_compile_project_path.py`.
+- **`IServerDocument.Modified` read directly is always False in a script** (upstream finding,
+  reproduced here with a sandbox probe: after `Modified := True`, `if Doc.Modified` False,
+  `BoolToStr(Doc.Modified, True)` 'True'). Upstream's `DocumentModified()` now replaces every
+  direct read of ours: `multiboard_document` status / close (it could close a document with
+  unsaved edits, and the "no unsaved changes" guard of `edit_multiboard_schematic` /
+  `edit_harness_drawing` never tripped), `get_project_info` states, `UnsavedProjectDocuments`
+  (the import / project reload guard never tripped), the `saved` / `relinked` / `reloaded`
+  reports after `DoFileSave` (always true before), `get_active_document` `document_modified`.
+  `DocumentModified` moved up next to `FindOpenDocument` (its first caller).
+- Regression: disk tools (`get_harness_data` on every `.PrjHar` / `.WirDoc` / `.LdrDoc`,
+  `check_harness_wiring` on every `.WirDoc`, `get_harness_drawing_data` on every `.HarDwf`,
+  `get_multiboard_data`; 49 calls) byte-identical between pre-merge `7ec4b71` and the merge.
+  Live with the merged bundle: `get_server_status`, `get_project_info`, `get_erc_violations` /
+  `get_project_components` (focused and `.PrjHar` path), `get_screenshot` (WirDoc, LdrDoc,
+  mbs, dwf), `add_harness_wiring` (labels, wire_updates, remove_objects; `saved: true`,
+  UniqueIDs kept) and `sync_harness_library` on a renamed scratch copy of a wiring diagram,
+  `edit_harness_drawing` / `edit_multiboard_schematic` dry runs. Not run live:
+  `import_harness_changes`, `edit_harness_layout` writes, `copy_objects`, the new PCB tools.
 
 ### Session 22 (2026-11-06): Multi-board (`.PrjMbd`) subproject visibility and lifecycle (uncommitted)
 In Altium's Projects panel, child subprojects (`.PrjHar`, `.PrjPcb`) of an open multi-board project

@@ -5,13 +5,15 @@ import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # Tk only serves the file dialogs that ask for a missing path. A Python built
 # without it (some uv-managed builds) still runs the server and the tests;
@@ -23,6 +25,7 @@ except ImportError:
     tk = filedialog = None
 
 import label_blocks
+import pcb_layout
 import pcblib_file
 import routing
 import sandbox
@@ -34,7 +37,12 @@ import win32gui
 import win32process
 import win32ui
 import win_processes
-from altium_files import long_path, read_altium_text, write_altium_text
+from altium_files import (
+    long_path,
+    read_altium_text,
+    spec_with_long_library,
+    write_altium_text,
+)
 from altium_install import find_altium_exe
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from exchange_lock import ExchangeLock
@@ -4612,6 +4620,14 @@ async def check_schematic(ctx: Context, path: str, max_issues_per_sheet: int = 1
         above it. Both go above: file name on the top edge, designator a line
         (100 mil) above it, both bottom-left justified at the left edge.
       * label_orientation, label_off_wire, dangling_wire, wire_through_body.
+      * pin_off_grid - a part whose pins sit a few microns (up to 1 mil) off
+        the grid. Every wire drawn to them comes out slanted. When the part
+        itself is on the grid its drawing was shifted from its origin. When
+        every pin is off by the same amount, suggest gives the fix:
+        move_component_to (an on-grid position for edit_schematic's
+        move_component) when the whole part is that far off the grid, else
+        shift_contents_by. Pins off by different amounts get no suggestion:
+        the symbol needs fixing in its library.
       * slanted_wire - a wire segment a little (1 um to half a grid) out of
         level or plumb. It looks straight, but dragging a part on it turns it
         diagonal. Usually a symbol whose pins are off the grid (then the
@@ -4727,6 +4743,18 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
                                 altium-script skill, SCH_API_Reference.md,
                                 TIeeeSymbol). An unknown edge or symbol is
                                 reported under problems.
+            PINFUNC|<pin number>|<F1>/<F2>/...   optional: replace the
+                                Functions list (Properties panel > Pin >
+                                Functions) of every pin with that number,
+                                in the order given, e.g.
+                                PINFUNC|23|ETH1_MDIO/USART2_TX/TIM2_CH3.
+                                Use it only when the user asks for pin
+                                functions; nothing sets them otherwise, not
+                                even from a pin name with '/' in it. Names
+                                cannot contain '/' or '|'. A script cannot
+                                clear the list, so an empty one is reported
+                                under problems; Altium merges repeated names,
+                                and a stored list that differs is reported.
             These records work after SYMBOL and EDITSYMBOL alike.
             Each SYMBOL or EDITSYMBOL line starts a new symbol; the other
             records belong to the most recent one.
@@ -4741,9 +4769,30 @@ async def create_symbols_batch(ctx: Context, spec_file: str) -> str:
     """
     logger.info(f"Creating symbols batch from {spec_file}")
 
-    response = await altium_bridge.execute_command(
-        "create_symbols_batch", {"spec_file": spec_file}
-    )
+    # The script opens or focuses the LIBRARY| path as written, so a short
+    # (8.3) or forward-slash path would open a second copy of a library that
+    # is open. Altium gets a copy with the long path; the caller's file is
+    # left as it is.
+    copy = None
+    try:
+        fixed = spec_with_long_library(read_altium_text(spec_file))
+    except OSError:
+        fixed = None  # missing or unreadable: the script reports it
+    if fixed is not None:
+        fd, copy = tempfile.mkstemp(prefix="symbols_spec_", suffix=".txt", dir=EXCHANGE_DIR)
+        os.close(fd)
+        write_altium_text(copy, fixed)
+    try:
+        response = await altium_bridge.execute_command(
+            "create_symbols_batch",
+            {"spec_file": copy or spec_file}
+        )
+    finally:
+        if copy:
+            try:
+                os.remove(copy)
+            except OSError:
+                pass
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -4786,8 +4835,9 @@ async def get_symbol_primitives(ctx: Context, library_path: str = "", symbol_nam
              parameter now. Pins also carry
              description, symbol_inside, symbol_inside_edge,
              symbol_outside_edge and symbol_outside (IEEE symbol names as
-             PINSYMBOL takes them), and their parameters [{name, value}]
-             when they have any
+             PINSYMBOL takes them), their parameters [{name, value}]
+             when they have any, and functions ["ETH1_MDIO", ...] (the
+             Functions list, as PINFUNC sets it) when they have any
     """
     logger.info(
         f"Getting symbol primitives (library={library_path}, symbol={symbol_name})"
@@ -4965,7 +5015,7 @@ async def move_components(ctx: Context, cmp_designators: list, x_offset: float, 
     return json.dumps({"success": True, "result": result}, indent=2)
 
 @_tool()
-async def place_components(ctx: Context, placements: list) -> str:
+async def place_components(ctx: Context, placements: list, board_path: str = "") -> str:
     """
     Place multiple components at absolute positions in a single Altium transaction.
 
@@ -4986,6 +5036,17 @@ async def place_components(ctx: Context, placements: list) -> str:
             - layer (str, optional): "top" or "bottom" to set the board side
               (the footprint is mirrored when flipped). Omit to keep the
               current side.
+            - locked (bool, optional): lock (true) or unlock (false) the
+              component; omit to leave it as it is.
+            - designator_text, comment_text (dict, optional): put the
+              designator or comment text at {x, y (its anchor, as get_layout
+              reports it), rotation, height, stroke_width, visible,
+              autoposition ("manual" by default, or top_left ... bottom_right
+              as get_layout reports it)} after the move. Omit to let it move
+              with the part. (set_designator_positions places by centre.)
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used. Give it whenever more
+            than one board is open, so the parts move on the right one.
 
     Example:
         placements=[{"designator": "R1", "x": 1000, "y": 2000, "rotation": 90},
@@ -5024,8 +5085,19 @@ async def place_components(ctx: Context, placements: list) -> str:
             errors.append(f"placements[{idx}] layer must be 'top' or 'bottom'")
             continue
 
+        locked = placement.get("locked")
+        if locked is not None and not isinstance(locked, bool):
+            errors.append(f"placements[{idx}] locked must be true or false")
+            continue
+        lock = "" if locked is None else ("1" if locked else "0")
         try:
-            entry = f"{designator}|{float(x)}|{float(y)}|{float(rotation)}|{layer}"
+            texts = "|".join(pcb_layout.text_spec(placement.get(k), f"placements[{idx}] {k}")
+                             for k in ("designator_text", "comment_text"))
+        except pcb_layout.LayoutError as e:
+            errors.append(str(e))
+            continue
+        try:
+            entry = f"{designator}|{float(x)}|{float(y)}|{float(rotation)}|{layer}|{lock}|{texts}"
         except (TypeError, ValueError):
             errors.append(f"placements[{idx}] x, y, and rotation must be numbers")
             continue
@@ -5036,9 +5108,10 @@ async def place_components(ctx: Context, placements: list) -> str:
     if not entries:
         return json.dumps({"success": False, "error": "No placements provided"})
 
-    response = await altium_bridge.execute_command(
-        "place_components", {"placements": entries}
-    )
+    params = {"placements": entries}
+    if board_path:
+        params["board_path"] = long_path(board_path)
+    response = await altium_bridge.execute_command("place_components", params)
 
     if not response.get("success", False):
         error_msg = response.get("error", "Unknown error")
@@ -5607,8 +5680,249 @@ async def place_cutout(ctx: Context, outline: list, kind: str = "polygon", layer
     result = response.get("result", {})
     return json.dumps(result, indent=2) if not isinstance(result, str) else result
 
+@_tool()
+async def repour_polygons(ctx: Context, names: list = None, net: str = "", layer: str = "",
+                          area: list = None, include_shelved: bool = False, board_path: str = "") -> str:
+    """
+    Repour polygon pours on a PCB: all of them, or the ones the filters pick.
+
+    Repour after moving parts, tracks or vias through a pour, or after
+    changing clearance or polygon connect rules; Altium does not repour by
+    itself. The whole repour is one undo step.
+
+    Filters combine; with none, every polygon on the board is repoured.
+
+    Args:
+        names (list): Polygon names, any case. Names need not be unique (a
+            "GND" pour on each layer is common), so add layer to pick one.
+        net (str): Only polygons on this net.
+        layer (str): Only polygons on this signal layer, by stack name or
+            Altium's name ("Top Layer").
+        area (list): [x1, y1, x2, y2] in mils from the board origin: only
+            polygons overlapping it, e.g. around an edit. Overlapping, so a
+            whole-board pour counts for any area on it.
+        include_shelved (bool): Also repour shelved polygons, which
+            unshelves them. By default they are left shelved and listed.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with how many polygons were repoured and, for each, its
+             name, layer, net and poured_regions (separate pieces of
+             copper) and hatch_tracks. shelved_skipped lists the shelved
+             polygons that matched and were left alone.
+    """
+    import pcb_shapes
+
+    board_path = long_path(board_path)
+    names, encoded, error = pcb_shapes.polygon_names(names)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    box, error = pcb_shapes.area_box(area)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    logger.info(f"Repouring polygons (names={names or 'any'}, net={net or 'any'}, layer={layer or 'any'})")
+    response = await altium_bridge.execute_command("repour_polygons", {
+        "names": encoded, "net": net, "layer": layer, "area": box,
+        "include_shelved": "true" if include_shelved else "false", "board_path": board_path})
+    if not response.get("success", False):
+        return json.dumps({"success": False,
+                           "error": f"Failed to repour: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        return result
+    missing = pcb_shapes.unmatched_names(names, result)
+    if missing:
+        result["names_not_matched"] = missing
+    if not result.get("repoured") and not result.get("shelved_skipped"):
+        result["warning"] = "No polygon matched the filters."
+    return json.dumps(result, indent=2)
+
 # Change the design: a timeout leaves their outcome unknown, so no blind retry
-MUTATING_COMMANDS.update({"create_polygon_pour", "create_cutout"})
+MUTATING_COMMANDS.update({"create_polygon_pour", "create_cutout", "repour_polygons"})
+
+@_tool(read_only=True)
+async def get_pour_report(ctx: Context, names: list = None, net: str = "", layer: str = "",
+                          area: list = None, sliver_sq_mils: float = 100, board_path: str = "") -> str:
+    """
+    Check what polygon pours poured: islands, slivers, and pours with no net
+    or no copper. Read only; repour first (repour_polygons) to check the
+    copper as the rules now make it.
+
+    Each polygon is listed with its pieces of solid copper and their sizes,
+    and flags:
+      * islands - poured into more than one separate piece;
+      * slivers - a piece smaller than sliver_sq_mils;
+      * no_net - the polygon has no net (dead copper);
+      * no_copper - poured nothing (no room, or all removed as dead copper);
+      * shelved - shelved, so it has no copper now.
+    A piece's area is its outline, holes not subtracted: an upper bound.
+
+    Args:
+        names, net, layer, area: Filters, as for repour_polygons; with none,
+            every polygon on the board.
+        sliver_sq_mils (float): A piece below this area is a sliver
+            (default 100 sq mil).
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with each polygon (name, layer, net, pieces, smallest
+             piece, copper area, slivers, flags) and the flagged ones first.
+    """
+    import pcb_shapes
+
+    names, encoded, error = pcb_shapes.polygon_names(names)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    box, error = pcb_shapes.area_box(area)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if (not isinstance(sliver_sq_mils, (int, float)) or isinstance(sliver_sq_mils, bool)
+            or not sliver_sq_mils >= 0 or sliver_sq_mils == float("inf")):
+        return json.dumps({"success": False, "error": "sliver_sq_mils must be a number of at least 0"})
+    response = await altium_bridge.execute_command("pour_report", {
+        "names": encoded, "net": net, "layer": layer, "area": box,
+        # Altium reads it as a 32-bit integer; no piece of copper is near this
+        "sliver_sq_mils": int(round(min(sliver_sq_mils, 2e9))), "board_path": long_path(board_path)})
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": response.get("error", "unknown error")})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        return result
+    polys = result.get("polygons", [])
+    polys.sort(key=lambda p: (not p.get("flags"), p.get("layer", ""), p.get("name", "")))
+    result["flagged"] = sum(1 for p in polys if p.get("flags"))
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+async def _edit_pcb_objects(params: dict, board_path: str) -> str:
+    response = await altium_bridge.execute_command("edit_pcb_objects", {**params, "board_path": board_path})
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": response.get("error", "unknown error")})
+    result = response.get("result", {})
+    if isinstance(result, str):
+        return result
+    if not result.get("matched"):
+        result["warning"] = "No object matched the filters."
+    elif result.get("matched", 0) > len(result.get("objects", [])):
+        result["note"] = f"objects lists the first {len(result.get('objects', []))} of {result['matched']}."
+    return json.dumps(result, indent=2)
+
+@_tool()
+async def delete_pcb_objects(ctx: Context, kinds: list = None, net: str = "", layer: str = "",
+                             area: list = None, designators: list = None, margin_mils: float = 40,
+                             include_locked: bool = False, dry_run: bool = False, board_path: str = "") -> str:
+    """
+    Delete copper from a PCB: tracks, arcs, vias, polygon pours, copper
+    regions, fills or pour cutouts. Use it to rip up routing.
+
+    Objects are picked by every filter given: kinds, net, layer and area,
+    or a group's copper by designators. At least one must narrow the match;
+    deleting all the copper on the board is refused. Only copper is ever
+    touched: never pads, anything belonging to a component, keepouts, or
+    objects on other layers (board outline, silkscreen, mechanical). The
+    copper a pour poured goes with its pour. Locked objects are left alone
+    and listed, unless include_locked. One undo step in Altium. Use dry_run
+    first to see what would go.
+
+    Deleting copper inside a pour leaves the pour as it was: repour it.
+    Remove a via stitching group with Altium's own command rather than
+    here, so the group goes too.
+
+    Args:
+        kinds (list): Some of "track", "arc", "via", "polygon", "region",
+            "fill", "cutout" (a pour cutout). Empty: all but cutouts.
+        net (str): Only objects on this net.
+        layer (str): Only objects on this copper layer, by stack name or
+            Altium's name ("Top Layer"); a via matches every layer it spans.
+        area (list): [x1, y1, x2, y2] in mils from the board origin; only
+            objects lying inside it.
+        designators (list): Rip up a group's copper, as get_layout lists it:
+            what lies inside the group's extent (grown by margin_mils, or
+            area when given) plus the copper of its own nets (nets with no
+            pad on another part) wherever it runs.
+        margin_mils (float): See designators (default 40).
+        include_locked (bool): Delete locked objects too.
+        dry_run (bool): List what matches without deleting.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with matched, deleted, the first 50 objects (kind, net,
+             layer, position in mils), and locked_skipped with the first
+             20 locked objects left alone.
+    """
+    import pcb_edit
+
+    board_path = long_path(board_path)
+    params, error = pcb_edit.filters(kinds, net, layer, area, designators, margin_mils, include_locked)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if not pcb_edit.narrowed(kinds, net, layer, area, designators):
+        return json.dumps({"success": False, "error": (
+            "Give at least one filter (kinds, net, layer, area or designators): this would delete all the "
+            "copper on the board.")})
+    logger.info(f"Deleting PCB objects {params} (dry run: {dry_run})")
+    return await _edit_pcb_objects({**params, "action": "delete", "dry_run": "true" if dry_run else "false"},
+                                   board_path)
+
+@_tool()
+async def modify_pcb_objects(ctx: Context, kinds: list = None, net: str = "", layer: str = "",
+                             area: list = None, designators: list = None, margin_mils: float = 40,
+                             width_mils: float = None, via_diameter_mils: float = None,
+                             via_hole_mils: float = None, new_net: str = None, new_layer: str = "",
+                             include_locked: bool = False, dry_run: bool = False, board_path: str = "") -> str:
+    """
+    Change copper on a PCB: the width of tracks and arcs, the size of vias,
+    the net, or the layer.
+
+    Objects are picked as for delete_pcb_objects, and at least one filter
+    must narrow the match. Each change applies where it makes sense:
+    width_mils to tracks and arcs, via_diameter_mils and via_hole_mils to
+    vias, new_layer to tracks, arcs, fills and regions, new_net to all ("" removes
+    the net). A via whose hole would not fit inside its diameter is left as
+    it is and counted. A polygon given another net pours again. Locked
+    objects are left alone unless include_locked. One undo step in Altium.
+
+    Changed copper inside a pour leaves the pour as it was: repour it, and
+    run DRC after changing widths or via sizes.
+
+    Args:
+        kinds, net, layer, area, designators, margin_mils, include_locked:
+            The filters, as for delete_pcb_objects.
+        width_mils (float): New width of tracks and arcs.
+        via_diameter_mils, via_hole_mils (float): New via size; either alone
+            is checked against each via's other size.
+        new_net (str): New net; "" removes the net; leave out to keep it.
+        new_layer (str): Copper layer to move tracks, arcs, fills and
+            regions to.
+        dry_run (bool): List what matches without changing it.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        str: JSON with matched, changed, unchanged (matched objects none of
+             the changes applies to), vias_left_as_hole_would_not_fit,
+             locked_skipped, and the first 50 objects as they were.
+    """
+    import pcb_edit
+
+    board_path = long_path(board_path)
+    params, error = pcb_edit.filters(kinds, net, layer, area, designators, margin_mils, include_locked)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    if not pcb_edit.narrowed(kinds, net, layer, area, designators):
+        return json.dumps({"success": False, "error": (
+            "Give at least one filter (kinds, net, layer, area or designators): this would change all the "
+            "copper on the board.")})
+    change, error = pcb_edit.changes(width_mils, via_diameter_mils, via_hole_mils, new_net, new_layer)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    logger.info(f"Modifying PCB objects {params}: {change} (dry run: {dry_run})")
+    return await _edit_pcb_objects({**params, **change, "action": "modify",
+                                    "dry_run": "true" if dry_run else "false"}, board_path)
+
+MUTATING_COMMANDS.add("edit_pcb_objects")
 
 @_tool()
 async def route_track(ctx: Context, net_name: str, layer: str, width_mils: float, points: list,
@@ -6627,6 +6941,673 @@ async def place_vias(ctx: Context, vias: list, diameter_mils: float, hole_mils: 
 MUTATING_COMMANDS.add("create_vias")
 
 
+def _check_area(area, what="area"):
+    """[x1, y1, x2, y2] in mils as floats, or an error message."""
+    if not isinstance(area, (list, tuple)) or len(area) != 4:
+        return None, f"{what} must be [x1, y1, x2, y2] in mils"
+    try:
+        a = [float(v) for v in area]
+    except (TypeError, ValueError):
+        return None, f"{what} must hold four numbers"
+    if not all(math.isfinite(v) and abs(v) <= pcb_layout.LIMIT_MILS for v in a):
+        return None, f"{what} must lie within ±{pcb_layout.LIMIT_MILS} mil"
+    if a[0] >= a[2] or a[1] >= a[3]:
+        return None, f"{what} must have x1 < x2 and y1 < y2"
+    return a, ""
+
+
+def _names(values, what):
+    """A list of names as strings, or an error message."""
+    if values is None:
+        return [], ""
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list) or not all(isinstance(v, str) and v.strip() for v in values):
+        return None, f"{what} must be a list of names"
+    if any(";" in v or "|" in v for v in values):
+        return None, f"{what} may not contain ';' or '|'"
+    return [v.strip() for v in values], ""
+
+
+@_tool(read_only=True)
+async def get_layout(ctx: Context, designators: list = None, area: list = None, margin_mils: float = 40,
+                     include_touching: bool = False, include_local_nets: bool = True, include_pads: bool = False,
+                     board_path: str = "", out_file: str = "") -> str:
+    """
+    Read the layout of a group of components or of an area: the components'
+    placement and the copper around them (tracks, arcs, vias, fills, copper
+    regions and polygon pours, each pour with its full outline, arc edges
+    included, and its pour settings). Read-only.
+
+    The result is in exactly the form place_copper takes, so it can be
+    edited and placed again, on this board or moved with place_copper's
+    transform (to repeat a channel, for example). The components come in
+    place_components' form.
+
+    Args:
+        designators (list): Components to read, e.g. ["U5", "C13", "Y1"].
+            Without an area, the area is their extent (pads and bodies)
+            grown by margin_mils.
+        area (list): [x1, y1, x2, y2] in mils from the board origin. With
+            no designators, the components wholly inside it are listed.
+        margin_mils (float): How far the area reaches beyond the components
+            (default 40).
+        include_touching (bool): Also list copper that only reaches into the
+            area, such as a track leaving the group. By default only copper
+            wholly inside the area is listed: the group's own routing.
+        include_local_nets (bool): With designators, also list the copper of
+            their own nets (nets with no pad on any other part) wherever it
+            runs, such as a route between two of them that leaves the area
+            (default true).
+        include_pads (bool): Also list every pad reaching into the area
+            (designator, pad, x, y, layer, shape, size [x, y], rotation,
+            hole, net), e.g. to see what new copper must keep clear of.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+        out_file (str): Write the layout to this JSON file and return only a
+            summary; for large areas.
+
+    Never listed: copper that belongs to a component or that a pour poured
+    (the pour itself is), keepouts, and objects on non-copper layers
+    (counted in skipped).
+
+    Returns:
+        JSON: area; components (designator, x, y, rotation, layer, locked,
+        footprint, designator_text and comment_text: {x, y, rotation,
+        height, stroke_width, visible, autoposition}); tracks (net, layer,
+        width, start, end); arcs (net, layer, width, center, radius,
+        start_angle, end_angle: counter-clockwise from start to end); vias
+        (net, x, y, diameter, hole, start_layer, end_layer); fills; regions;
+        cutouts (layer, outline); pours (name, net, layer, hatch, pour_over,
+        remove_dead_copper, remove_islands, island_area_sq_mils,
+        remove_necks, neck_width_mils, grid, track_width, arc_approximation,
+        pour_index, locked, obey_cutouts, optimal_void_rotation, outline:
+        vertices {x, y} with "arc" {center, radius, start_angle, end_angle}
+        when the edge to the next vertex is an arc); counts and
+        missing_designators. All in mils and degrees.
+    """
+    names, err = _names(designators, "designators")
+    if err:
+        return json.dumps({"success": False, "error": err})
+    box = None
+    if area is not None:
+        box, err = _check_area(area)
+        if err:
+            return json.dumps({"success": False, "error": err})
+    if not names and box is None:
+        return json.dumps({"success": False, "error": "Give designators, an area, or both"})
+    try:
+        margin = float(margin_mils)
+        if not math.isfinite(margin) or not 0 <= margin <= 10000:
+            raise ValueError
+    except (TypeError, ValueError):
+        return json.dumps({"success": False, "error": "margin_mils must be a number from 0 to 10000"})
+    params = {"layout_designators": ";".join(names), "layout_margin": int(round(margin * pcb_layout.COORD_PER_MIL)),
+              "layout_touching": bool(include_touching), "layout_local_nets": bool(include_local_nets),
+              "layout_pads": bool(include_pads),
+              "layout_area": "" if box is None else "|".join(str(int(round(v * pcb_layout.COORD_PER_MIL))) for v in box)}
+    if board_path:
+        params["board_path"] = long_path(board_path)
+    response = await altium_bridge.execute_command("get_layout", params)
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": f"Failed to read the layout: {response.get('error', 'unknown error')}"})
+    text = response.get("result", "")
+    if not isinstance(text, str) or text.startswith("ERROR"):
+        return json.dumps({"success": False, "error": str(text)[:500]})
+    layout = pcb_layout.parse_layout(text)
+    found = {d.upper() for d in layout.pop("found")}
+    layout["missing_designators"] = [d for d in names if d.upper() not in found]
+    layout["counts"] = {k: len(layout[k]) for k in ("components", "tracks", "arcs", "vias", "fills", "regions", "cutouts",
+                                                     "pours", "pads")}
+    if not include_pads:
+        layout.pop("pads")
+        layout["counts"].pop("pads")
+    layout["success"] = True
+    if out_file:
+        path = Path(out_file)
+        try:
+            path.write_text(json.dumps(layout, indent=1), encoding="utf-8")
+        except OSError as e:
+            return json.dumps({"success": False, "error": f"Could not write {out_file}: {e}"})
+        return json.dumps({"success": True, "out_file": str(path), "area": layout["area"], "counts": layout["counts"],
+                           "missing_designators": layout["missing_designators"], "board": layout["board"]}, indent=2)
+    return json.dumps(layout, indent=1)
+
+
+@_tool()
+async def place_copper(ctx: Context, tracks: list = None, arcs: list = None, vias: list = None, fills: list = None,
+                       regions: list = None, cutouts: list = None, pours: list = None, layout: dict = None,
+                       transform: dict = None,
+                       rename_nets: dict = None, board_path: str = "") -> str:
+    """
+    Add copper to a PCB in one undo step: tracks and arcs at any angle, vias,
+    fills, copper regions and polygon pours (arc edges, island and neck
+    removal, pour order). Everything is checked first (each net must exist,
+    each layer must be a signal layer), so a bad entry adds nothing. Pours go
+    in last, in pour_index order, and are poured around the copper added
+    with them. The nets the copper is on are analyzed afterwards, so the
+    ratsnest is current (this can join straight track segments that continue
+    each other; the copper stays the same). Run run_drc or
+    get_unrouted_connections afterwards.
+
+    Each list takes entries in get_layout's form (mils, degrees):
+        tracks: {net, layer, width, start: [x, y], end: [x, y]}
+        arcs:   {net, layer, width, center: [x, y], radius, start_angle,
+                 end_angle}  (counter-clockwise from start to end)
+        vias:   {net, x, y, diameter, hole, start_layer, end_layer}
+                (layers default to Top Layer and Bottom Layer)
+        fills:  {net, layer, corner1: [x, y], corner2: [x, y], rotation}
+        regions: {net, layer, outline: [[x, y], ...]}
+        cutouts: {layer, outline}  a polygon pour cutout, on a signal layer
+                 or "Multi Layer" (all of them); pours with obey_cutouts
+                 leave it free
+        pours:  {net, layer, outline, name, hatch ("solid", "hatched_45",
+                 "hatched_90", "vertical", "horizontal", "none"), pour_over
+                 ("same_net", "same_net_polygons", "none"),
+                 remove_dead_copper, remove_islands (below island_area_sq_mils,
+                 default 2500), remove_necks (narrower than neck_width_mils,
+                 default 5), grid, track_width, arc_approximation,
+                 pour_index, locked, obey_cutouts (default true),
+                 optimal_void_rotation (default false)}
+                outline vertices are [x, y] or {x, y, arc: {center, radius,
+                start_angle, end_angle}} for an arc edge to the next vertex.
+    net "" is no net. Coordinates are mils from the board origin.
+
+    Args:
+        tracks, arcs, vias, fills, regions, cutouts, pours (list): Copper
+            to add.
+        layout (dict): A whole get_layout result; its copper lists are added
+            too (its components are not moved: use place_components).
+        transform (dict): Move everything: {"dx", "dy", "rotation" (degrees,
+            about "about": [x, y], default the origin), "mirror" (mirror x
+            before rotating)}. Fills only shift.
+        rename_nets (dict): {old net: new net}, e.g. to repeat a channel.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        JSON: counts added (tracks, arcs, vias, fills, regions, cutouts) and each pour
+        with the pieces of copper it poured (0 means it poured nothing), or
+        the problems that stopped it.
+    """
+    merged = {k: list(v or []) for k, v in (("tracks", tracks), ("arcs", arcs), ("vias", vias), ("fills", fills),
+                                            ("regions", regions), ("cutouts", cutouts), ("pours", pours))}
+    if layout is not None:
+        if not isinstance(layout, dict):
+            return json.dumps({"success": False, "error": "layout must be a get_layout result"})
+        for k in merged:
+            merged[k].extend(layout.get(k) or [])
+    if transform is not None and not isinstance(transform, dict):
+        return json.dumps({"success": False, "error": "transform must be an object {dx, dy, rotation, about, mirror}"})
+    if rename_nets is not None and not isinstance(rename_nets, dict):
+        return json.dumps({"success": False, "error": "rename_nets must be an object {old: new}"})
+    try:
+        lines = pcb_layout.encode_copper(merged, transform, rename_nets)
+    except (pcb_layout.LayoutError, KeyError, TypeError) as e:
+        what = f"missing field {e}" if isinstance(e, KeyError) else str(e)
+        return json.dumps({"success": False, "error": f"Nothing was added: {what}"})
+    if not lines:
+        return json.dumps({"success": False, "error": "Nothing to add"})
+    fd, spec = tempfile.mkstemp(prefix="copper_spec_", suffix=".txt", dir=EXCHANGE_DIR)
+    os.close(fd)
+    try:
+        write_altium_text(spec, "\n".join(lines) + "\n")
+        params = {"copper_spec_file": spec}
+        if board_path:
+            params["board_path"] = long_path(board_path)
+        response = await altium_bridge.execute_command("place_copper", params,
+                                                       timeout=max(RESPONSE_TIMEOUT, 60 + len(lines) / 20))
+    finally:
+        try:
+            os.remove(spec)
+        except OSError:
+            pass
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": f"Failed to add the copper: {response.get('error', 'unknown error')}"})
+    result = response.get("result", {})
+    return json.dumps(result, indent=2) if not isinstance(result, str) else result
+
+# Changes the design: a timeout leaves its outcome unknown, so no blind retry
+MUTATING_COMMANDS.add("place_copper")
+
+
+@_tool()
+async def get_unrouted_connections(ctx: Context, designators: list = None, nets: list = None, area: list = None,
+                                   margin_mils: float = 40, max_connections: int = 200,
+                                   board_path: str = "") -> str:
+    """
+    List the connections still to be routed (Altium's ratsnest lines): for a
+    group of components, some nets, or the whole board. Unlike run_drc it
+    has no 500-violation limit and needs no DRC run, so it is the quick way
+    to see what a group still lacks after placing and routing it.
+
+    Args:
+        designators (list): Components whose nets to check. Their pads name
+            the ends of each connection (from_pad, to_pad), and unless area is
+            given, the area is their pads' extent grown by margin_mils.
+        nets (list): Nets to check (exact names, any case). With neither
+            designators nor nets, every net.
+        area (list): [x1, y1, x2, y2] in mils from the board origin; each
+            connection says whether both its ends lie in it (inside).
+        margin_mils (float): See designators (default 40).
+        max_connections (int): Most connections listed (default 200); the
+            counts cover them all.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    With designators, only connections that end at one of their pads or lie
+    wholly inside the area are listed: a group's own connections and the
+    ones leaving it, not the rest of a board-wide net such as GND.
+
+    Altium does not update its ratsnest after copper added by a script, so
+    the nets are analyzed first. Analyzing can join straight track segments
+    that continue each other into one (the copper stays the same), as
+    Altium does after interactive routing.
+
+    Returns:
+        JSON: connection_count, inside_count (both ends in the area),
+        by_net counts, area, and connections (net, from, to, from_pad,
+        to_pad, length in mils, inside), longest first.
+    """
+    names, err = _names(designators, "designators")
+    if err:
+        return json.dumps({"success": False, "error": err})
+    net_names, err = _names(nets, "nets")
+    if err:
+        return json.dumps({"success": False, "error": err})
+    box = None
+    if area is not None:
+        box, err = _check_area(area)
+        if err:
+            return json.dumps({"success": False, "error": err})
+    try:
+        margin = float(margin_mils)
+        limit = int(max_connections)
+    except (TypeError, ValueError):
+        return json.dumps({"success": False, "error": "margin_mils and max_connections must be numbers"})
+    params = {"unrouted_nets": ";".join(net_names), "unrouted_designators": ";".join(names)}
+    if board_path:
+        params["board_path"] = long_path(board_path)
+    response = await altium_bridge.execute_command("get_unrouted_connections", params)
+    if not response.get("success", False):
+        return json.dumps({"success": False, "error": f"Failed to read the connections: {response.get('error', 'unknown error')}"})
+    text = response.get("result", "")
+    if not isinstance(text, str) or text.startswith("ERROR"):
+        return json.dumps({"success": False, "error": str(text)[:500]})
+    pads, conns, board = pcb_layout.parse_unrouted(text)
+    if box is None and pads:
+        xs, ys = [p["x"] for p in pads], [p["y"] for p in pads]
+        box = [min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin]
+    labelled = pcb_layout.label_connections(pads, conns, box)
+    if names:
+        labelled = [c for c in labelled if c["from_pad"] or c["to_pad"] or c["inside"]]
+    labelled.sort(key=lambda c: -c["length"])
+    by_net = {}
+    for c in labelled:
+        by_net[c["net"]] = by_net.get(c["net"], 0) + 1
+    found = {p["designator"].upper() for p in pads}
+    missing = [d for d in names if d.upper() not in found]
+    return json.dumps({"success": True, "board": board, "connection_count": len(labelled),
+                       "inside_count": sum(1 for c in labelled if c["inside"]),
+                       "by_net": dict(sorted(by_net.items(), key=lambda kv: -kv[1])),
+                       "area": [round(v, 2) for v in box] if box else None,
+                       "missing_designators": missing, "connections": labelled[:max(0, limit)]}, indent=1)
+
+
+def _exact_segments(layer, net, width, pts):
+    """place_copper tracks through pts (mils), every segment exactly 0, 45 or
+    90 degrees: routing.route adds a short leg where an end point snapped
+    onto the grid leaves a bend off 45."""
+    ipts = [(int(round(x * routing.COORD_PER_MIL)), int(round(y * routing.COORD_PER_MIL))) for x, y in pts]
+    segs = routing.route(ipts)
+    c = routing.COORD_PER_MIL
+    return [{"net": net, "layer": layer, "width": width, "start": [x1 / c, y1 / c], "end": [x2 / c, y2 / c]}
+            for x1, y1, x2, y2 in segs if (x1, y1) != (x2, y2)]
+
+
+def _route_params(width_mils, clearance_mils, via_diameter_mils, via_hole_mils, grid_mils):
+    for name, v in (("width_mils", width_mils), ("clearance_mils", clearance_mils),
+                    ("via_diameter_mils", via_diameter_mils), ("via_hole_mils", via_hole_mils), ("grid_mils", grid_mils)):
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 < v < 1000:
+            return f"{name} must be a positive number of mils"
+    if via_hole_mils >= via_diameter_mils:
+        return "via_hole_mils must be smaller than via_diameter_mils"
+    if not 0.5 <= grid_mils <= 25:
+        return "grid_mils must be from 0.5 to 25"
+    return ""
+
+
+async def _net_rules(nets, layer, board_path):
+    """{net: {"min", "preferred", "max", "rule", "clearance"}} in mils, from the
+    board's width and clearance rules for a track of each net on layer."""
+    nets = sorted({n for n in nets if n and ";" not in n and "|" not in n})
+    if not nets:
+        return {}
+    params = {"net_rules_nets": ";".join(nets), "net_rules_layer": layer}
+    if board_path:
+        params["board_path"] = long_path(board_path)
+    response = await altium_bridge.execute_command("net_rules", params)
+    text = response.get("result", "") if response.get("success") else ""
+    out = {}
+    for line in (text if isinstance(text, str) else "").splitlines():
+        f = line.split("|")
+        if f[0] == "N" and len(f) >= 7:
+            mil = lambda v: int(v) / routing.COORD_PER_MIL if v.strip().lstrip("-").isdigit() else None
+            out[f[1]] = {"min": mil(f[2]), "preferred": mil(f[3]), "max": mil(f[4]), "rule": f[5].strip(),
+                         "clearance": mil(f[6]) if mil(f[6]) and mil(f[6]) > 0 else None}
+    return out
+
+
+@_tool()
+async def route_connections(ctx: Context, designators: list = None, nets: list = None, area: list = None,
+                            layers: list = None, width_mils: float = None, clearance_mils: float = None,
+                            via_diameter_mils: float = 24, via_hole_mils: float = 12, grid_mils: float = 2.5,
+                            include_leaving: bool = False, max_connections: int = 100, dry_run: bool = False,
+                            board_path: str = "") -> str:
+    """
+    Route unrouted connections automatically: a maze router finds a path for
+    each connection, every segment 0, 45 or 90 degrees, keeping the clearance
+    from other nets' copper and changing layer through a via where a route
+    needs it. For a group's local routing after it is placed (and fanned out
+    with fanout_pads). Each net gets the preferred width of its width rule
+    (the minimum where the preferred width finds no path) and the gap of
+    its clearance rule, unless width_mils or clearance_mils is given. Wider
+    nets are routed first, then shortest first; each route becomes an
+    obstacle for the next. Polygon pours are not obstacles: they pour again
+    around new copper (repour_polygons). Everything is added in one undo
+    step; check with run_drc and get_unrouted_connections.
+
+    Args:
+        designators (list): Route the connections of these components that
+            lie wholly inside their area (their pads' extent, as
+            get_unrouted_connections gives it); include_leaving adds those
+            leaving the group.
+        nets (list): Route the connections of these nets (inside area when
+            given).
+        area (list): [x1, y1, x2, y2] in mils from the board origin.
+        layers (list): Layers routes may use, e.g. ["Top Layer"] (default)
+            or ["Top Layer", "Bottom Layer"]; with more than one, vias
+            (through, Top to Bottom) change layer.
+        width_mils (float): One width for every net, instead of the rules.
+        clearance_mils (float): Gap to other nets' copper, instead of the
+            largest clearance rule gap of the nets routed.
+        via_diameter_mils, via_hole_mils (float): Size of a layer-change via.
+        grid_mils (float): Routing grid (default 2.5); finer finds paths
+            between fine-pitch pads but is slower.
+        include_leaving (bool): See designators.
+        max_connections (int): Most connections routed in one call.
+        dry_run (bool): Find the routes and return them without adding them.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        JSON: routed and failed connections (net, from, to, pads, width, and
+        why a route failed), tracks and vias added, the widths used per
+        net, and the connections still unrouted afterwards. With dry_run,
+        the tracks and vias themselves.
+    """
+    import router
+
+    layers = layers or ["Top Layer"]
+    if not isinstance(layers, list) or not all(isinstance(l, str) and l.strip() for l in layers):
+        return json.dumps({"success": False, "error": "layers must be a list of layer names"})
+    err = _route_params(width_mils or 6, clearance_mils or 6, via_diameter_mils, via_hole_mils, grid_mils)
+    if err:
+        return json.dumps({"success": False, "error": err})
+    if not designators and not nets:
+        return json.dumps({"success": False, "error": "Give designators or nets to route"})
+    un = json.loads(await get_unrouted_connections(ctx, designators=designators, nets=nets, area=area,
+                                                   max_connections=100000, board_path=board_path))
+    if not un.get("success"):
+        return json.dumps(un)
+    conns = [c for c in un["connections"] if include_leaving or c["inside"] or (not designators and area is None)]
+    conns.sort(key=lambda c: c["length"])
+    conns = conns[:max(0, int(max_connections))]
+    if not conns:
+        return json.dumps({"success": True, "routed": 0, "failed": [], "note": "Nothing to route",
+                           "unrouted": un.get("connection_count", 0)})
+    rules = await _net_rules({c["net"] for c in conns}, layers[0], board_path)
+    clearance = clearance_mils or max([r["clearance"] for r in rules.values() if r.get("clearance")] or [6.0])
+
+    def widths(net):
+        """The widths to try for a net: preferred, then minimum."""
+        if width_mils:
+            return [float(width_mils)]
+        r = rules.get(net) or {}
+        pref, low = r.get("preferred") or 6.0, r.get("min") or r.get("preferred") or 6.0
+        return [pref] if abs(pref - low) < 1e-6 else [pref, low]
+
+    xs = [p[0] for c in conns for p in (c["from"], c["to"])]
+    ys = [p[1] for c in conns for p in (c["from"], c["to"])]
+    margin = 150.0
+    box = [min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin]
+    lay = json.loads(await get_layout(ctx, area=box, include_touching=True, include_local_nets=False,
+                                      include_pads=True, board_path=board_path))
+    if not lay.get("success"):
+        return json.dumps(lay)
+    signal = sorted({p["layer"] for p in lay["pads"] if p["layer"] != "Multi Layer"} |
+                    {t["layer"] for t in lay["tracks"]} | {a["layer"] for a in lay["arcs"]} | set(layers))
+    base_shapes = router.shapes_from_layout(lay, signal)
+
+    def end_layers(layer):
+        return list(layers) if layer == "Multi Layer" else [layer]
+
+    def attempt(order):
+        """One routing pass over the connections in this order, in memory."""
+        new_shapes, routed, failed, tracks, vias = [], [], [], [], []
+        pending = [(c, 0) for c in order]   # (connection, index into widths(net))
+        used = {}
+        while pending:
+            width = max(widths(c["net"])[k] for c, k in pending)
+            batch = [(c, k) for c, k in pending if abs(widths(c["net"])[k] - width) < 1e-6]
+            pending = [(c, k) for c, k in pending if abs(widths(c["net"])[k] - width) >= 1e-6]
+            try:
+                grid = router.Board(box, grid_mils, signal, width, clearance, via_diameter_mils,
+                                    {c["net"] for c, _ in batch})
+            except router.RouteError as e:
+                return json.dumps({"success": False, "error": str(e)})
+            for s in base_shapes + new_shapes:
+                grid.add(s)
+            for c, k in batch:
+                info = {key: c[key] for key in ("net", "from", "to", "from_pad", "to_pad")}
+                sl = [l for l in end_layers(c["from_layer"]) if l in layers]
+                el = [l for l in end_layers(c["to_layer"]) if l in layers]
+                if not sl or not el:
+                    failed.append(dict(info, why=f"an end is on {c['from_layer'] if not sl else c['to_layer']}, "
+                                                 "not on a routing layer"))
+                    continue
+                i1, j1 = grid.cell(min(c["from"][0], c["to"][0]) - 100, min(c["from"][1], c["to"][1]) - 100)
+                i2, j2 = grid.cell(max(c["from"][0], c["to"][0]) + 100, max(c["from"][1], c["to"][1]) + 100)
+                window = (max(0, i1), max(0, j1), min(grid.nx - 1, i2), min(grid.ny - 1, j2))
+                found = router.route_one(grid, c["net"], c["from"], c["to"], sl, el, window=window) or \
+                    router.route_one(grid, c["net"], c["from"], c["to"], sl, el)
+                if found is None:
+                    if k + 1 < len(widths(c["net"])):
+                        pending.append((c, k + 1))   # try again at the rule's minimum width
+                    else:
+                        failed.append(dict(info, width=width, why="no path keeps the clearance on the routing layers"))
+                    continue
+                legs, via_pts = found
+                for layer, pts in legs:
+                    segs = _exact_segments(layer, c["net"], width, pts)
+                    tracks.extend(segs)
+                    for s in segs:
+                        shape = router.Shape("seg", c["net"], [layer], ax=s["start"][0], ay=s["start"][1],
+                                             bx=s["end"][0], by=s["end"][1], hw=width / 2)
+                        grid.add(shape)
+                        new_shapes.append(shape)
+                for vx, vy in via_pts:
+                    vias.append({"net": c["net"], "x": round(vx, 4), "y": round(vy, 4), "diameter": via_diameter_mils,
+                                 "hole": via_hole_mils, "start_layer": "Top Layer", "end_layer": "Bottom Layer"})
+                    shape = router.Shape("circle", c["net"], signal, cx=vx, cy=vy, r=via_diameter_mils / 2)
+                    grid.add(shape)
+                    new_shapes.append(shape)
+                used[c["net"]] = width
+                routed.append(dict(info, width=width))
+        return routed, failed, tracks, vias, used
+
+    # A connection that fails is often walled in by routes made before it:
+    # route again with the failures first, and keep the best pass
+    order, best = list(conns), None
+    for _ in range(3):
+        outcome = attempt(order)
+        if isinstance(outcome, str):
+            return outcome
+        if best is None or len(outcome[1]) < len(best[1]):
+            best = outcome
+        if not outcome[1]:
+            break
+        failed_keys = {(f["net"], tuple(f["from"]), tuple(f["to"])) for f in outcome[1]}
+        key = lambda c: (c["net"], tuple(c["from"]), tuple(c["to"]))
+        order = [c for c in conns if key(c) in failed_keys] + [c for c in conns if key(c) not in failed_keys]
+    routed, failed, tracks, vias, used = best
+    result = {"success": True, "routed": len(routed), "failed": failed, "tracks": len(tracks), "vias": len(vias),
+              "clearance_mils": clearance, "widths": used}
+    if dry_run:
+        result.update({"dry_run": True, "track_list": tracks, "via_list": vias})
+        return json.dumps(result, indent=1)
+    if tracks or vias:
+        placed = json.loads(await place_copper(ctx, tracks=tracks, vias=vias, board_path=board_path))
+        if not placed.get("success"):
+            return json.dumps({"success": False, "error": f"Routes found but not added: {placed.get('error')}",
+                               "problems": placed.get("problems")})
+    after = json.loads(await get_unrouted_connections(ctx, designators=designators, nets=nets, area=area,
+                                                      max_connections=20, board_path=board_path))
+    result["unrouted_after"] = after.get("connection_count")
+    result["inside_unrouted_after"] = after.get("inside_count")
+    return json.dumps(result, indent=1)
+
+MUTATING_COMMANDS.add("route_connections")
+
+
+@_tool()
+async def fanout_pads(ctx: Context, designators: list, nets: list = None, pads: list = None,
+                      width_mils: float = None, clearance_mils: float = None, via_diameter_mils: float = 24,
+                      via_hole_mils: float = 12, max_distance_mils: float = 80, grid_mils: float = 2.5,
+                      dry_run: bool = False, board_path: str = "") -> str:
+    """
+    Fan out pads: a short track from each pad to a via next to it, e.g. to
+    take an IC's ground and power pads down to their planes, or to free a
+    pad for routing on another layer. Each via goes outward from the
+    component first (then the other 45 degree directions), as near as
+    clearance_mils from other nets' copper allows, within max_distance_mils.
+    Pads that already have a track or via on them are left alone. One undo
+    step; vias are through (Top to Bottom).
+
+    Args:
+        designators (list): Components whose pads to fan out.
+        nets (list): Only pads on these nets, e.g. ["GND", "3V3"].
+        pads (list): Only these pads, as "U1-5" or pad names.
+        width_mils, clearance_mils (float): Track width and gap to other
+            nets' copper. By default each net's width rule (its preferred
+            width, but no wider than the pad and never below the rule's
+            minimum) and the largest clearance rule gap of the nets.
+        via_diameter_mils, via_hole_mils (float): Via size.
+        max_distance_mils (float): Farthest a via may sit from its pad's
+            centre (default 80).
+        grid_mils (float): Grid for the clearance check (default 2.5).
+        dry_run (bool): Return the vias and tracks without adding them.
+        board_path (str): Full path of the .PcbDoc; empty for the focused
+            board, or the one the PCB tools last used.
+
+    Returns:
+        JSON: fanned out pads with their via positions, pads skipped (and
+        why), and the counts added.
+    """
+    import router
+
+    names, err = _names(designators, "designators")
+    if err or not names:
+        return json.dumps({"success": False, "error": err or "Give designators"})
+    err = _route_params(width_mils or 8, clearance_mils or 6, via_diameter_mils, via_hole_mils, grid_mils)
+    if err:
+        return json.dumps({"success": False, "error": err})
+    lay = json.loads(await get_layout(ctx, designators=names, margin_mils=max_distance_mils + 60,
+                                      include_touching=True, include_local_nets=False, include_pads=True,
+                                      board_path=board_path))
+    if not lay.get("success"):
+        return json.dumps(lay)
+    want_nets = {n.upper() for n in (nets or [])}
+    want_pads = {str(p).upper() for p in (pads or [])}
+    upper = {n.upper() for n in names}
+    comps = {c["designator"].upper(): c for c in lay["components"]}
+    sel = [p for p in lay["pads"] if p["designator"].upper() in upper and p["net"]
+           and (not want_nets or p["net"].upper() in want_nets)
+           and (not want_pads or p["pad"].upper() in want_pads
+                or f"{p['designator']}-{p['pad']}".upper() in want_pads)]
+    signal = sorted({p["layer"] for p in lay["pads"] if p["layer"] != "Multi Layer"} |
+                    {t["layer"] for t in lay["tracks"]} | {"Top Layer", "Bottom Layer"})
+    rules = await _net_rules({p["net"] for p in sel}, "Top Layer", board_path)
+    clearance = clearance_mils or max([r["clearance"] for r in rules.values() if r.get("clearance")] or [6.0])
+
+    def width_for(p):
+        if width_mils:
+            return float(width_mils)
+        r = rules.get(p["net"]) or {}
+        pref, low = r.get("preferred") or 8.0, r.get("min") or 6.0
+        return max(low, min(pref, min(p["size"])))
+
+    widest = max([width_for(p) for p in sel] or [width_mils or 8.0])
+    try:
+        grid = router.Board(lay["area"], grid_mils, signal, widest, clearance, via_diameter_mils,
+                            {p["net"] for p in sel})
+    except router.RouteError as e:
+        return json.dumps({"success": False, "error": str(e)})
+    shapes = router.shapes_from_layout(lay, signal)
+    for s in shapes:
+        grid.add(s)
+    # Copper already on a pad: a track end or a via (not the pads themselves)
+    ends = {}
+    for s in shapes:
+        if s.g.get("pad"):
+            continue
+        if s.kind == "seg":
+            ends.setdefault(s.net, []).extend([(s.g["ax"], s.g["ay"]), (s.g["bx"], s.g["by"])])
+        elif s.kind == "circle":
+            ends.setdefault(s.net, []).append((s.g["cx"], s.g["cy"]))
+    done, skipped, tracks, vias = [], [], [], []
+    for p in sorted(sel, key=lambda p: (p["net"], p["designator"], p["pad"])):
+        name = f"{p['designator']}-{p['pad']}"
+        if p["layer"] == "Multi Layer":
+            skipped.append({"pad": name, "why": "through-hole pad: it already reaches every layer"})
+            continue
+        pad_shape = router.shapes_from_layout({"pads": [p]}, signal)[0]
+        if any(pad_shape.dist(x, y) <= 0.01 for x, y in ends.get(p["net"], [])):
+            skipped.append({"pad": name, "why": "already has a track or via on it"})
+            continue
+        comp = comps.get(p["designator"].upper())
+        center = (comp["x"], comp["y"]) if comp else (p["x"], p["y"])
+        site = router.fanout_site(grid, p, p["net"], width_for(p), via_diameter_mils, max_distance_mils, center,
+                                  [p["layer"]])
+        if site is None:
+            skipped.append({"pad": name, "why": f"no via site within {max_distance_mils} mil keeps the clearance"})
+            continue
+        (vx, vy), legs = site
+        w = width_for(p)
+        for layer, pts in legs:
+            segs = _exact_segments(layer, p["net"], w, pts)
+            tracks.extend(segs)
+            for s in segs:
+                grid.add(router.Shape("seg", p["net"], [layer], ax=s["start"][0], ay=s["start"][1],
+                                      bx=s["end"][0], by=s["end"][1], hw=w / 2))
+        vias.append({"net": p["net"], "x": round(vx, 4), "y": round(vy, 4), "diameter": via_diameter_mils,
+                     "hole": via_hole_mils, "start_layer": "Top Layer", "end_layer": "Bottom Layer"})
+        grid.add(router.Shape("circle", p["net"], signal, cx=vx, cy=vy, r=via_diameter_mils / 2))
+        done.append({"pad": name, "net": p["net"], "via": [round(vx, 2), round(vy, 2)]})
+    result = {"success": True, "fanned_out": done, "skipped": skipped, "tracks": len(tracks), "vias": len(vias)}
+    if dry_run or not vias:
+        if dry_run:
+            result.update({"dry_run": True, "track_list": tracks, "via_list": vias})
+        return json.dumps(result, indent=1)
+    placed = json.loads(await place_copper(ctx, tracks=tracks, vias=vias, board_path=board_path))
+    if not placed.get("success"):
+        return json.dumps({"success": False, "error": f"Fanout found but not added: {placed.get('error')}",
+                           "problems": placed.get("problems")})
+    return json.dumps(result, indent=1)
+
+MUTATING_COMMANDS.add("fanout_pads")
+
+
 def _bring_to_front(hwnd):
     """Give a window the foreground from this background process.
 
@@ -7109,7 +8090,8 @@ async def get_pcb_rules(ctx: Context) -> str:
     return json.dumps(rules_data, indent=2)
 
 @_tool()
-async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200) -> str:
+async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200, rules: list = None,
+                  nets: list = None, area: list = None) -> str:
     """
     Run the design rule check (DRC) on a PCB and list the violations.
 
@@ -7128,6 +8110,17 @@ async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200)
         board_path (str): Full path of the .PcbDoc to check. It is opened if
             needed and brought to the front. Empty: the focused board, or
             the one the PCB tools last used.
+        rules (list): Only violations of these rules: each is a rule's own
+            name or a rule kind ("Clearance", "Width", "Short-Circuit",
+            "Un-Routed Net", "Hole To Hole Clearance", ...), whole, in any
+            case and with or without spaces. "Clearance" is the electrical
+            clearance rules only, not hole-to-hole or silk clearances. The
+            whole check still runs: Altium checks every enabled rule.
+        nets (list): Only violations with an object on one of these nets.
+        area (list): Only violations located in [x1, y1, x2, y2] (mils from
+            the board origin), by their own or an object's position.
+            With any filter, matching_count counts the matching violations;
+            listed_by_rule always counts the ones listed.
         max_violations (int): How many violations to list in full.
             violation_count counts every violation the check found, but
             Altium stops the check at its own violation limit (500 unless
@@ -7142,6 +8135,21 @@ async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200)
     """
     import drc
 
+    # The filters are checked before the check runs, which takes a while.
+    # A lone name counts as a list of one, not as letters.
+    rules = [rules] if isinstance(rules, str) else rules
+    nets = [nets] if isinstance(nets, str) else nets
+    for label, names in (("rules", rules), ("nets", nets)):
+        if names is not None and (not isinstance(names, (list, tuple))
+                                  or not all(isinstance(n, str) for n in names)):
+            return json.dumps({"success": False, "error": f"{label} is a list of names"})
+    rules = [r for r in rules or () if r.strip()]
+    nets = [n for n in nets or () if n.strip()]
+    if area is not None and (not isinstance(area, (list, tuple)) or len(area) != 4 or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) for v in area)):
+        return json.dumps({"success": False, "error": "area is [x1, y1, x2, y2] in mils from the board origin"})
+    filtered = bool(rules or nets or area is not None)
+
     board_path = long_path(board_path)
     logger.info(f"Running DRC on {board_path or 'the focused board'}")
     started = time.time()
@@ -7149,7 +8157,10 @@ async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200)
     driver = asyncio.create_task(drc.drive_dialog(outcome, PROGRESS_FILE))
     try:
         response = await altium_bridge.execute_command(
-            "run_drc", {"board_path": board_path, "max_violations": int(max_violations)})
+            "run_drc", {"board_path": board_path,
+                        # filtered: the violations Altium kept (500 unless its
+                        # limit was raised), up to a cap, then filter
+                        "max_violations": drc.FILTER_FETCH if filtered else int(max_violations)})
     finally:
         driver.cancel()
         try:
@@ -7177,6 +8188,21 @@ async def run_drc(ctx: Context, board_path: str = "", max_violations: int = 200)
         if outcome.notes:
             out["notes"] = outcome.notes
     out.update({k: v for k, v in result.items() if k != "success"})
+    # By how much each violation fails, as numbers; then the filters
+    for v in out.get("violations", []):
+        v.update(drc.measurement(v.get("description", "")))
+    if filtered:
+        fetched = out.get("violations", [])
+        picked = [v for v in fetched if drc.matches(v, rules, nets, area)]
+        out["matching_count"] = len(picked)
+        out["violations"] = picked[:max(0, int(max_violations))]
+        if out.get("violation_count", 0) > len(fetched):
+            out["filter_note"] = (f"The filters looked at the first {len(fetched)} of "
+                                  f"{out['violation_count']} violations; matching_count may be low.")
+    by_rule = {}
+    for v in out.get("violations", []):
+        by_rule[v.get("rule", "")] = by_rule.get(v.get("rule", ""), 0) + 1
+    out["listed_by_rule"] = by_rule
     report = drc.find_report(result.get("board", board_path), started)
     if report is not None:
         try:
@@ -8567,6 +9593,27 @@ async def _simple_command(command: str, params: dict, what: str) -> str:
     )
 
 
+async def _bridge_json(command: str, params: dict, timeout: Optional[float] = None) -> Tuple[Optional[dict], str]:
+    """(result, "") of a bridge command that returns JSON, or (None, error).
+    One helper for the tools that work with the reply instead of passing it
+    on; strict=False because Altium text can hold control characters."""
+    if timeout is None:
+        response = await altium_bridge.execute_command(command, params)
+    else:
+        response = await altium_bridge.execute_command(command, params, timeout=timeout)
+    if not response.get("success", False):
+        return None, response.get("error", "unknown error")
+    result = response.get("result", {})
+    if isinstance(result, str):
+        try:
+            result = json.loads(result, strict=False)
+        except ValueError:
+            return None, result if result.startswith("ERROR") else f"unexpected reply: {result[:300]}"
+    if not isinstance(result, dict):
+        return None, f"unexpected reply: {str(result)[:300]}"
+    return result, ""
+
+
 @_tool(read_only=True)
 async def get_project_info(ctx: Context) -> str:
     """
@@ -8632,16 +9679,40 @@ async def get_project_info(ctx: Context) -> str:
     return json.dumps({"error": f"Failed to get project info: {error_msg}"})
 
 
+def _project_path(project_path: str):
+    """A compile tool's project_path in its long form, and an error ('' when
+    fine): empty for the focused project, else an existing .PrjPcb or .PrjHar
+    (harness projects are read from their saved files). Altium would open any
+    project file it is given, a script project too."""
+    if not project_path:
+        return "", ""
+    path = long_path(project_path)
+    if not path.lower().endswith((".prjpcb", ".prjhar")):
+        return path, f"project_path must be a .PrjPcb or .PrjHar file: {project_path}"
+    if not os.path.isfile(path):
+        return path, f"project_path not found: {project_path}"
+    return path, ""
+
+
+
+def _is_harness_project(project_path: str) -> bool:
+    """Whether a compile tool's project_path names a harness project (.PrjHar)."""
+    return project_path.lower().endswith(".prjhar")
+
+
 @_tool(read_only=True)
 async def get_project_components(ctx: Context, include_parameters: bool = False, designators: list = None,
                                  sheet: str = "", offset: int = 0, limit: int = 0,
-                                 parameter_names: list = None) -> str:
+                                 parameter_names: list = None, project_path: str = "") -> str:
     """
     List every component of the compiled project (schematic or harness side).
 
-    Compiles the focused project in memory first (nothing is saved). If the focused
-    project is an Altium Harness project (.PrjHar), it automatically parses the wiring
-    diagrams (.WirDoc) directly.
+    Compiles the project in memory first (nothing is saved): project_path,
+    or the focused project, as for get_erc_violations. Unlike
+    the PCB component tools, this returns the schematic Comment of each
+    instance, which is where values of generic passives usually live.
+    An Altium Harness project (.PrjHar, given as project_path or focused)
+    is read from its saved wiring diagrams (.WirDoc) instead.
 
     A large project does not fit in one reply. A reply stops at about 60,000
     characters: when next_offset is not null, call again with
@@ -8660,6 +9731,8 @@ async def get_project_components(ctx: Context, include_parameters: bool = False,
         limit (int): At most this many components; 0 for as many as fit.
         parameter_names (list): Return only these parameters, e.g.
             ["Manufacturer_Part_Number"]. Implies include_parameters.
+        project_path (str): Full path of the .PrjPcb to compile, or of a
+            .PrjHar to read from its saved files.
 
     Returns:
         str: JSON with project_path, component_count (the whole project),
@@ -8670,9 +9743,15 @@ async def get_project_components(ctx: Context, include_parameters: bool = False,
     import project_components
 
     with_parameters = include_parameters or bool(parameter_names)
-    response = await altium_bridge.execute_command(
-        "get_project_components", {"include_parameters": with_parameters})
-    if response.get("success", False):
+    project_path, error = _project_path(project_path)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    response = None
+    if not _is_harness_project(project_path):
+        response = await altium_bridge.execute_command(
+            "get_project_components",
+            {"include_parameters": with_parameters, "project_path": project_path})
+    if response is not None and response.get("success", False):
         result = response.get("result", {})
         try:
             data = json.loads(result, strict=False) if isinstance(result, str) else result
@@ -8684,10 +9763,12 @@ async def get_project_components(ctx: Context, include_parameters: bool = False,
             data, designators=designators, sheet=sheet, offset=offset, limit=limit,
             parameter_names=parameter_names))
 
-    # Fallback for Harness projects (.PrjHar / .WirDoc), parsed from the saved
-    # files. Their parameters are a {name: value} dict, so names are picked here.
+    # Harness projects (.PrjHar / .WirDoc), parsed from the saved files: the
+    # one named, else the focused one. Their parameters are a {name: value}
+    # dict, so names are picked here.
     try:
-        h_path = await _get_active_harness_path()
+        h_path = (Path(project_path) if _is_harness_project(project_path)
+                  else await _get_active_harness_path())
         if h_path:
             components = get_harness_components(h_path, include_parameters=with_parameters)
             if parameter_names:
@@ -8703,33 +9784,52 @@ async def get_project_components(ctx: Context, include_parameters: bool = False,
     except Exception as e:
         logger.warning(f"Harness fallback failed: {e}")
 
-    error_msg = response.get("error", "Unknown error")
+    error_msg = (response or {}).get("error", "Unknown error")
     logger.error(f"Error getting project components: {error_msg}")
     return json.dumps({"error": f"Failed to get project components: {error_msg}"})
 
 
 @_tool(read_only=True)
-async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
+async def get_erc_violations(ctx: Context, compile: bool = True, project_path: str = "") -> str:
     """
-    Compile the focused project and list its ERC/compiler violations.
+    Compile a project and list its ERC/compiler violations.
 
-    Compiling works in memory and does not save any document (Altium may
-    refresh the derived .PrjPcbStructure file). For harness projects (.PrjHar),
-    performs native rule-checking (unconnected pins, single pin nets, unannotated
-    connectors).
+    Give project_path to compile exactly that project (it is opened if
+    needed): without it the focused project is compiled, which is whatever
+    document last had focus, and "Free Documents" is refused. The result
+    names the project it compiled.
+
+    Compiling reads each sheet from disk, except a sheet open in Altium with
+    unsaved changes: that one is compiled from Altium's copy and listed in
+    unsaved_in_altium. Save it (or close it unsaved) for the file to count.
+    Sheets the project lists but that are not on disk are in
+    missing_on_disk. Compiling does not save any document (Altium may
+    refresh the derived .PrjPcbStructure file).
+
+    For harness projects (.PrjHar, given as project_path or focused),
+    performs native rule-checking on the saved files (unconnected pins,
+    single pin nets, unannotated connectors).
 
     Args:
         compile (bool): Compile before reading (default True). False returns
             the violations of the last compilation.
+        project_path (str): Full path of the .PrjPcb to compile, or of a
+            .PrjHar to read from its saved files.
 
     Returns:
-        str: JSON with total, fatal, errors, warnings and violations
+        str: JSON with project_path, unsaved_in_altium, missing_on_disk,
+             total, fatal, errors, warnings and violations
              [{level, type, detail}]
     """
-    response = await altium_bridge.execute_command(
-        "get_erc_violations", {"compile": compile}
-    )
-    if response.get("success", False):
+    project_path, error = _project_path(project_path)
+    if error:
+        return json.dumps({"success": False, "error": error})
+    response = None
+    if not _is_harness_project(project_path):
+        response = await altium_bridge.execute_command(
+            "get_erc_violations", {"compile": compile, "project_path": project_path}
+        )
+    if response is not None and response.get("success", False):
         result = response.get("result", {})
         return (
             result
@@ -8737,9 +9837,11 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
             else json.dumps(result, indent=2, ensure_ascii=False)
         )
 
-    # Fallback for harness projects where compilation returns no flattened document
+    # Harness projects: the one named, else the focused one (a compile
+    # returns no flattened document for them)
     try:
-        h_path = await _get_active_harness_path()
+        h_path = (Path(project_path) if _is_harness_project(project_path)
+                  else await _get_active_harness_path())
         if h_path:
             violations = get_harness_erc_violations(h_path)
             return json.dumps(
@@ -8748,7 +9850,7 @@ async def get_erc_violations(ctx: Context, compile: bool = True) -> str:
     except Exception as e:
         logger.warning(f"ERC harness fallback failed: {e}")
 
-    error_msg = response.get("error", "Unknown error")
+    error_msg = (response or {}).get("error", "Unknown error")
     logger.error(f"Error getting ERC violations: {error_msg}")
     return json.dumps({"error": f"Failed to get ERC violations: {error_msg}"})
 

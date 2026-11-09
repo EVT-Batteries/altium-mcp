@@ -492,6 +492,17 @@ begin
     end;
 end;
 
+// Whether an open document has unsaved changes. Read through BoolToStr:
+// in the bridge, IServerDocument.Modified read directly in a condition or an
+// assignment is always False, while passed as an argument it is right (a
+// sheet with a real unsaved edit read False one way and True the other).
+function DocumentModified(Doc: IServerDocument): Boolean;
+begin
+    Result := False;
+    if Doc = nil then Exit;
+    Result := BoolToStr(Doc.Modified, True) = 'True';
+end;
+
 // multiboard_document: whether Altium holds a document the server edits on
 // disk (multi-board schematic .MbsDoc, kind SdDoc; Draftsman harness drawing
 // .HarDwf, kind HarnessDrawing) and has unsaved edits in it, so the server can edit the saved
@@ -533,7 +544,7 @@ begin
         ServerDoc := FindOpenDocument(DocPath);
         if (Action = 'close') and (ServerDoc <> nil) then
         begin
-            if ServerDoc.Modified then
+            if DocumentModified(ServerDoc) then
             begin
                 Result := '{"success": false, "error": "the document has unsaved changes in Altium", "open": true, "modified": true}';
                 Exit;
@@ -553,7 +564,7 @@ begin
         if (ServerDoc <> nil) then
         begin
             IsOpen := 'true';
-            if ServerDoc.Modified then
+            if DocumentModified(ServerDoc) then
                 Modified := 'true';
         end;
         Result := '{"success": true, "action": "' + Action + '", "open": ' + IsOpen +
@@ -1928,7 +1939,7 @@ begin
                             ServerDoc := FindOpenDocument(ChildDoc.DM_FullPath);
                             if (ServerDoc = Nil) then
                                 ChildDocState := 'closed'
-                            else if ServerDoc.Modified then
+                            else if DocumentModified(ServerDoc) then
                             begin
                                 ChildDocState := 'modified';
                                 Inc(ChildModified);
@@ -1968,7 +1979,7 @@ begin
                 ServerDoc := FindOpenDocument(Doc.DM_FullPath);
                 if ServerDoc = Nil then
                     OpenState := 'closed'
-                else if ServerDoc.Modified then
+                else if DocumentModified(ServerDoc) then
                 begin
                     OpenState := 'modified';
                     Inc(ModifiedCount);
@@ -2036,7 +2047,91 @@ end;
 // Compile the focused project (in memory, nothing is saved) and list the
 // compiler/ERC violations. Violations live on the project object; the
 // per-document DM_ViolationCount does not exist in recent Altium versions.
-function GetERCViolations(ROOT_DIR: String; DoCompile: Boolean): String;
+// The project a compile command works on: ProjectPath when given (found
+// among the open projects, else opened), otherwise the focused project.
+// 'Free Documents' is not a project: compiling it gave results for nothing
+// the caller meant, so it is refused and the caller asked for a path.
+function TargetProject(ProjectPath: String; var Err: String): IProject;
+var
+    P : Integer;
+    Project : IProject;
+begin
+    Result := nil;
+    Err := '';
+    if ProjectPath <> '' then
+    begin
+        for P := 0 to GetWorkspace.DM_ProjectCount - 1 do
+        begin
+            Project := GetWorkspace.DM_Projects(P);
+            if (Project <> nil) and SameText(NormalizePath(Project.DM_ProjectFullPath), NormalizePath(ProjectPath)) then
+            begin
+                Result := Project;
+                Exit;
+            end;
+        end;
+        if not FileExists(ProjectPath) then
+        begin
+            Err := 'Project not found: ' + ProjectPath;
+            Exit;
+        end;
+        Result := GetWorkspace.DM_OpenProject(ProjectPath, True);
+        if Result = nil then Err := 'Altium could not open the project ' + ProjectPath;
+        Exit;
+    end;
+    // FocusedDesignProject skips Free Documents and script projects, falling
+    // back to the project of the shown document (a harness or multi-board
+    // sub-project focused through its parent) or the last project used.
+    // Free Documents' full path is just 'Free Documents': a project in a
+    // folder of that name is still a project
+    Result := FocusedDesignProject(0);
+    if (Result = nil) or SameText(Result.DM_ProjectFullPath, 'Free Documents') then
+    begin
+        Result := nil;
+        Err := 'No project is focused (Free Documents has focus); give project_path';
+    end;
+end;
+
+// What a compile of Project reads: a sheet with unsaved changes in Altium is
+// compiled from Altium's copy, not the file; one listed but missing on disk
+// is left out. Both are added to Props, so a result says what it rests on.
+procedure AddProjectSheetStatus(Project: IProject; Props: TStringList);
+var
+    I : Integer;
+    Doc : IDocument;
+    SheetPath : String;
+    SheetDoc : IServerDocument;
+    Unsaved, Missing : TStringList;
+begin
+    Unsaved := TStringList.Create;
+    Missing := TStringList.Create;
+    try
+        for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+        begin
+            Doc := Project.DM_LogicalDocuments(I);
+            if Doc.DM_DocumentKind = 'SCH' then
+            begin
+                SheetPath := Doc.DM_FullPath;
+                if not FileExists(SheetPath) then
+                    Missing.Add('"' + JSONEscapeString(SheetPath) + '"')
+                else
+                begin
+                    SheetDoc := Client.GetDocumentByPath(SheetPath);
+                    if DocumentModified(SheetDoc) then
+                        Unsaved.Add('"' + JSONEscapeString(SheetPath) + '"');
+                end;
+            end;
+        end;
+        if Unsaved.Count > 0 then Props.Add(BuildJSONArray(Unsaved, 'unsaved_in_altium'))
+        else Props.Add('"unsaved_in_altium": []');
+        if Missing.Count > 0 then Props.Add(BuildJSONArray(Missing, 'missing_on_disk'))
+        else Props.Add('"missing_on_disk": []');
+    finally
+        Unsaved.Free;
+        Missing.Free;
+    end;
+end;
+
+function GetERCViolations(ROOT_DIR: String; DoCompile: Boolean; ProjectPath: String): String;
 var
     Project     : IProject;
     Violation   : IViolation;
@@ -2046,11 +2141,12 @@ var
     ViolArray   : TStringList;
     ItemProps   : TStringList;
     OutputLines : TStringList;
+    Err         : String;
 begin
-    Project := FocusedDesignProject(0);
+    Project := TargetProject(ProjectPath, Err);
     if Project = Nil then
     begin
-        Result := 'ERROR: No focused project';
+        Result := 'ERROR: ' + Err;
         Exit;
     end;
 
@@ -2082,6 +2178,7 @@ begin
 
         AddJSONProperty(ResultProps, 'project_path', Project.DM_ProjectFullPath);
         AddJSONBoolean(ResultProps, 'compiled', DoCompile);
+        AddProjectSheetStatus(Project, ResultProps);
         AddJSONInteger(ResultProps, 'total', ViolArray.Count);
         AddJSONInteger(ResultProps, 'fatal', NFatal);
         AddJSONInteger(ResultProps, 'errors', NError);
@@ -2103,7 +2200,7 @@ end;
 
 // Every component of the compiled (flattened) project with its comment,
 // footprint, library reference, sheet and parameters. Compiles first.
-function GetProjectComponents(ROOT_DIR: String; IncludeParameters: Boolean): String;
+function GetProjectComponents(ROOT_DIR: String; IncludeParameters: Boolean; ProjectPath: String): String;
 var
     Project     : IProject;
     Flat        : IDocument;
@@ -2114,11 +2211,12 @@ var
     ParamArray  : TStringList;
     ResultProps : TStringList;
     OutputLines : TStringList;
+    Err         : String;
 begin
-    Project := FocusedDesignProject(0);
+    Project := TargetProject(ProjectPath, Err);
     if Project = Nil then
     begin
-        Result := 'ERROR: No focused project';
+        Result := 'ERROR: ' + Err;
         Exit;
     end;
     Project.DM_Compile;
@@ -2197,7 +2295,7 @@ begin
     begin
         DocPath := Client.CurrentView.OwnerDocument.FileName;
         DocKind := Client.CurrentView.OwnerDocument.Kind;
-        IsModified := Client.CurrentView.OwnerDocument.Modified;
+        IsModified := DocumentModified(Client.CurrentView.OwnerDocument);
     end;
 
     if (DocPath <> '') then
