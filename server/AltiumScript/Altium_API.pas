@@ -148,10 +148,12 @@ var
     Module: IServerModule;
     CurrentDoc: IServerDocument;
     SchZoom: String;
+    DwfView: String;
 begin
     // Extract the view type parameter
     ViewType := 'pcb';  // Default to PCB
     SchZoom := '';
+    DwfView := '';
     DocPath := '';
     PrjPath := '';
     DesignatorsList := TStringList.Create;
@@ -182,6 +184,11 @@ begin
             else if (Pos('"sch_zoom"', RequestData[i]) > 0) then
             begin
                 SchZoom := JSONLineValue(RequestData[i]);
+            end
+            // Draftsman view step: 'action;page index;steps;rect'
+            else if (Pos('"dwf_view"', RequestData[i]) > 0) then
+            begin
+                DwfView := JSONLineValue(RequestData[i]);
             end;
         end;
 
@@ -205,7 +212,7 @@ begin
 
         end;
 
-        Result := TakeViewScreenshot(ViewType, DesignatorsList, SchZoom);
+        Result := TakeViewScreenshot(ViewType, DesignatorsList, SchZoom, DwfView);
     finally
         DesignatorsList.Free;
     end;

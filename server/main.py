@@ -7893,6 +7893,228 @@ def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
         win32gui.ReleaseDC(hwnd, hwnd_dc)
 
 
+def _run_dpi_aware(fn):
+    """Run fn with per-monitor DPI awareness for this thread (physical pixels).
+
+    Altium works in physical pixels (Draftsman's PointToScreen too); this
+    process is not DPI aware, so without this window rects come back divided
+    by the display scale.
+    """
+    import ctypes
+    set_dpi_context = ctypes.windll.user32.SetThreadDpiAwarenessContext
+    set_dpi_context.restype = ctypes.c_void_p
+    set_dpi_context.argtypes = [ctypes.c_void_p]
+    previous = set_dpi_context(-4) or set_dpi_context(-3)
+    try:
+        return fn()
+    finally:
+        if previous:
+            set_dpi_context(previous)
+
+
+def _draftsman_view_window(document_name: str) -> tuple[int, tuple] | None:
+    """The WPF window of the Draftsman view showing document_name: (hwnd, rect)."""
+    import pywintypes
+
+    def children(parent: int) -> list[int]:
+        out: list[int] = []
+
+        def collect(h, _):
+            if win32gui.IsWindowVisible(h):
+                out.append(h)
+            return True
+        try:
+            win32gui.EnumChildWindows(parent, collect, 0)
+        except pywintypes.error:
+            logger.debug(f"EnumChildWindows failed on {parent:#x}")
+        return out
+
+    wanted = document_name.lower()
+    mains: list[int] = []
+
+    def top(hwnd, _):
+        if win32gui.IsWindowVisible(hwnd) and "Altium" in win32gui.GetWindowText(hwnd):
+            mains.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(top, 0)
+    tabs = [h for m in mains for h in children(m)
+            if win32gui.GetClassName(h) == "TViewComponent" and win32gui.GetWindowText(h).lower() == wanted]
+    best = None
+    for tab in tabs:
+        found = [h for h in children(tab) if win32gui.GetClassName(h).startswith("HwndWrapper")]
+        for h in found:
+            r = win32gui.GetWindowRect(h)
+            size = (r[2] - r[0]) * (r[3] - r[1])
+            if size > 0 and (best is None or size > best[2]):
+                best = (h, r, size)
+    return (best[0], best[1]) if best else None
+
+
+def _wheel_over_view(hwnd: int, notches: int, rect: tuple, horizontal: bool = False) -> bool:
+    """Scroll a view with real wheel input (call in physical pixels, Altium in front).
+
+    Posted WM_MOUSEWHEEL messages are ignored by Draftsman's WPF view unless
+    WPF already believes the mouse is over it, and it reads modifier keys
+    from the real keyboard, so the cursor is put over the view centre for
+    the wheel turn (with Shift held to scroll horizontally) and moved back at
+    once. Nothing happens (False) when another window covers that point.
+    """
+    x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
+    under = win32gui.WindowFromPoint((x, y))
+    if under != hwnd and not win32gui.IsChild(hwnd, under):
+        return False
+    saved = win32api.GetCursorPos()
+    try:
+        win32api.SetCursorPos((x, y))
+        time.sleep(0.05)
+        if horizontal:
+            win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
+            time.sleep(0.05)
+        while notches:
+            step = max(-100, min(100, notches))
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, step * 120, 0)
+            notches -= step
+        time.sleep(0.1)
+    finally:
+        if horizontal:
+            win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.05)
+        win32api.SetCursorPos(saved)
+    return True
+
+
+async def _navigate_draftsman(base_params: dict, document_path: str, zoom) -> dict:
+    """Bring a page (and area) of a Draftsman drawing into view.
+
+    zoom: "document", a page number (1-based) or {"page": n, "area":
+    [x1, y1, x2, y2]} (mm from the page's bottom-left corner, y up). Returns
+    {"crop": screen rect or None, "info": {...}} or {"error": ...}.
+    """
+    import draftsman_view as dv
+    from harness_drawing import review_drawing
+
+    async def step(action: str, page_idx: int = 0, steps: int = 0, rect: str = "") -> dict:
+        params = {**base_params, "dwf_view": f"{action};{page_idx};{steps};{rect}"}
+        response = await altium_bridge.execute_command("take_view_screenshot", params)
+        if not response.get("success", False):
+            return {"error": response.get("error", "Altium did not answer")}
+        result = response.get("result", {})
+        state = dv.parse_state(result.get("dwf_view", "") if isinstance(result, dict) else "")
+        logger.info(f"Draftsman view {action}: {state}")
+        if not state:
+            return {"error": "the focused document is not a Draftsman drawing"}
+        return state
+
+    if isinstance(zoom, str) and zoom.strip().lower() == "document":
+        state = await step("document")
+        if "error" in state:
+            return {"error": state["error"]}
+        return {"crop": None, "info": {"dwf_zoom": "document", "page_count": state.get("pages")}}
+
+    area = None
+    if isinstance(zoom, dict):
+        page_no, area = zoom.get("page", 1), zoom.get("area")
+    else:
+        page_no = zoom
+    try:
+        page_no = int(page_no)
+    except (TypeError, ValueError):
+        return {"error": 'dwf zoom is "document", a page number or {"page": n, "area": [x1, y1, x2, y2]} (mm)'}
+    if area is not None:
+        try:
+            area = [float(v) for v in area]
+        except (TypeError, ValueError):
+            area = []
+        if len(area) != 4:
+            return {"error": "area is [x1, y1, x2, y2] in mm from the page's bottom-left corner"}
+
+    try:
+        review = await asyncio.to_thread(review_drawing, Path(document_path))
+    except (OSError, ValueError) as e:
+        return {"error": f"cannot read the drawing's pages: {e}"}
+    pages = review.get("pages", [])
+    if not 1 <= page_no <= len(pages):
+        return {"error": f"page {page_no} does not exist (the saved drawing has {len(pages)} pages)"}
+    page = pages[page_no - 1]
+    rect = dv.rect_spec((page.get("width_mm") or 0.0, page.get("height_mm") or 0.0), area)
+    idx = page_no - 1
+
+    window = await asyncio.to_thread(_run_dpi_aware, lambda: _draftsman_view_window(Path(document_path).name))
+    if not window:
+        return {"error": "Draftsman view window not found"}
+    hwnd, view = window
+    in_front = False
+
+    async def scroll_to(target_key: str, state: dict, axis: str = "y") -> dict:
+        nonlocal in_front
+        px = dv.DEFAULT_PIXELS_PER_NOTCH
+        i = 0 if axis == "x" else 1
+        for _ in range(4):
+            target = state.get(target_key)
+            if not target:
+                return state
+            notches = dv.scroll_notches(target, view, px, axis)
+            if notches == 0:
+                return state
+            if not in_front:
+                # Real wheel input goes to the window under the cursor
+                await asyncio.to_thread(_bring_to_front, win32gui.GetAncestor(hwnd, 2))
+                await asyncio.sleep(0.4)
+                in_front = True
+            done = await asyncio.to_thread(
+                _run_dpi_aware, lambda n=notches: _wheel_over_view(hwnd, n, view, axis == "x"))
+            logger.info(f"Draftsman view: wheel {notches} notches ({axis}) over {view}: {done}")
+            if not done:
+                return {"error": "another window covers the Draftsman view; it cannot be scrolled"}
+            await asyncio.sleep(0.3)
+            new = await step("locate", idx, 0, rect)
+            if "error" in new:
+                return new
+            moved = new[target_key][i] - target[i] if new.get(target_key) else 0
+            if moved and abs(notches) >= 2:
+                px = abs(moved / notches)
+            state = new
+            if not moved:
+                return state  # the view does not scroll further
+        return state
+
+    state = await step("locate", idx, 0, rect)
+    if "error" in state:
+        return {"error": state["error"]}
+    state = await scroll_to("page", state)
+    if "error" in state:
+        return {"error": state["error"]}
+    state = await step("fit", idx, 0, rect)
+    if "error" in state:
+        return {"error": state["error"]}
+    info: dict = {"dwf_page": page_no, "page_count": state.get("pages")}
+    if state.get("page") and not dv.inside(state["page"], view, tolerance=12):
+        info["zoom_warning"] = "the fitted page is not the one asked for; the view may not scroll this far"
+    crop = None
+    if area:
+        # Centre the area, zoom in as far as it fits, again: a fitted page
+        # has no room to scroll sideways until it is zoomed in
+        total = 0
+        while total < dv.MAX_ZOOM_STEPS:
+            for axis in ("y", "x"):
+                state = await scroll_to("area", state, axis)
+                if "error" in state:
+                    return {"error": state["error"]}
+            steps = dv.zoom_steps(state["area"], view, max_steps=dv.MAX_ZOOM_STEPS - total) if state.get("area") else 0
+            if not steps:
+                break
+            state = await step("zoom", idx, steps, rect)
+            if "error" in state:
+                return {"error": state["error"]}
+            total += steps
+        info["zoom_steps"] = total
+        crop = dv.crop_rect(state["area"], view) if state.get("area") else None
+        if crop is None:
+            info["zoom_warning"] = "the area is not in view; the whole view is captured"
+    return {"crop": crop, "info": info}
+
+
 @_tool(read_only=True)
 async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = None,
                          document_path: str = None, zoom: Any = None):
@@ -7915,13 +8137,27 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         document_path (str, optional): Absolute or relative path of the
             schematic, harness, multi-board or Draftsman document to focus
             and capture (it must be open in Altium or openable).
-        zoom (optional, 'sch' view only): "document" fits the whole sheet;
+        zoom (optional): 'sch' view: "document" fits the whole sheet;
             [x1, y1, x2, y2] (mils) zooms onto the objects the sheet owns that
             lie inside that area (connectors, wires, texts, notes, ...; Altium
             fits their extent, so the frame can be a little smaller or larger
             than the area). get_harness_data(region=...) lists what an area
             holds. The selection is restored afterwards and nothing is
-            changed in the document. Without zoom the current zoom is kept.
+            changed in the document.
+            'dwf' view (needs document_path): "document" shows every page;
+            a page number (1-based, as get_harness_drawing_data numbers
+            them) fits that page; {"page": n, "area": [x1, y1, x2, y2]} (mm
+            from the page's bottom-left corner, y up, as the review reports
+            items) zooms in on that area (x2 steps, up to x64) as far as it
+            stays in view and returns the capture cropped to it. Draftsman
+            has no script command for either: the view is scrolled with
+            real mouse-wheel input (Shift+wheel horizontally) while Altium is
+            in front, the cursor resting on the view only for each wheel turn
+            and then put back. Draftsman zooms around the view centre and
+            does not scroll past a page's edge, so an area near the edge of
+            the first or last page gets less zoom (zoom_steps in the result).
+            The page sizes come from the saved file.
+            Without zoom the current zoom is kept.
 
     Returns:
         Image content of the captured window plus a JSON metadata text block
@@ -7936,9 +8172,14 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         params = {"view_type": view_type.lower()}
         if zoom_to:
             params["designators"] = zoom_to
-        if zoom is not None:
+        dwf_zoom = None
+        if zoom is not None and view_type.lower() == "dwf":
+            if not document_path:
+                return json.dumps({"success": False, "error": "a 'dwf' zoom needs document_path"})
+            dwf_zoom = zoom
+        elif zoom is not None:
             if view_type.lower() != "sch":
-                return json.dumps({"success": False, "error": "zoom applies to the 'sch' view only"})
+                return json.dumps({"success": False, "error": "zoom applies to the 'sch' and 'dwf' views only"})
             if isinstance(zoom, str) and zoom.strip().lower() == "document":
                 params["sch_zoom"] = "document"
             elif isinstance(zoom, (list, tuple)) and len(zoom) == 4:
@@ -7990,6 +8231,18 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                 "requested_view_type": view_type,
                 "focused_kind": focused_kind,
                 "focused_document": focused_document})
+
+        # Draftsman page / area: scroll and zoom the view, crop the capture
+        crop = None
+        dwf_info: dict = {}
+        if dwf_zoom is not None:
+            nav = await _navigate_draftsman(params, str(Path(document_path).resolve()), dwf_zoom)
+            if "error" in nav:
+                if previous_window and win32gui.GetForegroundWindow() != previous_window:
+                    await asyncio.to_thread(_bring_to_front, previous_window)
+                return json.dumps({"success": False, "error": nav["error"]})
+            crop = nav.get("crop")
+            dwf_info = nav.get("info", {})
 
         # The capture runs in a worker thread: it waits for Altium to come to
         # the front and paint, which must not block the server's event loop
@@ -8117,6 +8370,13 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                         # Not when the user has already moved on by themselves
                         if previous_pid not in (0, altium_pid) and altium_is_foreground():
                             _bring_to_front(previous_window)
+                    if crop:
+                        # Screen pixels -> image pixels (both physical)
+                        box = (crop[0] - left, crop[1] - top, crop[2] - left, crop[3] - top)
+                        box = (max(0, box[0]), max(0, box[1]), min(width, box[2]), min(height, box[3]))
+                        if box[2] - box[0] > 10 and box[3] - box[1] > 10:
+                            img = img.crop(box)
+                            width, height = img.size
 
                     # Encode once: the same PNG bytes are returned and, when
                     # asked for, kept as a debug copy
@@ -8197,6 +8457,7 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             result["zoomed_object_count"] = found
             if not found:
                 result["zoom_warning"] = "no sheet object lies inside the area; zoom unchanged"
+        result.update(dwf_info)
         # What was actually captured, as opposed to what was requested
         result["captured_kind"] = focused_kind or None
         result["captured_document"] = focused_document or None

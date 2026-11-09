@@ -217,9 +217,14 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   `System\advsch.rcs` (`PLSch:Zoom*`): zoom to selection is `Object=Selected` (not
   `Action=Selected`, which does nothing), fit sheet `Action=Document`, `ZoomLevel=<x>`.
   Zoom area / around point are interactive. Draftsman's are in its extension's
-  `Altium.Designer.PcbDrawing.rcs`: `FitSheet` fits the *selected* sheet, `Zoom Action=Area`
-  is interactive, and the editor shows one page at a time ("Page n of m"); no command found
-  turns the page from a script.
+  `Altium.Designer.PcbDrawing.rcs`: `FitSheet` fits the page under the view centre (pages are
+  stacked top to bottom), `Zoom Action=In` doubles around the view centre, `Action=Area` /
+  `Point` are interactive. Draftsman's script API is `DraftsmanServer` (unit `RT_Draftsman`:
+  pages, items, `PointToScreen`); its WPF view ignores posted wheel messages and posted
+  modifier keys, so `get_screenshot` scrolls it with real wheel input (HANDOVER session 25).
+- An interface missing from the scripting docs: read its members and parameter names from
+  the .NET metadata (`System\Altium.Edp.Interfaces.dll`, namespace `Rt_*` / `RT_*`, e.g. with a
+  small ECMA-335 table reader) before probing; a `var` parameter shows as a by-ref type.
 - Font ids: a text's or note's `FontID` in memory indexes Altium's font manager, while the
   saved file's `FontID` indexes the sheet's own font table (RECORD 104 `FontName<n>` /
   `Size<n>`); the two differ (a label set to id 3 was saved as 2). Give fonts by name and size

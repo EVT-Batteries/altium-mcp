@@ -1261,11 +1261,98 @@ begin
     end;
 end;
 
+// Screen rectangle 'left,top,right,bottom' (physical pixels) of the area
+// X1..X2 x Y1..Y2 (mm from the page's bottom-left corner, y up) of a page of
+// the Draftsman view. Pages are stacked top to bottom in the view; a page
+// scrolled out of sight still reports where it would be.
+function DwfScreenRect(View: IDraftsman_DocumentView; PageIdx: Integer; X1, Y1, X2, Y2: Double): String;
+var
+    AX, AY, BX, BY, T: Double;
+begin
+    AX := X1; AY := Y1;
+    View.PointToScreen(PageIdx, AX, AY);
+    BX := X2; BY := Y2;
+    View.PointToScreen(PageIdx, BX, BY);
+    if (BX < AX) then begin T := AX; AX := BX; BX := T; end;
+    if (BY < AY) then begin T := AY; AY := BY; BY := T; end;
+    Result := IntToStr(Round(AX)) + ',' + IntToStr(Round(AY)) + ',' + IntToStr(Round(BX)) + ',' + IntToStr(Round(BY));
+end;
+
+// Draftsman view step for get_screenshot (Draftsman has no zoom-to-area or
+// page command a script can drive; the server scrolls the view between
+// steps). Action: 'locate' (no change), 'fit' (PcbDrawing:FitSheet: fits the
+// page that holds the view centre), 'zoom' (Zoom In Steps times, x2 around
+// the view centre each), 'document' (ViewFit, every page). Rect: page
+// rectangle and optional area, in thousandths of mm, comma separated (4 or 8
+// numbers). Returns 'pages=<n>;page=<l,t,r,b>;area=<l,t,r,b>' (screen pixels).
+function DraftsmanViewStep(Action: String; PageIdx, Steps: Integer; RectSpec: String): String;
+var
+    Srv    : IDraftsman_ServerInterface;
+    Data   : IDraftsman_DocumentData;
+    View   : IDraftsman_DocumentView;
+    Fn     : String;
+    Parts  : TStringList;
+    k, N   : Integer;
+begin
+    Result := 'error=no Draftsman view';
+    if (Client.CurrentView = nil) then Exit;
+    if (Client.CurrentView.OwnerDocument = nil) then Exit;
+    Fn := Client.CurrentView.OwnerDocument.FileName;
+    Srv := DraftsmanServer;
+    if (Srv = nil) then Exit;
+    Data := Srv.GetState_DocumentData(Fn);
+    View := Srv.GetState_DocumentView(Fn);
+    if (Data = nil) or (View = nil) then Exit;
+    N := Data.GetState_PageCount;
+    if (PageIdx < 0) or (PageIdx >= N) then
+    begin
+        Result := 'error=page out of range;pages=' + IntToStr(N);
+        Exit;
+    end;
+    if (Action = 'fit') then
+    begin
+        ResetParameters;
+        RunProcess('PcbDrawing:FitSheet');
+    end
+    else if (Action = 'document') then
+    begin
+        ResetParameters;
+        RunProcess('PcbDrawing:ViewFit');
+    end
+    else if (Action = 'zoom') then
+    begin
+        for k := 1 to Steps do
+        begin
+            ResetParameters;
+            AddStringParameter('Action', 'In');
+            RunProcess('PcbDrawing:Zoom');
+        end;
+    end;
+    Result := 'pages=' + IntToStr(N);
+    Parts := TStringList.Create;
+    try
+        Parts.CommaText := RectSpec;
+        if (Parts.Count >= 4) then
+        begin
+            Result := Result + ';page=' + DwfScreenRect(View, PageIdx,
+                StrToInt(Parts[0]) / 1000.0, StrToInt(Parts[1]) / 1000.0,
+                StrToInt(Parts[2]) / 1000.0, StrToInt(Parts[3]) / 1000.0);
+            if (Parts.Count >= 8) then
+                Result := Result + ';area=' + DwfScreenRect(View, PageIdx,
+                    StrToInt(Parts[4]) / 1000.0, StrToInt(Parts[5]) / 1000.0,
+                    StrToInt(Parts[6]) / 1000.0, StrToInt(Parts[7]) / 1000.0);
+        end;
+    finally
+        Parts.Free;
+    end;
+end;
+
 // If DesignatorsList is non-empty (PCB view only), the view is zoomed to
 // those components before the server captures the window. SchZoom (sch view):
 // 'document' fits the whole sheet, 'x1,y1,x2,y2' (mils) the objects inside
-// that area; '' keeps the zoom.
-function TakeViewScreenshot(ViewType: String; DesignatorsList: TStringList; SchZoom: String): String;
+// that area; '' keeps the zoom. DwfView (dwf view): 'action;page index;
+// steps;rect' for DraftsmanViewStep, reported as 'dwf_view'.
+function TakeViewScreenshot(ViewType: String; DesignatorsList: TStringList; SchZoom: String; DwfView: String): String;
 var
     Board          : IPCB_Board;
     SchDoc         : ISch_Document;
@@ -1286,8 +1373,14 @@ var
     ScreenshotResult : String;
     ZoomParts      : TStringList;
     SchZoomed      : Integer;
+    DwfState       : String;
+    DwfRest        : String;
+    DwfAction      : String;
+    DwfPage        : String;
+    DwfSteps       : String;
 begin
     SchZoomed := -1;
+    DwfState := '';
     // Default result
     Result := '{"success": false, "error": "Failed to initialize screenshot capture"}';
 
@@ -1366,6 +1459,22 @@ begin
             end;
         end;
 
+    // Draftsman view step (page / area navigation, driven by the server)
+    if (DocType = 'DWF') and (DwfView <> '') then
+    begin
+        DwfRest := DwfView + ';;;';
+        DwfAction := Copy(DwfRest, 1, Pos(';', DwfRest) - 1);
+        DwfRest := Copy(DwfRest, Pos(';', DwfRest) + 1, Length(DwfRest));
+        DwfPage := Copy(DwfRest, 1, Pos(';', DwfRest) - 1);
+        DwfRest := Copy(DwfRest, Pos(';', DwfRest) + 1, Length(DwfRest));
+        DwfSteps := Copy(DwfRest, 1, Pos(';', DwfRest) - 1);
+        DwfRest := Copy(DwfRest, Pos(';', DwfRest) + 1, Length(DwfRest));
+        DwfRest := Copy(DwfRest, 1, Pos(';', DwfRest) - 1);
+        if (DwfPage = '') then DwfPage := '0';
+        if (DwfSteps = '') then DwfSteps := '0';
+        DwfState := DraftsmanViewStep(DwfAction, StrToInt(DwfPage), StrToInt(DwfSteps), DwfRest);
+    end;
+
     // Report what is ACTUALLY focused now that EnsureDocumentFocused has run.
     // The server compares this against the requested view: if no document of
     // the requested kind is open, the focus stays where it was and the
@@ -1404,6 +1513,7 @@ begin
         AddJSONInteger(ResultProps, 'zoomed_component_count', ZoomedCount);
         // -1: no sch zoom asked; 0 after 'document'; else objects zoomed to
         AddJSONInteger(ResultProps, 'sch_zoomed_objects', SchZoomed);
+        AddJSONProperty(ResultProps, 'dwf_view', DwfState);
 
         // Add signal to the server that it can now capture the screenshot
         AddJSONBoolean(ResultProps, 'ready_for_capture', True);

@@ -34,20 +34,49 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `e62f7d9` (session 23 merge, committed by the user) | session 24: sheet graphics, connector removal, checker frames, layout notes / merge_bundles / import report, Draftsman add_text / missing tables, sch screenshot zoom; the user commits |
+| `altium-mcp/` | `feature/harness-support` | `551c3bf` (session 24, committed by the user) | session 25: Draftsman page / area screenshots (`get_screenshot` dwf `zoom`); the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
 `a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`,
-session 21 `3507e5d`, session 22 `ef585d9` / `7ec4b71`, session 23 merge `e62f7d9`. Unit tests:
-464 passed, 7 skipped (session 24).
+session 21 `3507e5d`, session 22 `ef585d9` / `7ec4b71`, session 23 merge `e62f7d9`, session 24
+`551c3bf`. Unit tests: 471 passed, 7 skipped (session 25).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 24 (2026-11-09): sheet graphics, connector removal, layout merges, zoom (uncommitted)
+### Session 25 (2026-11-09): Draftsman page / area screenshots (uncommitted)
+`get_screenshot(view_type="dwf", document_path=..., zoom=...)`: `"document"` (every page,
+`PcbDrawing:ViewFit`), a page number (1-based, review numbering) or `{"page": n, "area":
+[x1, y1, x2, y2]}` (mm, page bottom-left, y up), the capture then cropped to the area. New module
+`server/draftsman_view.py` (geometry, tests `tests/test_draftsman_view.py`); bridge
+`DraftsmanViewStep` in `other_utils.pas` (param `dwf_view` = `action;page index;steps;rect`,
+actions locate / fit / zoom / document), driven step by step from `_navigate_draftsman` in
+`main.py`. Verified live on the scratch pigtail drawing (5 pages): pages 1, 2, 4, 5, document,
+a 60 x 50 mm area holding a rear view (x4, cropped), page 9 refused.
+- **Draftsman has a script API** (no decompiling needed; read from the .NET metadata of
+  `System\Altium.Edp.Interfaces.dll`, unit `RT_Draftsman`): the global `DraftsmanServer`
+  (`IDraftsman_ServerInterface`) gives `GetState_DocumentData(FileName)` (pages: count, items
+  with type / title / location / size in mm, page template get / set) and
+  `GetState_DocumentView(FileName)` with `PointToScreen(PageIndex, var X, var Y)` /
+  `ScreenToPoint` (mm from the page's bottom-left <-> physical screen pixels). Declare the
+  variables typed (`IDraftsman_DocumentView`...); late-bound calls fail. No selection, zoom or
+  page command.
+- **Navigation**: pages are stacked top to bottom in one view; `PcbDrawing:FitSheet` fits the
+  page under the view centre, `Zoom Action=In` doubles around the view centre. The server
+  scrolls with **real** wheel input: posted `WM_MOUSEWHEEL` worked once and then never again
+  (WPF only takes it while it believes the mouse is over the view; a posted `WM_MOUSEMOVE`
+  does not make it so) and posted modifier flags are ignored (WPF reads the real keyboard).
+  So Altium comes to the front, the cursor rests on the view centre for each wheel turn
+  (Shift held for horizontal) and is put back; nothing is sent when another window covers that
+  point. 50 px per notch, measured per call. A fitted page has no sideways scroll range, so an
+  area is centred and zoomed in rounds; the view does not scroll past a page edge, so an area
+  near a side edge gets less zoom. Ctrl+wheel does not zoom in Draftsman. A bridge run's
+  `Client.ShowDocument` keeps the scroll position.
+
+### Session 24 (2026-11-09): sheet graphics, connector removal, layout merges, zoom
 The §8 to-do list, worked through with live tests on a renamed scratch copy of a two-connector
 pigtail harness project (`MCP_Test_Reg.*` in the session scratch folder; wiring diagram,
 layout, Draftsman drawing). New module `server/sheet_spec.py` (note / move / region-copy
@@ -95,10 +124,7 @@ new cases in the parser, checker, layout and drawing suites.
   restored. `Action=Rectangle`, `Action=Selected`, `Sch:ZoomSelected` do nothing from a
   script; the right parameters are in `System\advsch.rcs`. `Selection` only resolves
   late-bound and only on sheet-owned objects (dev skill §5).
-- **Not done**: Draftsman page navigation / zoom for screenshots (§8 item 6). Its commands
-  (`Altium.Designer.PcbDrawing.rcs`) fit the *selected* sheet or ask for an area, and the
-  editor shows one page at a time; reading how a sheet gets selected needs the extension
-  decompiled (ILSpy), which the session's permission settings did not allow.
+- **Not done** here: Draftsman page navigation / zoom for screenshots (done in session 25).
 - Multi-part `part` was tested live on a single-part connector only (A found, B not_found).
 
 ### Session 23 (2026-11-09): upstream v0.6.2 + v0.7.0 merged (uncommitted merge)
@@ -985,9 +1011,9 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    stored projections lets Draftsman draw them itself. Projection computation is the agent's
    job today (build123d session); a helper that takes footprint + side and returns the lines
    would save steps. (done, session 24) Text items (`add_text`, e.g. cavity numbers).
-   Open: page navigation / zoom to a view for screenshots. The editor shows one page at a
-   time and `PcbDrawing:FitSheet` fits the selected sheet; how a sheet is selected (and
-   whether `Zoom` takes a location) needs `Altium.Designer.PcbDrawing.dll` decompiled.
+   (done, session 25) page / area screenshots (`get_screenshot` dwf `zoom`). Open: the
+   `DraftsmanServer` script API could replace some file edits of `edit_harness_drawing`
+   (item locations, page templates) while the drawing is open.
 7. `import_harness_changes`: (fixed, session 19) a save from a bridge run keeps the import
    now that the bridge runs a script file (verified: sandbox import, bridge save, the saved
    layout carries the imported parameter); the open / import / save may move into the bridge
