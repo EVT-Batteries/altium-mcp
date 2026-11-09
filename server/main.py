@@ -7951,37 +7951,87 @@ def _draftsman_view_window(document_name: str) -> tuple[int, tuple] | None:
     return (best[0], best[1]) if best else None
 
 
-def _wheel_over_view(hwnd: int, notches: int, rect: tuple, horizontal: bool = False) -> bool:
+def _wheel_over_view(hwnd: int, notches: int, rect: tuple, horizontal: bool = False) -> str:
     """Scroll a view with real wheel input (call in physical pixels, Altium in front).
 
-    Posted WM_MOUSEWHEEL messages are ignored by Draftsman's WPF view unless
-    WPF already believes the mouse is over it, and it reads modifier keys
-    from the real keyboard, so the cursor is put over the view centre for
-    the wheel turn (with Shift held to scroll horizontally) and moved back at
-    once. Nothing happens (False) when another window covers that point.
+    Posted WM_MOUSEWHEEL messages are ignored by Draftsman's WPF view (it
+    checks the real cursor position) and it reads modifier keys from the
+    real keyboard, so the cursor is put over the view centre for the wheel
+    turn (Shift held to scroll horizontally), about 0.15 s, and moved back.
+    Returns "ok", "covered" (another window is on top there), "busy" (a
+    mouse button or modifier key is down) or "interrupted" (the user moved
+    the mouse meanwhile: the cursor is then left to them).
     """
     x, y = (rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2
     under = win32gui.WindowFromPoint((x, y))
     if under != hwnd and not win32gui.IsChild(hwnd, under):
-        return False
+        return "covered"
+    if _user_input_held():
+        return "busy"
     saved = win32api.GetCursorPos()
+    restore = True
     try:
         win32api.SetCursorPos((x, y))
-        time.sleep(0.05)
+        time.sleep(0.03)
+        if win32api.GetCursorPos() != (x, y) or _user_input_held():
+            # The user moved the mouse or pressed a button: hands off
+            restore = False
+            return "interrupted"
         if horizontal:
             win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
-            time.sleep(0.05)
-        while notches:
-            step = max(-100, min(100, notches))
-            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, step * 120, 0)
-            notches -= step
-        time.sleep(0.1)
+        try:
+            while notches:
+                step = max(-100, min(100, notches))
+                win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, step * 120, 0)
+                notches -= step
+            # The view reads the cursor position when it handles the wheel
+            time.sleep(0.12)
+        finally:
+            if horizontal:
+                win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
+        if win32api.GetCursorPos() != (x, y):
+            restore = False  # the user has the mouse now; leave it where they put it
     finally:
-        if horizontal:
-            win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
-        win32api.SetCursorPos(saved)
-    return True
+        if restore:
+            win32api.SetCursorPos(saved)
+    return "ok"
+
+
+# Draftsman screenshots use real mouse input; only after this long without
+# any input from the user, waiting at most DWF_IDLE_WAIT seconds for it
+DWF_IDLE_SECONDS = 2.0
+DWF_IDLE_WAIT = 30.0
+
+
+_ZORDER_ONLY = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+
+
+def _raise_without_activating(hwnd: int) -> None:
+    """Put a window above the others without giving it the keyboard."""
+    try:
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0, _ZORDER_ONLY)
+    except win32gui.error as e:
+        logger.debug(f"SetWindowPos (raise) refused: {e}")
+
+
+def _lower_behind(hwnd: int, front: int) -> None:
+    """Put a window back just behind another one, without activating either."""
+    try:
+        win32gui.SetWindowPos(hwnd, front, 0, 0, 0, 0, _ZORDER_ONLY)
+    except win32gui.error as e:
+        logger.debug(f"SetWindowPos (lower) refused: {e}")
+
+
+def _user_idle_seconds() -> float:
+    """Seconds since the last keyboard or mouse input (any program)."""
+    return max(0, win32api.GetTickCount() - win32api.GetLastInputInfo()) / 1000.0
+
+
+def _user_input_held() -> bool:
+    """A mouse button or a modifier key is down."""
+    keys = (win32con.VK_LBUTTON, win32con.VK_RBUTTON, win32con.VK_MBUTTON,
+            win32con.VK_SHIFT, win32con.VK_CONTROL, win32con.VK_MENU)
+    return any(win32api.GetAsyncKeyState(k) & 0x8000 for k in keys)
 
 
 async def _navigate_draftsman(base_params: dict, document_path: str, zoom) -> dict:
@@ -8044,10 +8094,40 @@ async def _navigate_draftsman(base_params: dict, document_path: str, zoom) -> di
     if not window:
         return {"error": "Draftsman view window not found"}
     hwnd, view = window
-    in_front = False
+    altium_root = win32gui.GetAncestor(hwnd, 2)
+    cx, cy = (view[0] + view[2]) // 2, (view[1] + view[3]) // 2
+
+    def view_on_top() -> bool:
+        under = win32gui.WindowFromPoint((cx, cy))
+        return under == hwnd or bool(win32gui.IsChild(hwnd, under))
+
+    async def wheel(notches: int, axis: str) -> str:
+        """One wheel turn, only while the user is idle.
+
+        Altium is raised above the other windows WITHOUT being activated
+        (the wheel goes to the window under the cursor; the keyboard stays
+        with the user's window), then put back behind that window.
+        """
+        waited = 0.0
+        while _user_idle_seconds() < DWF_IDLE_SECONDS:
+            if waited >= DWF_IDLE_WAIT:
+                return "user_active"
+            await asyncio.sleep(0.25)
+            waited += 0.25
+        previous = win32gui.GetForegroundWindow()
+        try:
+            await asyncio.to_thread(_raise_without_activating, altium_root)
+            for _ in range(10):
+                await asyncio.sleep(0.05)
+                if await asyncio.to_thread(_run_dpi_aware, view_on_top):
+                    break
+            return await asyncio.to_thread(
+                _run_dpi_aware, lambda: _wheel_over_view(hwnd, notches, view, axis == "x"))
+        finally:
+            if previous and previous != altium_root:
+                await asyncio.to_thread(_lower_behind, altium_root, previous)
 
     async def scroll_to(target_key: str, state: dict, axis: str = "y") -> dict:
-        nonlocal in_front
         px = dv.DEFAULT_PIXELS_PER_NOTCH
         i = 0 if axis == "x" else 1
         for _ in range(4):
@@ -8057,32 +8137,16 @@ async def _navigate_draftsman(base_params: dict, document_path: str, zoom) -> di
             notches = dv.scroll_notches(target, view, px, axis)
             if notches == 0:
                 return state
-            if not in_front:
-                # Real wheel input goes to the window under the cursor:
-                # wait until the view is on top there (Windows can refuse or
-                # delay the first foreground request)
-                cx, cy = (view[0] + view[2]) // 2, (view[1] + view[3]) // 2
-
-                def view_on_top(cx: int = cx, cy: int = cy) -> bool:
-                    under = win32gui.WindowFromPoint((cx, cy))
-                    return under == hwnd or bool(win32gui.IsChild(hwnd, under))
-
-                for attempt in range(2):
-                    await asyncio.to_thread(_bring_to_front, win32gui.GetAncestor(hwnd, 2))
-                    for _ in range(15):
-                        await asyncio.sleep(0.1)
-                        if await asyncio.to_thread(_run_dpi_aware, view_on_top):
-                            break
-                    else:
-                        logger.info(f"Draftsman view: not on top after bring to front ({attempt + 1})")
-                        continue
-                    break
-                in_front = True
-            done = await asyncio.to_thread(
-                _run_dpi_aware, lambda n=notches: _wheel_over_view(hwnd, n, view, axis == "x"))
-            logger.info(f"Draftsman view: wheel {notches} notches ({axis}) over {view}: {done}")
-            if not done:
-                return {"error": "another window covers the Draftsman view; it cannot be scrolled"}
+            outcome = await wheel(notches, axis)
+            logger.info(f"Draftsman view: wheel {notches} notches ({axis}) over {view}: {outcome}")
+            if outcome != "ok":
+                return {"error": {
+                    "covered": "another window covers the Draftsman view; it cannot be scrolled",
+                    "busy": "a mouse button or modifier key was held; the view was not scrolled",
+                    "interrupted": "the mouse moved while the view was being scrolled; stopped",
+                    "user_active": f"the PC was in use (no {DWF_IDLE_SECONDS:g} s pause in "
+                                   f"{DWF_IDLE_WAIT:g} s); the view was not scrolled",
+                }.get(outcome, outcome)}
             await asyncio.sleep(0.3)
             new = await step("locate", idx, 0, rect)
             if "error" in new:
@@ -8137,9 +8201,10 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
     """
     Take a screenshot of the Altium window, returned as viewable image content.
 
-    Altium comes to the front for about a second, because it only paints
-    what is on screen, and the window that was in front then gets the
-    foreground back.
+    Altium is raised above the other windows for about a second, because it
+    only paints what is on screen, without being activated (the keyboard
+    stays with the user's window), then put back behind it. A minimized
+    Altium is restored and activated instead.
 
     Args:
         view_type (str): Type of view to capture - 'pcb', 'sch' (schematic,
@@ -8167,9 +8232,12 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             items) zooms in on that area (x2 steps, up to x64) as far as it
             stays in view and returns the capture cropped to it. Draftsman
             has no script command for either: the view is scrolled with
-            real mouse-wheel input (Shift+wheel horizontally) while Altium is
-            in front, the cursor resting on the view only for each wheel turn
-            and then put back. Draftsman zooms around the view centre and
+            real mouse-wheel input (Shift+wheel horizontally). Each wheel
+            turn waits until the user has not touched mouse or keyboard for
+            2 s (up to 30 s, else the call fails), brings Altium in front,
+            rests the cursor on the view for about 0.15 s, puts it back and
+            returns the foreground; it stops if the mouse moves or a button
+            or modifier key is down meanwhile. Draftsman zooms around the view centre and
             does not scroll past a page's edge, so an area near the edge of
             the first or last page gets less zoom (zoom_steps in the result).
             The page sizes come from the saved file.
@@ -8355,18 +8423,31 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     fg = win32gui.GetForegroundWindow()
                     return bool(fg) and win32process.GetWindowThreadProcessId(fg)[1] == altium_pid
 
+                def altium_on_top():
+                    # The window at the frame's centre belongs to Altium
+                    x1, y1, x2, y2 = win32gui.GetWindowRect(hwnd)
+                    under = win32gui.WindowFromPoint(((x1 + x2) // 2, (y1 + y2) // 2))
+                    return bool(under) and win32process.GetWindowThreadProcessId(under)[1] == altium_pid
+
+                # Raised above the other windows WITHOUT activation, so
+                # nothing the user types reaches Altium; a minimized Altium
+                # has to be restored and activated as before.
+                raised_only = not win32gui.IsIconic(hwnd)
                 try:
-                    _bring_to_front(hwnd)
+                    if raised_only:
+                        _raise_without_activating(hwnd)
+                    else:
+                        _bring_to_front(hwnd)
                     deadline = time.time() + 1.5
                     while time.time() < deadline:
                         time.sleep(0.1)
-                        if altium_is_foreground():
+                        if (altium_on_top() if raised_only else altium_is_foreground()):
                             activated = True
                             break
                 except Exception as e:
                     logger.warning(f"Could not bring window to foreground: {e}")
                 if not activated:
-                    logger.warning("Altium is not the foreground window; the capture may show an unpainted view")
+                    logger.warning("Altium is not on top; the capture may show an unpainted or covered view")
                 # A freshly switched-to document needs a moment to render.
                 time.sleep(1.0)
 
@@ -8383,8 +8464,13 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
                     try:
                         img = _grab_window_image(hwnd, width, height)
                     finally:
+                        if raised_only:
+                            # Back behind the window the user is working in
+                            fg = win32gui.GetForegroundWindow()
+                            if fg and win32process.GetWindowThreadProcessId(fg)[1] != altium_pid:
+                                _lower_behind(hwnd, fg)
                         # Not when the user has already moved on by themselves
-                        if previous_pid not in (0, altium_pid) and altium_is_foreground():
+                        elif previous_pid not in (0, altium_pid) and altium_is_foreground():
                             _bring_to_front(previous_window)
                     if crop:
                         # Screen pixels -> image pixels (both physical)

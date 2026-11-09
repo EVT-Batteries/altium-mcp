@@ -34,7 +34,7 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `3a66f9c` (session 25, committed by the user) | `main.py`: Draftsman scroll waits for Altium to be on top (session 25 follow-up); the user commits |
+| `altium-mcp/` | `feature/harness-support` | `3a66f9c` (session 25, committed by the user) | `main.py`: session 25 follow-up (idle-gated Draftsman scrolling, Altium raised without activation for every screenshot); the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
@@ -49,10 +49,36 @@ of real documents first; files the user is editing are not ours.
 
 ### Session 25 (2026-11-09): Draftsman page / area screenshots (`3a66f9c`)
 Verified after the restart through the MCP on a real six-page drawing: page 4 fitted; an
-85 x 80 mm area holding a rear view zoomed x8 and cropped. Follow-up fix (uncommitted): the
-first area call was refused ("another window covers the Draftsman view") because Windows had
-not yet brought Altium in front 0.4 s after the request; the scroll step now waits up to 1.5 s
-for the view to be on top at its centre and asks once more before giving up.
+85 x 80 mm area holding a rear view zoomed x8 and cropped.
+
+Follow-up (uncommitted): **the real input disturbed the user.** A click of the user's landed in
+Altium while the cursor was borrowed (it drew a selection window on the drawing), and a Ctrl+F
+typed while Altium was briefly in front opened Draftsman's Find dialog. Now:
+- **Idle gate:** each wheel turn waits for 2 s without any user input (`GetLastInputInfo`,
+  `DWF_IDLE_SECONDS`, at most `DWF_IDLE_WAIT` 30 s, else the call fails: "the PC was in
+  use").
+- **Stop conditions:** no turn starts while a mouse button or a modifier is down; a turn stops
+  ("interrupted") if the cursor moves while it is borrowed, and the cursor is then left where
+  the user put it.
+- **Short hold:** the cursor rests on the view for about 0.15 s (WPF reads the real cursor
+  position when it handles the wheel).
+- **No activation:** Altium is **raised without being activated** (`SetWindowPos HWND_TOP`
+  with `SWP_NOACTIVATE`): the wheel goes to the window under the cursor, Shift+wheel still
+  scrolls sideways, and the keyboard stays with the user's window. Altium is then put back
+  just behind that window.
+- **All screenshots:** the capture uses the same raise for every view type (verified on a
+  `.WirDoc` and on the drawing); only a minimized Altium is still restored and activated.
+
+Tried and dropped:
+- **PDF route** (render pages from a PDF, no input at all):
+  - A temporary OutJob only prints documents of its own project ("Missing file").
+  - `PcbDrawing:ExportToPdf` shows a standard Save As dialog. The server can fill it with
+    window messages: `WM_SETTEXT` on Edit id 1001, then `WM_COMMAND` IDOK to the dialog, since
+    a posted `BM_CLICK` on the button is ignored.
+  - The export then failed on a font the drawing template uses and the machine lacks
+    (Century Gothic regular, `GOTHIC.TTF`).
+  - It would need a PDF renderer dependency (pypdfium2).
+  - The user chose the idle-gated input for now.
 `get_screenshot(view_type="dwf", document_path=..., zoom=...)`: `"document"` (every page,
 `PcbDrawing:ViewFit`), a page number (1-based, review numbering) or `{"page": n, "area":
 [x1, y1, x2, y2]}` (mm, page bottom-left, y up), the capture then cropped to the area. New module

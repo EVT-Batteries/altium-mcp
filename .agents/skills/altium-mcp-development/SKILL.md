@@ -221,7 +221,9 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   stacked top to bottom), `Zoom Action=In` doubles around the view centre, `Action=Area` /
   `Point` are interactive. Draftsman's script API is `DraftsmanServer` (unit `RT_Draftsman`:
   pages, items, `PointToScreen`); its WPF view ignores posted wheel messages and posted
-  modifier keys, so `get_screenshot` scrolls it with real wheel input (HANDOVER session 25).
+  modifier keys, so `get_screenshot` scrolls it with real wheel input, only while the user
+  is idle and with Altium raised but never activated (HANDOVER session 25). Never take the
+  user's foreground or cursor while they work: their clicks and keys land in Altium.
 - An interface missing from the scripting docs: read its members and parameter names from
   the .NET metadata (`System\Altium.Edp.Interfaces.dll`, namespace `Rt_*` / `RT_*`, e.g. with a
   small ECMA-335 table reader) before probing; a `var` parameter shows as a by-ref type.
