@@ -8058,9 +8058,25 @@ async def _navigate_draftsman(base_params: dict, document_path: str, zoom) -> di
             if notches == 0:
                 return state
             if not in_front:
-                # Real wheel input goes to the window under the cursor
-                await asyncio.to_thread(_bring_to_front, win32gui.GetAncestor(hwnd, 2))
-                await asyncio.sleep(0.4)
+                # Real wheel input goes to the window under the cursor:
+                # wait until the view is on top there (Windows can refuse or
+                # delay the first foreground request)
+                cx, cy = (view[0] + view[2]) // 2, (view[1] + view[3]) // 2
+
+                def view_on_top(cx: int = cx, cy: int = cy) -> bool:
+                    under = win32gui.WindowFromPoint((cx, cy))
+                    return under == hwnd or bool(win32gui.IsChild(hwnd, under))
+
+                for attempt in range(2):
+                    await asyncio.to_thread(_bring_to_front, win32gui.GetAncestor(hwnd, 2))
+                    for _ in range(15):
+                        await asyncio.sleep(0.1)
+                        if await asyncio.to_thread(_run_dpi_aware, view_on_top):
+                            break
+                    else:
+                        logger.info(f"Draftsman view: not on top after bring to front ({attempt + 1})")
+                        continue
+                    break
                 in_front = True
             done = await asyncio.to_thread(
                 _run_dpi_aware, lambda n=notches: _wheel_over_view(hwnd, n, view, axis == "x"))

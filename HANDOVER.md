@@ -34,20 +34,25 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `551c3bf` (session 24, committed by the user) | session 25: Draftsman page / area screenshots (`get_screenshot` dwf `zoom`); the user commits |
+| `altium-mcp/` | `feature/harness-support` | `3a66f9c` (session 25, committed by the user) | `main.py`: Draftsman scroll waits for Altium to be on top (session 25 follow-up); the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
 `a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`,
 session 21 `3507e5d`, session 22 `ef585d9` / `7ec4b71`, session 23 merge `e62f7d9`, session 24
-`551c3bf`. Unit tests: 471 passed, 7 skipped (session 25).
+`551c3bf`, session 25 `3a66f9c`. Unit tests: 471 passed, 7 skipped (session 25).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 25 (2026-11-09): Draftsman page / area screenshots (uncommitted)
+### Session 25 (2026-11-09): Draftsman page / area screenshots (`3a66f9c`)
+Verified after the restart through the MCP on a real six-page drawing: page 4 fitted; an
+85 x 80 mm area holding a rear view zoomed x8 and cropped. Follow-up fix (uncommitted): the
+first area call was refused ("another window covers the Draftsman view") because Windows had
+not yet brought Altium in front 0.4 s after the request; the scroll step now waits up to 1.5 s
+for the view to be on top at its centre and asks once more before giving up.
 `get_screenshot(view_type="dwf", document_path=..., zoom=...)`: `"document"` (every page,
 `PcbDrawing:ViewFit`), a page number (1-based, review numbering) or `{"page": n, "area":
 [x1, y1, x2, y2]}` (mm, page bottom-left, y up), the capture then cropped to the area. New module
