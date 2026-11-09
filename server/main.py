@@ -24,18 +24,24 @@ try:
 except ImportError:
     tk = filedialog = None
 
+import win32api
+import win32con
+import win32gui
+import win32process
+import win32ui
+from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.utilities.types import Image as MCPImage
+from mcp.types import ToolAnnotations
+from PIL import Image
+
 import label_blocks
 import pcb_layout
 import pcblib_file
 import routing
 import sandbox
 import script_bundle
+import sheet_spec
 import silkscreen
-import win32api
-import win32con
-import win32gui
-import win32process
-import win32ui
 import win_processes
 from altium_files import (
     long_path,
@@ -54,6 +60,7 @@ from harness_layout import (
 )
 from harness_parser import (
     COMPONENT_KIND_NAMES,
+    TEXT_JUSTIFICATIONS,
     get_harness_component_data,
     get_harness_component_pins,
     get_harness_components,
@@ -65,14 +72,11 @@ from harness_parser import (
     get_harness_property_values,
     get_harness_schematic_data,
     get_harness_wiring_docs,
+    objects_in_region,
     parse_prjhar,
     parse_wirdoc,
 )
-from mcp.server.mcpserver import Context, MCPServer
-from mcp.server.mcpserver.utilities.types import Image as MCPImage
-from mcp.types import ToolAnnotations
 from outjob_parser import parse_outjob
-from PIL import Image
 
 # Set MCP_DIR to the directory of the current Python file
 MCP_DIR = Path(__file__).parent
@@ -2686,6 +2690,23 @@ def _wire_extra_lines(des: str, item: dict) -> list[str]:
 # include_wiring is set: wires, splices, no-connects, twists, shields, cables
 # and wire breaks
 WIRING_OBJECT_IDS = (82, 83, 94, 92, 93, 98, 106)
+# copy_objects types -> ObjectIds (connector 81, sheet graphics: eRectangle 4
+# = frame, eLabel 22 = text, eNote 2, eTextFrame 13, eImage 11 = picture)
+COPY_TYPES = {
+    "connector": 81,
+    "wire": 82,
+    "splice": 83,
+    "no_connect": 94,
+    "twist": 93,
+    "shield": 92,
+    "cable": 98,
+    "wire_break": 106,
+    "frame": 4,
+    "text": 22,
+    "note": 2,
+    "text_frame": 13,
+    "picture": 11,
+}
 
 # remove_objects types and their REMOVE record kinds
 REMOVE_KINDS = {
@@ -2696,20 +2717,98 @@ REMOVE_KINDS = {
 }
 
 
-def _remove_object_lines(items: list | None) -> list[str]:
+def _part_id(value: Any) -> int:
+    """Part of a multi-part connector: a letter (A = 1) or a number."""
+    text = str(value).strip().upper()
+    if text.isdigit() and int(text) > 0:
+        return int(text)
+    if len(text) == 1 and "A" <= text <= "Z":
+        return ord(text) - ord("A") + 1
+    raise ValueError(f"part must be a letter (A, B, ...) or a number, got {value!r}")
+
+
+def _remove_connector_lines(
+    item: dict, document_path: str | None, removed: set[str]
+) -> list[str]:
+    """REMOVE|CONNECTOR records for a connector (every part, or the one named
+    by part) and REMOVE|UID records for the no-connects on its pins. Refused
+    (ValueError) while a wire not removed in the same call ends on one of its
+    pins: deleting it would leave that wire dangling."""
+    if not document_path:
+        raise ValueError("remove_objects: removing a connector needs document_path")
+    try:
+        parsed = parse_wirdoc(Path(document_path).resolve())
+    except (OSError, KeyError, ValueError) as e:
+        raise ValueError(
+            f"remove_objects: the saved sheet could not be read to check the connector: {e}"
+        ) from None
+    uid = str(item.get("unique_id") or "").strip()
+    des = str(item.get("designator") or "").strip()
+    part = _part_id(item["part"]) if item.get("part") not in (None, "") else None
+    parts = [
+        c
+        for c in parsed.get("connectors", [])
+        if (uid and c.get("unique_id") == uid)
+        or (
+            not uid
+            and des
+            and c.get("designator") == des
+            and (part is None or c.get("current_part_id") == part)
+        )
+    ]
+    label = uid or des + (f":{chr(64 + part)}" if part else "")
+    if not parts:
+        raise ValueError(f"remove_objects: no connector {label!r} on the saved sheet")
+    wired = sorted(
+        {
+            f"{c['designator']}.{p['designator']} ({p['connected_wire']})"
+            for c in parts
+            for p in c.get("pins", [])
+            if p.get("connected_wire") and p["connected_wire"] not in removed
+        }
+    )
+    if wired:
+        raise ValueError(
+            f"remove_objects: connector {label!r} is wired ({', '.join(wired)}); "
+            "remove or reroute those wires first (in this call or before)"
+        )
+    lines = [_spec_line("REMOVE", "CONNECTOR", c["unique_id"]) for c in parts]
+    hot = {
+        (p["hot_end"]["x"], p["hot_end"]["y"]) for c in parts for p in c.get("pins", [])
+    }
+    for nc in parsed.get("no_connects", []):
+        if (nc["x"], nc["y"]) in hot and nc.get("unique_id"):
+            lines.append(_spec_line("REMOVE", "UID", nc["unique_id"]))
+    return lines
+
+
+def _remove_object_lines(
+    items: list | None, document_path: str | None = None
+) -> list[str]:
     """REMOVE records for remove_objects: REMOVE|UID|<unique id>,
-    REMOVE|WIRE / SPLICE / NOCONNECT|<designator or no-connect name> or
-    REMOVE|TEXT|x|y|<text>."""
+    REMOVE|WIRE / SPLICE / NOCONNECT|<designator or no-connect name>,
+    REMOVE|TEXT|x|y|<text> or REMOVE|CONNECTOR|<unique id> (with the
+    no-connects on its pins). Raises ValueError on a malformed entry or a
+    connector that is still wired."""
     lines = []
+    # Wires removed in this call no longer hold a connector
+    removed = {
+        str(i.get("designator") or i.get("name") or "").strip()
+        for i in items or []
+        if isinstance(i, dict) and str(i.get("type") or "").lower() == "wire"
+    }
     for item in items or []:
         if not isinstance(item, dict):
             # ValueError: the caller turns it into the tool's error result
             raise ValueError(f"remove_objects entries must be objects: {item!r}")  # noqa: TRY004
+        kind_name = str(item.get("type") or "").strip().lower()
+        if kind_name == "connector":
+            lines.extend(_remove_connector_lines(item, document_path, removed))
+            continue
         uid = str(item.get("unique_id") or "").strip()
         if uid:
             lines.append(_spec_line("REMOVE", "UID", uid))
             continue
-        kind_name = str(item.get("type") or "").strip().lower()
         if kind_name == "text":
             text = str(item.get("text") or "")
             if item.get("x") is None or item.get("y") is None or not text:
@@ -2725,7 +2824,8 @@ def _remove_object_lines(items: list | None) -> list[str]:
         if kind is None or not name:
             raise ValueError(
                 "remove_objects entry needs a unique_id, or a type (wire, splice, "
-                f"no_connect) and a designator, or a text with x / y: {item!r}"
+                "no_connect, connector) and a designator, or a text with x / y: "
+                f"{item!r}"
             )
         lines.append(_spec_line("REMOVE", kind, name))
     return lines
@@ -2751,21 +2851,73 @@ def _copy_object_lines(copies: list | None) -> list[str]:
         for old, new in (c.get("replace_text") or {}).items():
             if str(old):
                 lines.append(_spec_line("COPYTEXT", str(old), str(new)))
-        exclude = "" if c.get("include_wiring") else ",".join(map(str, WIRING_OBJECT_IDS))
-        lines.append(
-            _spec_line(
-                "COPYFROM",
-                Path(source).resolve(),
-                min(x1, x2),
-                min(y1, y2),
-                max(x1, x2),
-                max(y1, y2),
-                int(offset[0]),
-                int(offset[1]),
-                exclude,
+        include = ""
+        if c.get("types"):
+            unknown = [t for t in c["types"] if str(t).lower() not in COPY_TYPES]
+            if unknown:
+                raise ValueError(
+                    f"copy_objects types {unknown} unknown; use {sorted(COPY_TYPES)}"
+                )
+            include = ",".join(str(COPY_TYPES[str(t).lower()]) for t in c["types"])
+            exclude = ""
+        else:
+            exclude = (
+                "" if c.get("include_wiring") else ",".join(map(str, WIRING_OBJECT_IDS))
             )
-        )
+        excluded_uids = ",".join(str(u).strip() for u in c.get("exclude") or [])
+        fields: list[Any] = [
+            "COPYFROM",
+            Path(source).resolve(),
+            min(x1, x2),
+            min(y1, y2),
+            max(x1, x2),
+            max(y1, y2),
+            int(offset[0]),
+            int(offset[1]),
+            exclude,
+            include,
+            excluded_uids,
+        ]
+        while len(fields) > 9 and fields[-1] == "":  # unused filters: as before
+            fields.pop()
+        lines.append(_spec_line(*fields))
     return lines
+
+
+def _note_lines(notes: list | None, updates: list | None, moves: list | None) -> list[str]:
+    """NOTE / NOTEUPD / MOVEOBJ records (sheet_spec.note_records). Raises
+    ValueError on a bad entry."""
+    return [_spec_line(*rec) for rec in sheet_spec.note_records(notes, updates, moves)]
+
+
+def _label_line(nl: dict) -> str | None:
+    """LABEL record of a labels entry (None for an empty text). Raises
+    ValueError on an unknown justification."""
+    text = str(nl.get("text", "")).strip()
+    if not text:
+        return None
+    just = nl.get("justification")
+    if just is not None:
+        if str(just).lower() not in TEXT_JUSTIFICATIONS:
+            raise ValueError(
+                f"label justification must be one of {list(TEXT_JUSTIFICATIONS)}: {just!r}"
+            )
+        just = TEXT_JUSTIFICATIONS.index(str(just).lower())
+    # Without font_from the orientation defaults to 0, with it to the source's
+    orientation = nl.get("orientation")
+    if orientation is None and not nl.get("font_from"):
+        orientation = 0
+    return _spec_line(
+        "LABEL",
+        int(nl.get("x", 0)),
+        int(nl.get("y", 0)),
+        "" if orientation is None else int(orientation),
+        text,
+        str(nl.get("font_from") or "").strip(),
+        sheet_spec.font_spec(nl.get("font")),
+        "" if nl.get("color") is None else int(nl["color"]),
+        "" if just is None else just,
+    )
 
 
 def _wire_break_orientation(
@@ -2879,6 +3031,9 @@ async def add_harness_wiring(
     clear_hidden_cavity_parts: list | None = None,
     copy_objects: list | None = None,
     remove_objects: list | None = None,
+    notes: list | None = None,
+    note_updates: list | None = None,
+    move_objects: list | None = None,
 ) -> str:
     """
     Add, update or remove wires, splices, no-connects, text, cavity parts, twists, shields, cables, wire breaks and parameters on a Harness Wiring Diagram (.WirDoc) or Schematic.
@@ -2935,6 +3090,26 @@ async def add_harness_wiring(
             [
                 {"x": 16700, "y": 8400, "orientation": 0, "text": "SIG_A"}
             ]
+            A new text takes the sheet's default font; to match the texts next to it
+            give "font_from": the unique_id of a sheet text (get_harness_data texts)
+            whose font, colour, justification and orientation (unless "orientation"
+            is given) it copies. Or set "font" ("Arial:10" or {"name", "size"}; texts
+            list theirs), "color" (TColor) and "justification" (bottom_left, bottom_center,
+            bottom_right, center_left, center, center_right, top_left, top_center,
+            top_right: the corner or edge x, y names).
+        notes (list): New sheet notes (the yellow note boxes), corners in mils, e.g.
+            [{"x1": 2800, "y1": 5050, "x2": 4950, "y2": 5250, "text": "TODO: ...",
+              "style_from": "KIPAZCBM"}]
+            style_from: the unique_id of a note (get_harness_data notes) whose colours,
+            font, border and author the new one takes. Or set area_color / text_color
+            (TColor), font ("Arial:10" or {"name", "size"}), show_border, solid,
+            alignment (left, center, right), word_wrap. Line breaks in text are kept.
+        note_updates (list): Change existing notes by unique_id: "text" (its size,
+            colours and font stay), new corners x1, y1, x2, y2 (move / resize) and any
+            style field of notes, e.g. [{"unique_id": "KIPAZCBM", "text": "Done"}].
+        move_objects (list): Move notes, frames, pictures, texts and text frames by
+            unique_id, e.g. [{"unique_id": "2563fb3b-...", "offset": [500, 0]}] (mils).
+            Connectors move with connectors, wires with reroutes.
         net_labels (list): Deprecated alias of labels.
         wire_updates (list): Parameters to upsert on existing wires, and names of parameters
             to delete from them, e.g.:
@@ -3026,22 +3201,38 @@ async def add_harness_wiring(
             designators renames copied connectors (and copied wires / splices);
             replace_text replaces text in copied texts and notes. Harness wiring
             (wires, splices, no-connects, twists, shields, cables, wire breaks) is left
-            out unless "include_wiring": True. Copies get new UniqueIds (pins included)
+            out unless "include_wiring": True. "types" copies only those kinds of object
+            (connector, frame, text, note, text_frame, picture, wire, splice, no_connect,
+            twist, shield, cable, wire_break; wiring is copied when listed) and
+            "exclude" leaves out objects by unique_id (e.g. notes about lugs a copied
+            frame no longer has); get_harness_data(region=...) lists the objects a
+            region holds. Copies get new UniqueIds (pins included)
             and are placed before the call's connector moves and wires, so those can
             use them. The result counts them under "copied".
         remove_objects (list): Delete harness wires, splices or no-connects, found by
             designator (a no-connect by its name) or by the unique_id get_harness_data
-            reports, and sheet texts, found by location (mils) and text, e.g.
+            reports; sheet texts, found by location (mils) and text; notes, frames,
+            pictures and texts by unique_id; connectors, e.g.
             [{"type": "wire", "designator": "W3"}, {"type": "splice", "designator": "SP1"},
              {"type": "no_connect", "designator": "NC9"}, {"unique_id": "QOWDFIRS"},
-             {"type": "text", "x": 4300, "y": 11600, "text": "OLD NOTE"}]
-            Connectors are never removed (a unique_id naming one is not_found). Removed
+             {"type": "text", "x": 4300, "y": 11600, "text": "OLD NOTE"},
+             {"type": "connector", "designator": "X5"}]
+            A connector goes with its pins, cavity parts and associated parts (no longer
+            in the BOM), every part of a multi-part one ("part": "B" for one), and the
+            no-connects on its pins; it is refused while a wire not removed in the same
+            call ends on one of its pins. A unique_id alone never removes a connector
+            (not_found): name it with "type": "connector". Removed
             before the call's copies and
             wires (which may reuse the designators), after designator_updates; the
             result counts them under "removed", a missing one is listed in not_found.
             Wires that ended on a removed splice are left with a free end: reroute or
             remove them too. A removed wire's links from a layout drawing (.LdrDoc)
             go with it; import the changes into the layout afterwards.
+        connectors (list): Move placed connectors, e.g. [{"designator": "P1", "x": 5000,
+            "y": 8000}] (mils). A multi-part connector (each part its own object, e.g. a
+            fuse holder's sockets 1-10 and 11-20) moves the part given by "part" ("A",
+            "B", or 1, 2, ...); without it the first part found. associated_parts take
+            "part" the same way.
         component_updates (list): Parameters to upsert on placed connectors/components, and
             names of parameters to delete from them, e.g.:
             [{"designator": "P1", "parameters": {"Max Operating Temperature": "105°C"},
@@ -3096,20 +3287,21 @@ async def add_harness_wiring(
     # Removals come before copies and wires, which may reuse their designators;
     # copies come before connector moves and wires, which may then use them
     try:
-        lines.extend(_remove_object_lines(remove_objects))
+        lines.extend(_remove_object_lines(remove_objects, document_path))
         lines.extend(_copy_object_lines(copy_objects))
-    except ValueError as e:
-        return json.dumps({"success": False, "error": str(e)})
-
-    for c in connectors or []:
-        lines.append(
-            _spec_line(
-                "CONNECTOR",
-                str(c.get("designator", "")).strip(),
-                int(c.get("x", 0)),
-                int(c.get("y", 0)),
+        for c in connectors or []:
+            part = c.get("part")
+            lines.append(
+                _spec_line(
+                    "CONNECTOR",
+                    str(c.get("designator", "")).strip(),
+                    int(c.get("x", 0)),
+                    int(c.get("y", 0)),
+                    *([_part_id(part)] if part not in (None, "") else []),
+                )
             )
-        )
+    except (ValueError, OSError) as e:
+        return json.dumps({"success": False, "error": str(e)})
 
     for s in splices or []:
         lines.append(
@@ -3191,18 +3383,14 @@ async def add_harness_wiring(
             )
         )
 
-    for nl in labels or net_labels or []:
-        text = str(nl.get("text", "")).strip()
-        if text:
-            lines.append(
-                _spec_line(
-                    "LABEL",
-                    int(nl.get("x", 0)),
-                    int(nl.get("y", 0)),
-                    int(nl.get("orientation", 0)),
-                    text,
-                )
-            )
+    try:
+        for nl in labels or net_labels or []:
+            line = _label_line(nl)
+            if line:
+                lines.append(line)
+        lines.extend(_note_lines(notes, note_updates, move_objects))
+    except ValueError as e:
+        return json.dumps({"success": False, "error": str(e)})
 
     for r in rectangles or []:
         lines.append(
@@ -3280,7 +3468,15 @@ async def add_harness_wiring(
 
     for ap in associated_parts or []:
         owner = str(ap.get("owner") or ap.get("connector") or "").strip()
-        if owner:
+        if not owner:
+            continue
+        if ap.get("part") not in (None, ""):
+            try:
+                part = _part_id(ap["part"])
+            except ValueError as e:
+                return json.dumps({"success": False, "error": str(e)})
+            lines.append(_spec_line("ASSOCPARTP", owner, part, *_part_fields(ap)))
+        else:
             lines.append(_spec_line("ASSOCPART", owner, *_part_fields(ap)))
 
     for t in twists or []:
@@ -3481,6 +3677,11 @@ async def edit_harness_layout(
     delete: list | None = None,
     wires: list | None = None,
     dry_run: bool = False,
+    notes: list | None = None,
+    note_updates: list | None = None,
+    move_objects: list | None = None,
+    copy_region: list | None = None,
+    merge_bundles: list | None = None,
 ) -> str:
     """
     Create, move, edit and delete objects on a Harness Layout Drawing (.LdrDoc): connectors
@@ -3583,6 +3784,27 @@ async def edit_harness_layout(
     lengths of the bundles on its route (bundle "length_mm", independent of the drawn
     length) plus its offset, unless a fixed length is set (wires).
 
+    The drawing's own graphics (get_harness_data lists notes, pictures, frames and texts
+    with their unique_id):
+      notes: new notes, as add_harness_wiring's (corners in mils, text, style_from: the
+        unique_id of a note to take colours and font from, or area_color, text_color,
+        font, show_border, solid, alignment, word_wrap).
+      note_updates: [{"unique_id", "text"?, "x1".."y2"?, <style>}] change a note's text
+        (size and style stay), move / resize it.
+      move_objects: [{"unique_id", "offset": [dx, dy]}] move notes, pictures, frames,
+        texts (mils).
+      copy_region: [{"region": [x1, y1, x2, y2], "offset": [dx, dy], "types": ["note",
+        "picture"], "exclude": [unique ids], "replace_text": {"OLD": "NEW"}}] copy the
+        graphics inside the region (all of note, picture, frame, text, text_frame unless
+        types narrows it), moved by offset: e.g. the note and picture a neighbouring
+        connector has, for a new connector.
+      delete also takes their unique ids (connectors and wires are never deleted).
+    merge_bundles: [{"connection_point": "CP5"}] or [{"bundles": ["B3", "B4"]}] joins
+    the two bundles at a connection point that holds nothing (a bend left by a
+    re-branch): the first stays (designator, comment, texts) and is drawn over both, the
+    second and the point are deleted; its length is the sum of both when either was set
+    manually, else computed from the drawing; coverings on the second cover the first.
+
     Not supported (Altium's script interface has no setter): wire length offsets
     ("Offset Length", calculated type), user-defined wire lengths and manual wire paths.
     get_harness_data reports all of them once set in Altium (length_type, length_offset,
@@ -3610,6 +3832,11 @@ async def edit_harness_layout(
             layout_labels=layout_labels,
             delete=delete,
             wires=wires,
+            notes=notes,
+            note_updates=note_updates,
+            move_objects=move_objects,
+            copy_region=copy_region,
+            merge_bundles=merge_bundles,
         )
     except (KeyError, TypeError, ValueError, IndexError) as e:
         return json.dumps({"success": False, "error": f"invalid request: {e!r}"})
@@ -7668,7 +7895,7 @@ def _grab_window_image(hwnd, width: int, height: int) -> Image.Image:
 
 @_tool(read_only=True)
 async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = None,
-                         document_path: str = None):
+                         document_path: str = None, zoom: Any = None):
     """
     Take a screenshot of the Altium window, returned as viewable image content.
 
@@ -7688,6 +7915,13 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         document_path (str, optional): Absolute or relative path of the
             schematic, harness, multi-board or Draftsman document to focus
             and capture (it must be open in Altium or openable).
+        zoom (optional, 'sch' view only): "document" fits the whole sheet;
+            [x1, y1, x2, y2] (mils) zooms onto the objects the sheet owns that
+            lie inside that area (connectors, wires, texts, notes, ...; Altium
+            fits their extent, so the frame can be a little smaller or larger
+            than the area). get_harness_data(region=...) lists what an area
+            holds. The selection is restored afterwards and nothing is
+            changed in the document. Without zoom the current zoom is kept.
 
     Returns:
         Image content of the captured window plus a JSON metadata text block
@@ -7702,6 +7936,21 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         params = {"view_type": view_type.lower()}
         if zoom_to:
             params["designators"] = zoom_to
+        if zoom is not None:
+            if view_type.lower() != "sch":
+                return json.dumps({"success": False, "error": "zoom applies to the 'sch' view only"})
+            if isinstance(zoom, str) and zoom.strip().lower() == "document":
+                params["sch_zoom"] = "document"
+            elif isinstance(zoom, (list, tuple)) and len(zoom) == 4:
+                try:
+                    x1, y1, x2, y2 = (int(v) for v in zoom)
+                except (TypeError, ValueError):
+                    return json.dumps({"success": False, "error": "zoom area values must be numbers (mils)"})
+                params["sch_zoom"] = f"{min(x1, x2)},{min(y1, y2)},{max(x1, x2)},{max(y1, y2)}"
+            else:
+                return json.dumps(
+                    {"success": False, "error": 'zoom is "document" or [x1, y1, x2, y2] in mils'}
+                )
         if document_path:
             params["document_path"] = str(Path(document_path).resolve())
         response = await altium_bridge.execute_command(
@@ -7943,6 +8192,11 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
         zoom_info = response.get("result", {})
         if isinstance(zoom_info, dict) and "zoomed_component_count" in zoom_info:
             result["zoomed_component_count"] = zoom_info["zoomed_component_count"]
+        if isinstance(zoom_info, dict) and params.get("sch_zoom") not in (None, "document"):
+            found = zoom_info.get("sch_zoomed_objects", 0)
+            result["zoomed_object_count"] = found
+            if not found:
+                result["zoom_warning"] = "no sheet object lies inside the area; zoom unchanged"
         # What was actually captured, as opposed to what was requested
         result["captured_kind"] = focused_kind or None
         result["captured_document"] = focused_document or None
@@ -8415,6 +8669,7 @@ async def get_harness_data(
     file_path: str = "",
     summary_only: bool = False,
     designators: list | None = None,
+    region: list | None = None,
 ) -> str:
     """
     Read an Altium Harness Wiring Diagram (.WirDoc) or Harness Project (.PrjHar).
@@ -8441,6 +8696,21 @@ async def get_harness_data(
     connection point's show_name is whether its Designator text is shown. Edit it with
     edit_harness_layout.
 
+    Both document types also list the graphics the sheet owns, each with its unique_id
+    (what remove_objects / note_updates / move_objects / delete address): notes (text,
+    corners, font, colours, border, alignment), frames (rectangles: corners, line
+    style and width, colours), pictures (corners, file name) and texts (with font
+    {name, size, bold, italic}, orientation and justification; font_from in
+    add_harness_wiring copies them).
+
+    region [x1, y1, x2, y2] (mils) adds objects_in_region: the sheet objects (connectors,
+    wires, splices, no-connects, wire breaks, twists, shields, cables, notes, frames,
+    pictures, texts) whose bounding box (mils) lies inside it, and those only partly
+    inside: what add_harness_wiring copy_objects with that region would take, to
+    choose a region without a screenshot. Boxes are estimates (text from its length,
+    a connector over its body, title and pins; Altium's own box can be slightly larger),
+    so keep a margin. Wiring diagrams only.
+
     A full wiring diagram can be very large; use summary_only or designators to keep
     the answer small.
 
@@ -8450,6 +8720,7 @@ async def get_harness_data(
         summary_only (bool): Connectors without pins, wires without geometry. Default False.
         designators (list, optional): Only these connectors (with their pins) and the wires
             that touch them.
+        region (list, optional): [x1, y1, x2, y2] in mils; adds objects_in_region.
 
     Returns:
         str: JSON with file_path, summary (connector_count, total_pins,
@@ -8505,6 +8776,14 @@ async def get_harness_data(
                 ]
         elif p.suffix.lower() == ".wirdoc":
             data = parse_wirdoc(p)
+            if region is not None:
+                if len(region) != 4:
+                    return json.dumps(
+                        {"error": "region must be [x1, y1, x2, y2] in mils"}
+                    )
+                data["objects_in_region"] = objects_in_region(
+                    data, [int(v) for v in region]
+                )
             if designators:
                 wanted = set(designators)
                 data["connectors"] = [
@@ -9022,6 +9301,17 @@ async def edit_harness_drawing(
           Draftsman keeps it on the point when the view moves or rescales.
           Adds Draftsman's default arrow style when the document has none
           (a callout without it is not drawn).
+      add_text {text, page?, x_mm, y_mm | item_id, point_mm; font?, font_style_id?,
+                color?, rotation?, horizontal_alignment?, vertical_alignment?,
+                width_mm?, height_mm?}
+          A free text: at x_mm / y_mm (its box's bottom-left corner) on page
+          (default 1), or centred on point_mm [x, y] of a component view's
+          projection (item_id; the frame of set_component_projection), e.g.
+          cavity numbers on a rear view. font {family, size (pt), bold}
+          reuses or adds a document font style (default Arial 8); color
+          [r, g, b]; rotation 0 / 90 / 180 / 270; the box is sized from the
+          font unless width_mm / height_mm are given. Unlike a callout, it
+          does not follow the view when the view moves.
       copy_table_format {from_item_id, from_document?, item_ids?}
           Copy a connection table's / wiring list's columns or a BOM's
           shown columns (set, order, visibility, sort, widths) onto the
@@ -9166,9 +9456,42 @@ def _layout_import_report(
     before: dict[str, Any], after: dict[str, Any]
 ) -> dict[str, Any]:
     """What a layout import changed: wires whose part or description changed,
-    wires added / removed, and the routing state afterwards."""
+    wires added / removed, connectors and splices added / removed (with where
+    Altium put the new ones and their connection point), and the routing state
+    afterwards."""
     old = {w["designator"]: w for w in before["wires"]}
     new = {w["designator"]: w for w in after["wires"]}
+    cps = {cp["designator"]: cp for cp in after.get("connection_points", [])}
+
+    def key(o: dict[str, Any]) -> str:
+        # The wiring-diagram original names an object across imports
+        return o.get("origin_uid") or o.get("unique_id") or o.get("designator", "")
+
+    def placed(o: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {"designator": o.get("designator", "")}
+        if "location" in o:
+            out["location_mils"] = [round(o["location"]["x"] * 10), round(o["location"]["y"] * 10)]
+        cp = cps.get(o.get("connection_point") or "")
+        if cp is not None:
+            out["connection_point"] = {
+                "designator": cp["designator"],
+                "location_mils": [round(cp["location"]["x"] * 10), round(cp["location"]["y"] * 10)],
+                "show_name": cp.get("show_name"),
+                "holds": cp.get("objects", []),
+            }
+        else:
+            out["connection_point"] = None
+        return out
+
+    def changes(kind: str) -> dict[str, list]:
+        was = {key(o): o for o in before.get(kind, [])}
+        now = {key(o): o for o in after.get(kind, [])}
+        return {
+            f"{kind}_added": [placed(now[k]) for k in now if k not in was],
+            f"{kind}_removed": sorted(was[k].get("designator", "") for k in was if k not in now),
+        }
+
+    moved = {**changes("connectors"), **changes("splices")}
     updated = [
         {
             "designator": name,
@@ -9184,6 +9507,7 @@ def _layout_import_report(
         )
     ]
     return {
+        **moved,
         "wires_updated": updated,
         "wires_added": sorted(set(new) - set(old)),
         "wires_removed": sorted(set(old) - set(new)),
@@ -9279,7 +9603,12 @@ async def import_harness_changes(ctx: Context, document_path: str) -> str:
 
     Returns:
         JSON with success and, per document, changed / saved and a report: for a
-        layout wires_updated (part before / after), wires_added, wires_removed,
+        layout connectors_added / splices_added (each with location_mils where
+        Altium put it, at its wiring-diagram coordinates, and its connection_point:
+        designator, location_mils, show_name, what it holds; Altium gives each new
+        connector a point of its own, offset from it, with its name shown, so place
+        both with edit_harness_layout), connectors_removed / splices_removed,
+        wires_updated (part before / after), wires_added, wires_removed,
         wires_without_part, unrouted_wires, newly_unrouted_wires, unassigned_pins and
         pin_repair; for a drawing items_moved, items_resized, items_added,
         items_removed, projections_emptied and the review's issues.

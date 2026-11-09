@@ -77,7 +77,10 @@ def _document(template_ok, template_missing, projections=""):
         ),
     ]
     return (
-        f"<Document {NS}><Id>0</Id><ArrowStyles/><BoardProjectionInformation><BoardOrigin><X>0</X>"
+        f"<Document {NS}><Id>0</Id><ArrowStyles/><FontStyles><FontStyleData>"
+        "<Decorations>None</Decorations><DecorationsV2>0</DecorationsV2><FamilyName>Arial"
+        "</FamilyName><Id>1</Id><Size>12</Size></FontStyleData></FontStyles>"
+        "<BoardProjectionInformation><BoardOrigin><X>0</X>"
         "<Y>0</Y></BoardOrigin><ComponentProjections>"
         f"{projections}</ComponentProjections><LastUpdate>x</LastUpdate>"
         "</BoardProjectionInformation>"
@@ -378,6 +381,76 @@ class DrawingTests(unittest.TestCase):
                     },
                 ],
             )
+
+    def test_add_text_on_page_and_on_projection_point(self):
+        doc = hd.HarnessDrawing(self.path)
+        hd.apply_operations(
+            doc,
+            [
+                {"op": "set_component_view", "item_id": 20, "view_side": "Back", "scale": 2},
+                {"op": "set_component_projection", "designator": "P1",
+                 "view_side": "Back", "lines_mm": SQUARE},
+            ],
+        )
+        res = hd.apply_operations(
+            doc,
+            [
+                {"op": "add_text", "page": 1, "x_mm": 30, "y_mm": 40, "text": "NOTE A",
+                 "font": {"family": "Arial", "size": 12}, "color": [255, 0, 0]},
+                {"op": "add_text", "item_id": 20, "point_mm": [10, 20], "text": "12",
+                 "font": {"family": "Arial", "size": 6, "bold": True}, "rotation": 270},
+            ],
+        )
+        on_page, on_view = res
+        # Arial 12 exists (style 1); Arial 6 bold is added as style 2
+        self.assertEqual((on_page["font_style_id"], on_view["font_style_id"]), ("1", "2"))
+        self.assertIn("<Decorations>Bold</Decorations><DecorationsV2>2</DecorationsV2>"
+                      "<FamilyName>Arial</FamilyName><Id>2</Id><Size>6</Size>", doc.xml)
+        text = doc.item(on_page["new_item_id"])
+        self.assertEqual((text.type, text.page), ("Text", 1))
+        self.assertAlmostEqual(on_page["x_mm"], 30, places=2)
+        self.assertIn("<R>255</R>", doc.xml[text.start : text.end])
+        # Centred on the projection's top-right corner (20 / 40 mm from the
+        # view's origin at 2:1), on the view's page, turned
+        view_text = doc.item(on_view["new_item_id"])
+        self.assertEqual(view_text.page, 2)
+        cx = on_view["x_mm"] + on_view["width_mm"] / 2
+        cy = on_view["y_mm"] + on_view["height_mm"] / 2
+        self.assertAlmostEqual(cx, hd._mm(500) + 20, places=1)
+        self.assertAlmostEqual(cy, hd._mm(500) + 40, places=1)
+        self.assertIn("<Rotation>Ccw270</Rotation><Rotation2>270</Rotation2>",
+                      doc.xml[view_text.start : view_text.end])
+        self.assertGreater(on_view["height_mm"], on_view["width_mm"])  # turned box
+        for bad in (
+            {"op": "add_text", "page": 1, "x_mm": 1, "y_mm": 1, "text": " "},
+            {"op": "add_text", "page": 9, "x_mm": 1, "y_mm": 1, "text": "x"},
+            {"op": "add_text", "page": 1, "x_mm": 1, "y_mm": 1, "text": "x", "rotation": 45},
+            {"op": "add_text", "item_id": 11, "point_mm": [0, 0], "text": "x"},
+            {"op": "add_text", "page": 1, "text": "x"},
+        ):
+            with self.assertRaises(hd.DrawingEditError):
+                hd.apply_operations(doc, [bad])
+
+    def test_review_lists_layout_connectors_without_table(self):
+        layout = {"connectors": [
+            {"designator": "P1", "part_number": "CONN-4P", "pin_count": 4},
+            {"designator": "X1", "part_number": "LUG", "pin_count": 1},
+        ]}
+        table = (
+            '<Item i:type="ConnectionTableData"><Id>30</Id><Anchor>Top Left</Anchor>'
+            "<OriginatedFromTemplate>false</OriginatedFromTemplate><Component>P1"
+            "</Component></Item>"
+        )
+        xml = hd.read_drawing_xml(self.path).decode("utf-8").replace(
+            "<Items><Item i:type=\"HarnessComponentViewData\"",
+            f"<Items>{table}<Item i:type=\"HarnessComponentViewData\"",
+        )
+        self.path.write_bytes(hd.encode_stream(xml.encode("utf-8")))
+        with patch("harness_layout.parse_ldrdoc", return_value=layout), \
+             patch.object(Path, "exists", return_value=True):
+            review = hd.review_drawing(self.path)
+        missing = [i for i in review["issues"] if i["kind"] == "connector_without_table"]
+        self.assertEqual([(i["designator"], i["pin_count"]) for i in missing], [("X1", 1)])
 
     def test_copy_table_format(self):
         def table(item_id, component, part_visible):

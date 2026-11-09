@@ -647,11 +647,13 @@ def review_drawing(path: Path, include_template_items: bool = False) -> dict:
                 }
             )
 
+    source = next(
+        (s for i in items if (s := _child_text(i.element, "BoardSourceName"))), None
+    )
+    issues.extend(_connectors_without_table(source, items))
     return {
         "document": str(path),
-        "source": next(
-            (s for i in items if (s := _child_text(i.element, "BoardSourceName"))), None
-        ),
+        "source": source,
         "pages": out_pages,
         "component_views": views,
         "projections": [
@@ -660,6 +662,44 @@ def review_drawing(path: Path, include_template_items: bool = False) -> dict:
         ],
         "issues": issues,
     }
+
+
+def _connectors_without_table(source: str | None, items: list[DrawingItem]) -> list[dict]:
+    """connector_without_table issues: connectors of the layout drawing the
+    drawing reads (its source, a .LdrDoc) that no connection table lists.
+    Draftsman's update adds no table for a connector new to the layout; the
+    fix is copy_item of a connection table with component."""
+    if not source or Path(source).suffix.lower() != ".ldrdoc" or not Path(source).exists():
+        return []
+    from harness_layout import parse_ldrdoc
+
+    try:
+        layout = parse_ldrdoc(Path(source))
+    except Exception:  # noqa: BLE001 - the review stands without this check
+        return []
+    listed = {
+        _child_text(i.element, "Component")
+        for i in items
+        if i.type == "ConnectionTableData"
+    }
+    seen: set[str] = set()
+    out = []
+    for c in layout["connectors"]:
+        des = c.get("designator") or ""
+        if not des or des in listed or des in seen:
+            continue
+        seen.add(des)
+        out.append(
+            {
+                "kind": "connector_without_table",
+                "designator": des,
+                "part_number": c.get("part_number", ""),
+                "pin_count": c.get("pin_count"),
+                "detail": "no connection table lists this connector of the layout; "
+                "add one with copy_item of a connection table and component",
+            }
+        )
+    return out
 
 
 # --- edits ----------------------------------------------------------------
@@ -969,6 +1009,174 @@ def _ensure_arrow_style(doc: HarnessDrawing) -> None:
         doc._replace(close, close, _ARROW_STYLE_1)
 
 
+def _projection_point_on_page(
+    doc: HarnessDrawing, view: DrawingItem, point: list | tuple
+) -> tuple[float, float, float, float]:
+    """(page x, page y) in page units of a point of a component view's
+    projection (point in mm, the frame of set_component_projection, y up), and
+    the point as stored (x, -y in page units). Page point = view location +
+    (point - bound min) x scale, matched Draftsman's own callouts."""
+    designator = _child_text(view.element, "Designator") or ""
+    side = _side_name(_child_text(view.element, "ViewSide") or "0")
+    proj = next(
+        (
+            p
+            for p in doc.projections()
+            if p["designator"] == designator and p["view_side"] == side
+        ),
+        None,
+    )
+    if proj is None or not proj["lines"]:
+        raise DrawingEditError(f"no projection stored for {designator} {side}")
+    seg = doc.xml[proj["start"] : proj["end"]]
+    bound = {k: float(v) for k, v in re.findall(r"<a:_(\w+)>([^<]+)</a:_\w+>", seg)}
+    if _child_text(view.element, "UseCustomScale") == "true":
+        scale = _float(_child_text(view.element, "CustomScale")) or 1.0
+    else:
+        num = _float(_child_text(view.element, "Scale", "Numenator")) or 1.0
+        den = _float(_child_text(view.element, "Scale", "Denominator")) or 1.0
+        scale = num / den
+    box = view.box() or (0.0, 0.0, 0.0, 0.0)
+    # stored projection: x as given, y negated (see _projection_xml)
+    sx, sy = _units(float(point[0])), -_units(float(point[1]))
+    page_x = box[0] + (sx - bound["x"]) * scale
+    page_y = box[1] + (bound["y"] + bound["height"] - sy) * scale
+    return page_x, page_y, sx, sy
+
+
+def _font_style_id(doc: HarnessDrawing, font: dict) -> str:
+    """Id of the document font style with this family, size (pt) and
+    boldness; a new style (max id + 1) when there is none."""
+    family = str(font.get("family") or "Arial")
+    size = _fmt(float(font.get("size") or 8))
+    bold = bool(font.get("bold"))
+    start = doc.xml.find("<FontStyles>")
+    if start < 0:
+        raise DrawingEditError("the document has no FontStyles list")
+    end = _element_end(doc.xml, start, "FontStyles")
+    ids = []
+    for m in re.finditer(r"<FontStyleData>.*?</FontStyleData>", doc.xml[start:end], re.DOTALL):
+        el = _parse_fragment(m.group(0))
+        sid = _child_text(el, "Id") or "0"
+        ids.append(int(sid))
+        if (
+            _child_text(el, "FamilyName") == family
+            and _fmt(_float(_child_text(el, "Size")) or 0) == size
+            and (_child_text(el, "Decorations") == "Bold") == bold
+        ):
+            return sid
+    new_id = str(max(ids, default=0) + 1)
+    data = (
+        f"<FontStyleData><Decorations>{'Bold' if bold else 'None'}</Decorations>"
+        f"<DecorationsV2>{2 if bold else 0}</DecorationsV2><FamilyName>{_escape(family)}"
+        f"</FamilyName><Id>{new_id}</Id><Size>{size}</Size></FontStyleData>"
+    )
+    close = end - len("</FontStyles>")
+    doc._replace(close, close, data)
+    return new_id
+
+
+_ALIGN_H = {"left": "Left", "center": "Center", "right": "Right"}
+_ALIGN_V = {"top": "Top", "center": "Center", "bottom": "Bottom"}
+
+
+def _op_add_text(doc: HarnessDrawing, op: dict) -> dict:
+    """A free text on a page: at x_mm / y_mm on page (1-based), or centred on
+    point_mm of a component view's projection (item_id; e.g. cavity numbers on
+    a rear view). font: {family, size (pt), bold} (a document font style is
+    reused or added) or font_style_id; color [r, g, b]; rotation 0, 90, 180 or
+    270; horizontal / vertical alignment within the text box."""
+    text = str(op.get("text", ""))
+    if not text.strip():
+        raise DrawingEditError("text is required")
+    if op.get("font_style_id") is not None:
+        style_id = str(int(op["font_style_id"]))
+    else:
+        style_id = _font_style_id(doc, op.get("font") or {})
+    size_pt = 8.0
+    fm = re.search(
+        rf"<FontStyleData>(?:(?!</FontStyleData>).)*<Id>{style_id}</Id><Size>([^<]+)</Size>",
+        doc.xml,
+        re.DOTALL,
+    )
+    if fm:
+        size_pt = float(fm.group(1))
+    elif op.get("font_style_id") is not None:
+        raise DrawingEditError(f"no font style {style_id}")
+    rotation = int(op.get("rotation", 0)) % 360
+    if rotation % 90:
+        raise DrawingEditError("rotation must be 0, 90, 180 or 270")
+    lines = text.split("\n")
+    # Text box from the font size (1 pt = 96 / 72 page units)
+    pt = 96 / 72
+    width = _units(float(op["width_mm"])) if op.get("width_mm") else max(len(s) for s in lines) * size_pt * 0.62 * pt + 4
+    height = _units(float(op["height_mm"])) if op.get("height_mm") else len(lines) * size_pt * 1.25 * pt + 2
+    if op.get("item_id") is not None:
+        view = doc.item(op["item_id"])
+        if view.type != "HarnessComponentViewData":
+            raise DrawingEditError(f"item {view.id} is a {view.type}, not a component view")
+        point = op.get("point_mm")
+        if not (isinstance(point, (list, tuple)) and len(point) == 2):
+            raise DrawingEditError("point_mm is [x, y] in the projection frame (mm)")
+        cx, cy, _, _ = _projection_point_on_page(doc, view, point)
+        page_index = view.page
+        h_align, v_align = "Center", "Center"
+    else:
+        if "x_mm" not in op or "y_mm" not in op:
+            raise DrawingEditError("give x_mm, y_mm and page, or item_id and point_mm")
+        page_index = int(op.get("page", 1))
+        cx = cy = None
+        h_align = _ALIGN_H.get(str(op.get("horizontal_alignment", "left")).lower())
+        v_align = _ALIGN_V.get(str(op.get("vertical_alignment", "top")).lower())
+        if not h_align or not v_align:
+            raise DrawingEditError(
+                f"alignments: horizontal {sorted(_ALIGN_H)}, vertical {sorted(_ALIGN_V)}"
+            )
+    page = next((p for p in doc.pages() if p["index"] == page_index), None)
+    if page is None:
+        raise DrawingEditError(f"no page {page_index}")
+    box_w, box_h = (height, width) if rotation in (90, 270) else (width, height)
+    if cx is not None:
+        x, y = cx - box_w / 2, cy - box_h / 2
+    else:
+        x, y = _units(float(op["x_mm"])), _units(float(op["y_mm"]))
+    color = op.get("color") or [0, 0, 0]
+    if len(color) != 3:
+        raise DrawingEditError("color is [r, g, b]")
+    r, g, b = (int(v) for v in color)
+    ids = [int(i.id) for i in doc.items()] + [int(p["id"]) for p in doc.pages()]
+    new_id = str(max(ids) + 1)
+    item = (
+        f'<Item i:type="Text"><Id>{new_id}</Id><Anchor>Top Left</Anchor>'
+        "<OriginatedFromTemplate>false</OriginatedFromTemplate>"
+        "<ClipToBounds>false</ClipToBounds>"
+        f"<Color><A>255</A><B>{b}</B><G>{g}</G><R>{r}</R></Color>"
+        f"<FillStyleId>1</FillStyleId><FontStyleId>{style_id}</FontStyleId>"
+        f"<HorizontalAlignment>{h_align}</HorizontalAlignment>"
+        f"<Rect><Height>{_fmt(box_h)}</Height><Width>{_fmt(box_w)}</Width>"
+        f"<X>{_fmt(x)}</X><Y>{_fmt(y)}</Y></Rect>"
+        f"<Rotation>Ccw{rotation}</Rotation><Rotation2>{rotation}</Rotation2>"
+        f"<Text>{_escape(text.replace(chr(10), chr(13) + chr(10)))}</Text>"
+        "<UseDocumentFont>false</UseDocumentFont><Version>1</Version>"
+        f"<VerticalAlignment>{v_align}</VerticalAlignment></Item>"
+    )
+    span = _child_span(doc.xml, page["start"], page["end"], "Items")
+    if not span:
+        raise DrawingEditError(f"page {page_index} has no item list")
+    close = span[1] - len("</Items>")
+    doc._replace(close, close, item)
+    return {
+        "new_item_id": new_id,
+        "page": page_index,
+        "text": text,
+        "x_mm": _mm(x),
+        "y_mm": _mm(y),
+        "width_mm": _mm(box_w),
+        "height_mm": _mm(box_h),
+        "font_style_id": style_id,
+    }
+
+
 def _op_add_callout(doc: HarnessDrawing, op: dict) -> dict:
     """A callout with custom text on a component view, snapped to a point of its
     projection: point_mm [x, y] in the projection frame (the frame of
@@ -986,31 +1194,7 @@ def _op_add_callout(doc: HarnessDrawing, op: dict) -> dict:
     if not (isinstance(point, (list, tuple)) and len(point) == 2):
         raise DrawingEditError("point_mm is [x, y] in the projection frame (mm)")
     designator = _child_text(view.element, "Designator") or ""
-    side = _side_name(_child_text(view.element, "ViewSide") or "0")
-    proj = next(
-        (
-            p
-            for p in doc.projections()
-            if p["designator"] == designator and p["view_side"] == side
-        ),
-        None,
-    )
-    if proj is None or not proj["lines"]:
-        raise DrawingEditError(f"no projection stored for {designator} {side}")
-    seg = doc.xml[proj["start"] : proj["end"]]
-    bound = {k: float(v) for k, v in re.findall(r"<a:_(\w+)>([^<]+)</a:_\w+>", seg)}
-    scale = 1.0
-    if _child_text(view.element, "UseCustomScale") == "true":
-        scale = _float(_child_text(view.element, "CustomScale")) or 1.0
-    else:
-        num = _float(_child_text(view.element, "Scale", "Numenator")) or 1.0
-        den = _float(_child_text(view.element, "Scale", "Denominator")) or 1.0
-        scale = num / den
-    box = view.box() or (0.0, 0.0, 0.0, 0.0)
-    # stored projection: x as given, y negated (see _projection_xml)
-    sx, sy = _units(float(point[0])), -_units(float(point[1]))
-    page_x = box[0] + (sx - bound["x"]) * scale
-    page_y = box[1] + (bound["y"] + bound["height"] - sy) * scale
+    page_x, page_y, sx, sy = _projection_point_on_page(doc, view, point)
     lx, ly = _units(float(leader[0])), _units(float(leader[1]))
     ids = [int(i.id) for i in doc.items()] + [int(p["id"]) for p in doc.pages()]
     new_id = str(max(ids) + 1)
@@ -1182,6 +1366,7 @@ OPERATIONS = {
     "move_item": _op_move_item,
     "copy_item": _op_copy_item,
     "add_callout": _op_add_callout,
+    "add_text": _op_add_text,
     "copy_table_format": _op_copy_table_format,
     "set_text": _op_set_text,
     "delete_item": _op_delete_item,

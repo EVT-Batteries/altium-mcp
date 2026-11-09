@@ -25,7 +25,14 @@ from pathlib import Path
 from typing import Any
 
 import olefile
-from harness_parser import _coord, _text, _uid_list, extract_ole_records
+import sheet_spec
+from harness_parser import (
+    _coord,
+    _text,
+    _uid_list,
+    extract_ole_records,
+    sheet_graphics,
+)
 
 # Internal Altium coordinate units per mil (lengths such as LengthLong)
 COORD_PER_MIL = 10000
@@ -498,6 +505,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         # Pins no connection point holds: their wires cannot be routed (a
         # connection point keeping the ids of pins replaced by an update
         # from the library holds none)
+        c["pin_count"] = len(c["pin_uids"])
         c["unassigned_pins"] = sorted(
             (pins[u]["designator"] for u in c.pop("pin_uids") if u not in pin_holder),
             key=lambda d: (len(d), d),
@@ -514,6 +522,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         synced_lists[s.pop("kind")].append(s)
 
     by_des = lambda items: sorted(items, key=lambda o: o.get("designator") or "")
+    graphics = sheet_graphics(records)
     return {
         "file_path": str(Path(file_path).resolve()),
         "summary": {
@@ -524,6 +533,8 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
             "layout_label_count": len(labels),
             "wire_count": len(wires),
             "unrouted_wire_count": len(unrouted),
+            "note_count": len(graphics["notes"]),
+            "picture_count": len(graphics["pictures"]),
         },
         "connectors": by_des(connectors.values()),
         "connection_points": by_des(cps.values()),
@@ -533,6 +544,8 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         "wires": by_des(wires.values()),
         "unrouted_wires": sorted(unrouted),
         **{k: by_des(v) for k, v in synced_lists.items()},
+        # Sheet graphics: notes, frames, pictures and texts the sheet owns
+        **graphics,
     }
 
 
@@ -690,6 +703,129 @@ def _follow_end(points: list[int], at_start: bool, x: int, y: int) -> list[int]:
     return pts
 
 
+def _merge_bundle_edits(
+    layout: dict[str, Any],
+    merges: list[dict[str, Any]] | None,
+    keyed: Any,
+    errors: list[str],
+) -> dict[str, list[Any]]:
+    """Deletions, bundle edits and covering edits that join two bundles
+    through the connection point between them, when it holds nothing (a bend
+    left by a re-branch). A merge names {"connection_point": cp} (the two
+    bundles at it) or {"bundles": [first, second]} (sharing a point). The
+    first bundle stays (designator, comment, texts) and is drawn over both;
+    the second and the point are deleted. Its length is the sum of both when
+    either was set manually, else computed from the drawing. Coverings on the
+    second bundle cover the first instead."""
+    out: dict[str, list[Any]] = {"delete": [], "bundles": [], "coverings": [], "warnings": []}
+    if not merges:
+        return out
+    cps = keyed(layout["connection_points"])
+    bundles = keyed(layout["bundles"])
+    by_uid = {b["unique_id"]: b for b in layout["bundles"]}
+
+    def name(b: dict[str, Any]) -> str:
+        return b["designator"] or b["unique_id"]
+
+    for m in merges:
+        if not isinstance(m, dict):
+            errors.append(f"merge_bundles entries must be objects: {m!r}")
+            continue
+        if m.get("connection_point"):
+            cp = cps.get(str(m["connection_point"]).strip())
+            if cp is None:
+                errors.append(f"merge_bundles: no connection point {m['connection_point']!r}")
+                continue
+            pair = [
+                b
+                for b in layout["bundles"]
+                if cp["unique_id"] in (b["end1_uid"], b["end2_uid"])
+            ]
+        else:
+            names = m.get("bundles") or []
+            pair = [bundles.get(str(n).strip()) for n in names]
+            if len(names) != 2 or None in pair:
+                errors.append(f"merge_bundles: bundles must name two bundles: {names!r}")
+                continue
+            shared = {pair[0]["end1_uid"], pair[0]["end2_uid"]} & {
+                pair[1]["end1_uid"],
+                pair[1]["end2_uid"],
+            }
+            cp = next(
+                (c for c in layout["connection_points"] if c["unique_id"] in shared), None
+            )
+            if cp is None:
+                errors.append(
+                    f"merge_bundles: {name(pair[0])} and {name(pair[1])} share no "
+                    "connection point"
+                )
+                continue
+        label = cp["designator"] or cp["unique_id"]
+        if len(pair) != 2:
+            errors.append(
+                f"merge_bundles: connection point {label} joins {len(pair)} bundles, not 2"
+            )
+            continue
+        if cp.get("objects"):
+            errors.append(
+                f"merge_bundles: connection point {label} holds {cp['objects']}; "
+                "only an empty point can be merged away"
+            )
+            continue
+        first, second = pair
+        if first["unique_id"] == second["unique_id"]:
+            errors.append(f"merge_bundles: {name(first)} would merge with itself")
+            continue
+        p1 = [round(v * 10) for v in first["points"]]
+        p2 = [round(v * 10) for v in second["points"]]
+        # first ends at the point, second starts there
+        if first["end1_uid"] == cp["unique_id"]:
+            p1 = [v for i in range(len(p1) - 2, -1, -2) for v in p1[i : i + 2]]
+        if second["end2_uid"] == cp["unique_id"]:
+            p2 = [v for i in range(len(p2) - 2, -1, -2) for v in p2[i : i + 2]]
+        points = p1 + p2[2:]
+        # A point where the line runs straight on is no vertex
+        n = len(p1) // 2 - 1
+        if 0 < n < len(points) // 2 - 1:
+            (ax, ay), (bx, by), (cx, cy) = (points[2 * k : 2 * k + 2] for k in (n - 1, n, n + 1))
+            if (ax == bx == cx) or (ay == by == cy):
+                points = points[: 2 * n] + points[2 * n + 2 :]
+        edit: dict[str, Any] = {"unique_id": first["unique_id"], "points": points}
+        if first["length_set_manually"] or second["length_set_manually"]:
+            edit["length_mm"] = round(first["length"]["mm"] + second["length"]["mm"], 3)
+        out["bundles"].append(edit)
+        out["delete"] += [second["unique_id"], cp["unique_id"]]
+        merged = {second["unique_id"], second["designator"], cp["unique_id"], cp["designator"]} - {""}
+        for cov in layout.get("coverings", []):
+            items = cov.get("items", [])
+            if not merged & set(items):
+                continue
+            keep = [i for i in items if i not in merged]
+            refs = []
+            for item in keep:
+                b = bundles.get(item) or by_uid.get(item)
+                if b is None:
+                    errors.append(
+                        f"merge_bundles: covering {cov['designator'] or cov['unique_id']} "
+                        f"also covers {item!r}, which is no bundle; edit it by hand"
+                    )
+                    refs = None
+                    break
+                refs.append(b["unique_id"])
+            if refs is None:
+                continue
+            if first["unique_id"] not in refs:
+                refs.append(first["unique_id"])
+            out["coverings"].append({"unique_id": cov["unique_id"], "bundles": refs})
+        for w in layout.get("wires", []):
+            if set(w.get("via_bundles") or []) & merged:
+                out["warnings"].append(
+                    f"wire {w['designator']}: its manual route names "
+                    f"{name(second)}, which the merge deletes; route it again in Altium"
+                )
+    return out
+
+
 def build_layout_spec(
     layout: dict[str, Any],
     connectors: list[dict[str, Any]] | None = None,
@@ -699,9 +835,19 @@ def build_layout_spec(
     layout_labels: list[dict[str, Any]] | None = None,
     delete: list[str] | None = None,
     wires: list[dict[str, Any]] | None = None,
+    notes: list[dict[str, Any]] | None = None,
+    note_updates: list[dict[str, Any]] | None = None,
+    move_objects: list[dict[str, Any]] | None = None,
+    copy_region: list[dict[str, Any]] | None = None,
+    merge_bundles: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Spec records for edit_harness_layout from the parse_ldrdoc() output of
     the saved drawing and the requested changes.
+
+    notes / note_updates / move_objects / copy_region edit the drawing's own
+    graphics (sheet_spec); delete also takes their unique ids. merge_bundles
+    joins two bundles through a connection point that holds nothing
+    (_merge_bundle_edits).
 
     Returns {"records": [[field, ...], ...], "errors": [...], "warnings": [...],
     "expect": {"bundles": {bundle uid (new: designator): [from_cp, to_cp]},
@@ -782,11 +928,30 @@ def build_layout_spec(
         uid = str(item.get("unique_id") or "").strip()
         return uid if uid and (not des or des in shared_names) else des or uid
 
+    # Sheet graphics (notes, frames, pictures, texts) by UniqueID
+    graphics = {
+        g["unique_id"]: g
+        for key in ("notes", "frames", "pictures", "texts")
+        for g in layout.get(key, [])
+        if g.get("unique_id")
+    }
+
+    # Bundles merged through a connection point holding nothing: the CP and
+    # the second bundle are deleted, the first one redrawn over both
+    merge = _merge_bundle_edits(layout, merge_bundles, keyed, errors)
+    delete = [*(delete or []), *merge["delete"]]
+    bundles = [*(bundles or []), *merge["bundles"]]
+    coverings = [*(coverings or []), *merge["coverings"]]
+    warnings.extend(merge["warnings"])
+
     # Deletions first: what they remove cannot be edited or followed
     deleted: set[str] = set()  # unique ids
     delete_records: list[list[Any]] = []
     for ref in delete or []:
         ref = str(ref).strip()
+        if ref in graphics:
+            delete_records.append(["DELETE", ref])
+            continue
         if ambiguous(ref):
             continue
         obj = (
@@ -797,7 +962,8 @@ def build_layout_spec(
         )
         if obj is None:
             errors.append(
-                f"delete: no bundle, covering, label or connection point '{ref}'"
+                f"delete: no bundle, covering, label, connection point, note, "
+                f"picture, frame or text '{ref}'"
             )
             continue
         if ref in cps:
@@ -1296,6 +1462,19 @@ def build_layout_spec(
         wire_records.append(["WIRELEN", wire["unique_id"], coord])
         expect_lengths[des] = None if coord == 0 else coord_to_mm(coord)
 
+    graphics_records: list[list[Any]] = []
+    try:
+        graphics_records += sheet_spec.copy_region_records(copy_region)
+        graphics_records += sheet_spec.note_records(notes, note_updates, move_objects)
+    except ValueError as e:
+        errors.append(str(e))
+    for rec in graphics_records:
+        uid = rec[1] if rec[0] in ("NOTEUPD", "MOVEOBJ") else None
+        if uid is not None and uid not in graphics:
+            errors.append(f"{rec[0].lower()}: no note, picture, frame or text '{uid}'")
+        if rec[0] == "NOTE" and rec[5] and rec[5] not in graphics:
+            errors.append(f"notes: style_from '{rec[5]}' is no note of the drawing")
+
     return {
         "records": [
             *delete_records,
@@ -1307,6 +1486,7 @@ def build_layout_spec(
             *covering_records,
             *label_records,
             *wire_records,
+            *graphics_records,
             # Last: texts of objects created above, and after connector moves
             *text_records,
         ],

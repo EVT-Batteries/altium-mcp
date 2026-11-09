@@ -1181,9 +1181,91 @@ begin
 end;
 
 // Add a screenshot function that supports both PCB and SCH views.
+// Zoom the shown schematic or harness sheet onto the objects the sheet owns
+// that lie inside X1..X2 x Y1..Y2 (mils): they are selected, Altium zooms to
+// the selection (Sch:Zoom has no area action a script can drive), and the
+// selection is put back as it was. Returns how many objects it zoomed to (0:
+// nothing inside, view unchanged). Selection is read through BoolToStr: a
+// Boolean property read directly in a condition has read False in scripts.
+function ZoomSchToArea(Doc: ISch_Document; X1, Y1, X2, Y2: Integer): Integer;
+var
+    Iter    : ISch_Iterator;
+    Obj     : ISch_GraphicalObject;
+    Owner   : ISch_BasicContainer;
+    OwnerId : Integer;
+    R       : TCoordRect;
+    Picked  : TList;
+    Before  : TList;
+    k       : Integer;
+    Sel     : IDispatch;
+begin
+    Result := 0;
+    Picked := TList.Create;
+    Before := TList.Create;
+    try
+        Iter := Doc.SchIterator_Create;
+        Obj := Iter.FirstSchObject;
+        while (Obj <> nil) do
+        begin
+            Owner := Obj.Container;
+            OwnerId := -1;
+            if (Owner <> nil) then OwnerId := Owner.ObjectId;
+            // Only objects the sheet owns: the iterator also reaches internal
+            // objects that have no Selection (a late-bound read then stops the
+            // script). BoundingRectangle is read typed (late-bound it has
+            // crashed Altium).
+            if (OwnerId = Doc.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) then
+            begin
+                Sel := Obj;
+                if (BoolToStr(Sel.Selection, True) = 'True') then
+                    Before.Add(Obj);
+                R := Obj.BoundingRectangle;
+                if (R.Left >= MilsToCoord(X1)) and (R.Bottom >= MilsToCoord(Y1)) and
+                   (R.Right <= MilsToCoord(X2)) and (R.Top <= MilsToCoord(Y2)) then
+                    Picked.Add(Obj);
+            end;
+            Obj := Iter.NextSchObject;
+        end;
+        Doc.SchIterator_Destroy(Iter);
+        Result := Picked.Count;
+        if (Result = 0) then Exit;
+        for k := 0 to Before.Count - 1 do
+        begin
+            Sel := Before[k];
+            Sel.Selection := False;
+        end;
+        for k := 0 to Picked.Count - 1 do
+        begin
+            Sel := Picked[k];
+            Sel.Selection := True;
+        end;
+        // Zoom to selection is Object=Selected (advsch.rcs PLSch:ZoomSelected);
+        // Action=Selected does nothing
+        ResetParameters;
+        AddStringParameter('Object', 'Selected');
+        RunProcess('Sch:Zoom');
+        for k := 0 to Picked.Count - 1 do
+        begin
+            Sel := Picked[k];
+            Sel.Selection := False;
+        end;
+        for k := 0 to Before.Count - 1 do
+        begin
+            Sel := Before[k];
+            Sel.Selection := True;
+        end;
+        Doc.GraphicallyInvalidate;
+    finally
+        Picked.Free;
+        Before.Free;
+    end;
+end;
+
 // If DesignatorsList is non-empty (PCB view only), the view is zoomed to
-// those components before the server captures the window.
-function TakeViewScreenshot(ViewType: String; DesignatorsList: TStringList): String;
+// those components before the server captures the window. SchZoom (sch view):
+// 'document' fits the whole sheet, 'x1,y1,x2,y2' (mils) the objects inside
+// that area; '' keeps the zoom.
+function TakeViewScreenshot(ViewType: String; DesignatorsList: TStringList; SchZoom: String): String;
 var
     Board          : IPCB_Board;
     SchDoc         : ISch_Document;
@@ -1202,7 +1284,10 @@ var
     // For screenshot thread
     ThreadStarted  : Boolean;
     ScreenshotResult : String;
+    ZoomParts      : TStringList;
+    SchZoomed      : Integer;
 begin
+    SchZoomed := -1;
     // Default result
     Result := '{"success": false, "error": "Failed to initialize screenshot capture"}';
 
@@ -1252,6 +1337,35 @@ begin
         end;
     end;
 
+    // Requested zoom on a schematic, wiring diagram or layout drawing
+    if (DocType = 'SCH') and (SchZoom <> '') and (Client.CurrentView <> nil) then
+        if (Client.CurrentView.OwnerDocument <> nil) then
+        begin
+            SchDoc := SchServer.GetSchDocumentByPath(Client.CurrentView.OwnerDocument.FileName);
+            if (SchDoc <> nil) then
+            begin
+                if (LowerCase(SchZoom) = 'document') then
+                begin
+                    ResetParameters;
+                    AddStringParameter('Action', 'Document');
+                    RunProcess('Sch:Zoom');
+                    SchZoomed := 0;
+                end
+                else
+                begin
+                    ZoomParts := TStringList.Create;
+                    try
+                        ZoomParts.CommaText := SchZoom;
+                        if (ZoomParts.Count = 4) then
+                            SchZoomed := ZoomSchToArea(SchDoc, StrToInt(ZoomParts[0]), StrToInt(ZoomParts[1]),
+                                                       StrToInt(ZoomParts[2]), StrToInt(ZoomParts[3]));
+                    finally
+                        ZoomParts.Free;
+                    end;
+                end;
+            end;
+        end;
+
     // Report what is ACTUALLY focused now that EnsureDocumentFocused has run.
     // The server compares this against the requested view: if no document of
     // the requested kind is open, the focus stays where it was and the
@@ -1288,7 +1402,9 @@ begin
         AddJSONProperty(ResultProps, 'class_filter', ClassName);
         AddJSONBoolean(ResultProps, 'window_found', WindowFound);
         AddJSONInteger(ResultProps, 'zoomed_component_count', ZoomedCount);
-        
+        // -1: no sch zoom asked; 0 after 'document'; else objects zoomed to
+        AddJSONInteger(ResultProps, 'sch_zoomed_objects', SchZoomed);
+
         // Add signal to the server that it can now capture the screenshot
         AddJSONBoolean(ResultProps, 'ready_for_capture', True);
 

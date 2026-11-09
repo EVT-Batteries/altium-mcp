@@ -147,9 +147,11 @@ var
     ModuleIdx, DocJ: Integer;
     Module: IServerModule;
     CurrentDoc: IServerDocument;
+    SchZoom: String;
 begin
     // Extract the view type parameter
     ViewType := 'pcb';  // Default to PCB
+    SchZoom := '';
     DocPath := '';
     PrjPath := '';
     DesignatorsList := TStringList.Create;
@@ -175,6 +177,11 @@ begin
             else if (Pos('"designators"', RequestData[i]) > 0) then
             begin
                 i := ReadJSONStringArray(RequestData, i, DesignatorsList);
+            end
+            // Schematic / harness zoom: 'document' or 'x1,y1,x2,y2' (mils)
+            else if (Pos('"sch_zoom"', RequestData[i]) > 0) then
+            begin
+                SchZoom := JSONLineValue(RequestData[i]);
             end;
         end;
 
@@ -198,7 +205,7 @@ begin
 
         end;
 
-        Result := TakeViewScreenshot(ViewType, DesignatorsList);
+        Result := TakeViewScreenshot(ViewType, DesignatorsList, SchZoom);
     finally
         DesignatorsList.Free;
     end;

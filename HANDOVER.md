@@ -34,17 +34,72 @@ projections that harness component views draw. Open work: §8.
 
 | Path | Branch | HEAD | Uncommitted |
 |---|---|---|---|
-| `altium-mcp/` | `feature/harness-support` | `7ec4b71` (session 22) | session 23: upstream v0.6.2 + v0.7.0 merge (`origin/main` `ce74f33`), conflicts resolved; the user commits |
+| `altium-mcp/` | `feature/harness-support` | `e62f7d9` (session 23 merge, committed by the user) | session 24: sheet graphics, connector removal, checker frames, layout notes / merge_bundles / import report, Draftsman add_text / missing tables, sch screenshot zoom; the user commits |
 
 Commits: session 10 multi-board `81280f9`, upstream 0.5.1 merge repair `0bdbf41`, layout CPs
 holding no-connects `8681502`, session 11 `aedbea7`, session 12 `e2e1203`, session 13
 `a29063e`, session 14 `1fa3dfe`, session 15 `15653b2`..`5b1f71e`, session 16 `1a93e86`,
-session 21 `3507e5d`, session 22 `ef585d9` / `7ec4b71`. Unit tests: 449 passed, 7 skipped (session 23).
+session 21 `3507e5d`, session 22 `ef585d9` / `7ec4b71`, session 23 merge `e62f7d9`. Unit tests:
+464 passed, 7 skipped (session 24).
 
 The user commits themselves. **Do not commit or push unless asked.** Test on renamed scratch copies
 of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
+
+### Session 24 (2026-11-09): sheet graphics, connector removal, layout merges, zoom (uncommitted)
+The §8 to-do list, worked through with live tests on a renamed scratch copy of a two-connector
+pigtail harness project (`MCP_Test_Reg.*` in the session scratch folder; wiring diagram,
+layout, Draftsman drawing). New module `server/sheet_spec.py` (note / move / region-copy
+records shared by the wiring and layout tools); tests `tests/test_sheet_graphics.py` and
+new cases in the parser, checker, layout and drawing suites.
+- **Readers** (`harness_parser.sheet_graphics`, used by `parse_wirdoc` and `parse_ldrdoc`):
+  notes (RECORD 209: text with `~1` line breaks decoded, corners, font, colours, border,
+  alignment), frames (sheet RECORD 14: corners, line style / width, colours), pictures
+  (RECORD 30) and texts (font, orientation, justification), each with its unique_id. Fonts
+  come from the sheet's font table (RECORD 104) as {name, size, bold, italic}: the file's
+  `FontID` is that table's index, not Altium's in-memory id (verified: a label set to id 3
+  was saved as 2). Connectors get a `bbox`; `get_harness_data(region=[...])` lists the
+  objects inside / partly inside an area (`objects_in_region`).
+- **`add_harness_wiring`**: `remove_objects` also takes notes, frames, pictures and texts by
+  unique_id, and connectors (`type: connector`, every part or `part`; with the no-connects
+  on their pins), refused while a wire not removed in the same call ends on a pin (checked
+  on the saved sheet before Altium is called). `notes` (new note; `style_from` replicates a
+  note's style), `note_updates` (text / corners / style), `move_objects` (notes, frames,
+  pictures, texts). `labels` take `font_from` (unique_id of a text: font, colour,
+  justification, orientation), `font` ("Arial:10") and `justification`. `copy_objects`
+  takes `types` and `exclude` (unique ids). `connectors` and `associated_parts` take
+  `part` (`CONNECTOR|..|<part id>`, new record `ASSOCPARTP`). Live: cross-project copy of a
+  connector (another open harness project as source) with crimps, note copy filtered by
+  type + exclude, two-line note, font_from, removal of the copied connector (diff: all its
+  records gone, wires untouched), refusal of a wired one, `part` A found / B not_found.
+- **`check_harness_wiring`**: wires keyed by UniqueID (`W? (<uid>)` when a designator does not
+  name one wire); `wire_in_frame` / `label_in_frame` warnings for wires (and labels) inside
+  the frame of a connector they do not end on (wires ending inside the frame, on a splice
+  there, belong to it); a label ending within 120 mils left of a vertical run is beside it.
+- **`edit_harness_layout`**: `notes`, `note_updates`, `move_objects`, `copy_region` (the
+  drawing's notes / pictures / frames / texts in a region, offset, `replace_text`), `delete`
+  of graphics by unique_id, and `merge_bundles` (two bundles through an empty connection
+  point; manual lengths added, coverings moved to the kept bundle). Live: split + merge
+  back (156.52 mm = 96.52 + 60 manual, wire lengths unchanged), region copy, deletes.
+- **`import_harness_changes`** layout report: `connectors_added` / `splices_added` (location,
+  own connection point with location, show_name, holds) and `*_removed`. Live: a connector
+  copied into the wiring diagram came back as added with its `CP_<des>`.
+- **Draftsman**: `add_text` (page position, or centred on a point of a component view's
+  projection; font family / size / bold reused or added as a FontStyle; colour; rotation);
+  verified that a Text item's `Rect` X, Y is its bottom-left corner. The review (and the
+  drawing import report) lists `connector_without_table` for layout connectors no connection
+  table names (source layout read from the drawing's BoardSourceName).
+- **`get_screenshot(view_type="sch", zoom=...)`**: "document" or an area [x1, y1, x2, y2]
+  mils: the sheet objects inside it are selected, `Sch:Zoom Object=Selected`, the selection
+  restored. `Action=Rectangle`, `Action=Selected`, `Sch:ZoomSelected` do nothing from a
+  script; the right parameters are in `System\advsch.rcs`. `Selection` only resolves
+  late-bound and only on sheet-owned objects (dev skill §5).
+- **Not done**: Draftsman page navigation / zoom for screenshots (§8 item 6). Its commands
+  (`Altium.Designer.PcbDrawing.rcs`) fit the *selected* sheet or ask for an area, and the
+  editor shows one page at a time; reading how a sheet gets selected needs the extension
+  decompiled (ILSpy), which the session's permission settings did not allow.
+- Multi-part `part` was tested live on a single-part connector only (A found, B not_found).
 
 ### Session 23 (2026-11-09): upstream v0.6.2 + v0.7.0 merged (uncommitted merge)
 `origin/main` (`ce74f33`, 27 commits: PCB layout / routing tools `get_layout`, `place_copper`,
@@ -914,38 +969,31 @@ Announce "using Altium now" / "Altium free" around live tests; a desktop screens
 whether an Altium modal window is up ("Altium did not start the command (not executed)" = ask
 the user to clear it). Test each change on a scratch copy first, and close the scratch document
 in Altium before overwriting it on disk (a file-changed prompt blocks the bridge).
-1. Fixes from session 9 (§6); part-aware lookup, parser parts and sync reload done in session 12:
-   - `CONNECTOR` (move) and `ASSOCPART` still take the first part object of a multi-part
-     connector (no way yet to name the part, e.g. `<designator>:B`).
-   - `check_harness_wiring`: key wires by UniqueID, not designator (unannotated `W?` wires merge).
-   - `check_harness_wiring`: parse the sheet rectangles (RECORD 14, the connector frames) and
-     report labels and channels inside another connector's frame (today only the screenshot shows
-     them).
-   - `get_screenshot(view_type="sch")` on a harness sheet: optional zoom (whole sheet via
-     `Sch:Zoom Action=Document`, or an area), so the agent can see every part of a large sheet.
-     Session 12 workaround: a sandbox run that selects objects and runs `Sch:Zoom
-     Action=Selected` (it zoomed only a little on a large sheet), then crop the PNG.
-   - `check_harness_wiring`: a vertical wire's label must start within 120 mils to its right
-     (`beside`); labels left of a vertical run are reported "off its wire".
+1. (done, session 24) Fixes from session 9: connector / associated part `part` of a
+   multi-part connector (live-tested on a single-part one only: try it on a real multi-part
+   one), checker keyed by UniqueID, frame checks, vertical label rule, sch screenshot zoom.
 2. (done, session 18) The 13 old test failures were replaced by tests on the synthetic fixture
    project (`server/tests/harness_fixture.py`).
 3. Open question: should view options (side, zoom) be copied from a template connector?
-4. Not supported yet: LdrDoc notes / text frames (scope in item 9); wire `LengthOffset` / user length / manual wire
-   paths (no script setter, §5).
-5. `copy_objects` was tested within one harness project only: try a source sheet of another open
-   project before relying on it. A `get_harness_data` option listing the objects inside a region
-   would help choose `region` without a screenshot.
+4. Not supported yet: wire `LengthOffset` / user length / manual wire paths (no script
+   setter, §5). (done, session 24) LdrDoc notes / pictures.
+5. (done, session 24) `copy_objects` from another open project's sheet (verified live), and
+   `get_harness_data(region=...)`.
 6. Draftsman (session 15): isolate why the native component-view lookup fails (probe
    `GetLocalComponentPCBLibraryPath` on the open harness document with and without the table
    name; test a `Footprint Path` DbLib field) - if a library change fixes it, removing the
    stored projections lets Draftsman draw them itself. Projection computation is the agent's
    job today (build123d session); a helper that takes footprint + side and returns the lines
-   would save steps. Cavity numbers on face views would need Text items (no op yet); page
-   navigation / zoom to a view for screenshots (only `ViewFit`, all sheets).
+   would save steps. (done, session 24) Text items (`add_text`, e.g. cavity numbers).
+   Open: page navigation / zoom to a view for screenshots. The editor shows one page at a
+   time and `PcbDrawing:FitSheet` fits the selected sheet; how a sheet is selected (and
+   whether `Zoom` takes a location) needs `Altium.Designer.PcbDrawing.dll` decompiled.
 7. `import_harness_changes`: (fixed, session 19) a save from a bridge run keeps the import
    now that the bridge runs a script file (verified: sandbox import, bridge save, the saved
    layout carries the imported parameter); the open / import / save may move into the bridge
-   (optional, the sandbox flow works). (fixed, session 19) the pin repair runs only when an
+   (optional, the sandbox flow works). (done, session 24) the layout report lists
+   connectors / splices added (with location and connection point) and removed.
+   (fixed, session 19) the pin repair runs only when an
    unassigned pin carries a wire. Tried in session 17: new connectors arrive with their own
    CP at Altium's default spot, new wires to free ends are unrouted (`success: false` with
    `newly_unrouted_wires`) until CPs hold their no-connects.
@@ -979,51 +1027,15 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
      `net_labels` / `net_label_count` and `get_all_nets` listed them as nets. Texts now go
      under `texts` / `summary.text_count` and never become nets; `net_labels` holds only
      RECORD 25 (invalid) net labels.
-9. **Gaps found reworking a sheet (session 20)**: after a rework (copy a contactor frame,
-   move lugs, reroute, import, re-branch the layout) these steps were left to the user in the
-   GUI, or needed a read-only olefile scratch script. Each object below is addressed by the
-   unique_id the reader reports.
-   - **WirDoc reader** (`get_harness_data`): report notes (RECORD 209: text, colour, corners),
-     frames / rectangles (RECORD 14: corners, line style) and pictures (RECORD 30: corners, file
-     name), each with its unique_id. Today they are invisible to the tools, so choosing a
-     `copy_objects` region or finding a stale note needed a raw record dump (see also item 5).
-   - **WirDoc delete** (`add_harness_wiring` `delete`: unique_ids, or designators for connectors
-     / wires / splices): remove notes, texts, frames, pictures, and connectors no wire touches
-     (refused when one does; a stale connector otherwise stays in the BOM). Today only
-     `clear_existing` removes anything, and only wiring. Never delete a whole object tree by
-     index: the owner indexes of the remaining records must be renumbered (let Altium do it,
-     `RemoveSchObject` in the bridge).
-   - **WirDoc notes** (`note_updates` / `notes`): change a note's text (keep its size, colour
-     and font), add a note (copy the style of a given one), move it. `label_updates` covers
-     only texts (eLabel). Stale "TODO" notes and notes that no longer match the drawing were
-     left to the user.
-   - **Text style**: `labels` place a new text in the sheet's default font, so a new frame
-     title is smaller than the copied ones next to it. Add `font_from` (unique_id of a text whose
-     FontID, colour and justification are copied) or `font_id`.
-   - **`copy_objects` filters**: `exclude` (unique_ids) and/or `types` (connector, frame, text,
-     note, picture), so a copied frame does not bring along notes for lugs it no longer has.
-   - **LdrDoc notes and pictures** (item 4): read them in `get_harness_data` (`notes`,
-     `pictures`, with unique_id and corners); in `edit_harness_layout` change a note's text, move
-     / delete notes and pictures, and copy a note + picture group from a region with an offset,
-     like `copy_objects`. Needed when a connector's role changes (a note naming the wrong part)
-     and when a new connector needs the note and picture its neighbours have. Check whether the
-     layout note is the same record type as the WirDoc one (RECORD 209) first.
-   - **Import report**: `import_harness_changes` should list `connectors_added` /
-     `connectors_removed` with where Altium put them (they land at their wiring-diagram
-     coordinates, their own CP offset from the connector and its name shown), so the agent knows
-     what to place.
-   - **Bend-only connection points**: after a re-branch a CP can be left joining just two
-     bundles (a bend). Add `edit_harness_layout` `merge_bundles` (join two bundles through a CP
-     that holds nothing, deleting it, keeping the first bundle's designator and texts; manual
-     lengths added).
-   - **Drawing review**: report the layout connectors that no connection table lists
-     (`connector_without_table`), since Draftsman's update adds none for new connectors; the fix is
-     `copy_item` with `component` (session 20). A screenshot of a given page (item 6) would
-     let the agent check where the new tables sit.
+9. (done, session 24) **Gaps found reworking a sheet (session 20)**: WirDoc reader for notes,
+   frames and pictures; deleting notes, texts, frames, pictures and unwired connectors; note
+   edits; text font from another text; `copy_objects` types / exclude; LdrDoc notes and
+   pictures (edit, move, delete, region copy); import report of added connectors;
+   `merge_bundles`; `connector_without_table` in the drawing review. See session 24.
 
 ## 9. How to verify
 ```powershell
-# unit tests (altium-mcp root) - 399 passed, 7 skipped, 0 failed (session 19)
+# unit tests (altium-mcp root) - 464 passed, 7 skipped, 0 failed (session 24)
 cd <altium-mcp checkout>
 uv run --with pytest python -m pytest server/tests -q
 uvx ruff check --extend-select I server/harness_layout.py server/harness_parser.py server/harness_check.py

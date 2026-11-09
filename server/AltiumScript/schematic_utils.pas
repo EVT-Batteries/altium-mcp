@@ -2993,9 +2993,11 @@ end;
 // connectors, wires and splices named in DesOld get the DesNew name at the
 // same index; texts and notes get TxtOld -> TxtNew replaced. The source must
 // be a wiring diagram of an open harness project (alone it opens empty).
+// Include lists the only ObjectIds to copy ('2,4'; '' = all) and ExUids
+// UniqueIds of objects to leave out (comma-separated).
 // Returns the number of objects copied.
 function CopyHarnessObjects(Doc: ISch_Document; SrcPath: String;
-    X1, Y1, X2, Y2, DX, DY: Integer; Exclude: String;
+    X1, Y1, X2, Y2, DX, DY: Integer; Exclude, Include, ExUids: String;
     DesOld, DesNew, TxtOld, TxtNew, Misses: TStringList): Integer;
 var
     SrcServer : IServerDocument;
@@ -3037,7 +3039,9 @@ begin
             // Only what the sheet itself owns (the iterator recurses into
             // components); never its template (42) or document parameters (27)
             if (OwnerId = Src.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) and
-               (Pos(',' + IntToStr(Obj.ObjectId) + ',', ',' + Exclude + ',') = 0) then
+               (Pos(',' + IntToStr(Obj.ObjectId) + ',', ',' + Exclude + ',') = 0) and
+               ((Include = '') or (Pos(',' + IntToStr(Obj.ObjectId) + ',', ',' + Include + ',') > 0)) and
+               ((ExUids = '') or (Pos(',' + Obj.UniqueId + ',', ',' + ExUids + ',') = 0)) then
             begin
                 R := Obj.BoundingRectangle;
                 if (R.Left >= MilsToCoord(X1)) and (R.Bottom >= MilsToCoord(Y1)) and
@@ -3088,6 +3092,205 @@ begin
     finally
         Objs.Free;
     end;
+end;
+
+// Object the sheet itself owns (its Container is Doc: notes, texts, frames,
+// pictures, harness objects; never the sheet template or document
+// parameters) with UniqueId Uid, or nil.
+function FindSheetObjectByUid(Doc: ISch_Document; Uid: String): ISch_GraphicalObject;
+var
+    Iter    : ISch_Iterator;
+    Obj     : ISch_GraphicalObject;
+    Owner   : ISch_BasicContainer;
+    OwnerId : Integer;
+begin
+    Result := nil;
+    if (Uid = '') then Exit;
+    Iter := Doc.SchIterator_Create;
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (Obj.UniqueId = Uid) then
+        begin
+            Owner := Obj.Container;
+            OwnerId := -1;
+            if (Owner <> nil) then OwnerId := Owner.ObjectId;
+            if (OwnerId = Doc.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) then
+            begin
+                Result := Obj;
+                Break;
+            end;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// ':<part letter>' of a part id field ('2' -> ':B'), '' when none given.
+function PartSuffix(PartField: String): String;
+begin
+    Result := '';
+    if (PartField <> '') then
+        if (StrToInt(PartField) > 0) then
+            Result := ':' + Chr(Ord('A') + StrToInt(PartField) - 1);
+end;
+
+// The part PartId (CurrentPartID, 1 = A) of the placed connector or component
+// Des, or nil. PartId 0: the first part found (FindPlacedComponent).
+function FindPlacedPart(Doc: ISch_Document; Des: String; PartId: Integer): ISch_GraphicalObject;
+var
+    Iter : ISch_Iterator;
+    Obj  : ISch_GraphicalObject;
+begin
+    if (PartId <= 0) then
+    begin
+        Result := FindPlacedComponent(Doc, Des);
+        Exit;
+    end;
+    Result := nil;
+    Iter := Doc.SchIterator_Create;
+    Iter.AddFilter_ObjectSet(MkSet(81, eSchComponent));
+    Obj := Iter.FirstSchObject;
+    while (Obj <> nil) do
+    begin
+        if (AnsiUpperCase(PlacedDesignator(Obj)) = AnsiUpperCase(Des)) and
+           (Obj.CurrentPartID = PartId) then
+        begin
+            Result := Obj;
+            Break;
+        end;
+        Obj := Iter.NextSchObject;
+    end;
+    Doc.SchIterator_Destroy(Iter);
+end;
+
+// Style fields of a NOTE / NOTEUPD record from field F on ('' = keep):
+// area colour, text colour, font id, show border 1/0, solid 1/0,
+// alignment (0 centre, 1 left, 2 right), word wrap 1/0.
+procedure ApplyNoteStyle(Obj: ISch_GraphicalObject; Rec: String; F: Integer);
+begin
+    if (SpecField(Rec, F) <> '') then Obj.AreaColor := StrToInt(SpecField(Rec, F));
+    if (SpecField(Rec, F + 1) <> '') then Obj.TextColor := StrToInt(SpecField(Rec, F + 1));
+    // Font '<name>:<size>': ids in a saved file are its own table's
+    if (SpecField(Rec, F + 2) <> '') then
+        if (FontIDFromSpec(SpecField(Rec, F + 2)) > 0) then
+            Obj.FontID := FontIDFromSpec(SpecField(Rec, F + 2));
+    if (SpecField(Rec, F + 3) <> '') then Obj.ShowBorder := (SpecField(Rec, F + 3) = '1');
+    if (SpecField(Rec, F + 4) <> '') then Obj.IsSolid := (SpecField(Rec, F + 4) = '1');
+    if (SpecField(Rec, F + 5) <> '') then Obj.Alignment := StrToInt(SpecField(Rec, F + 5));
+    if (SpecField(Rec, F + 6) <> '') then Obj.WordWrap := (SpecField(Rec, F + 6) = '1');
+end;
+
+// NOTE|x1|y1|x2|y2|<style from: unique id of a note, ''>|text|<style fields>
+// A sheet note (eNote, 2) with corners in mils. Given a note to take the
+// style from, the new one is its replica (colours, font, border, author)
+// with a fresh UniqueId. Returns False (Misses names why) when the style
+// note is not found.
+function PlaceSheetNote(Doc: ISch_Document; Rec: String; Misses: TStringList): Boolean;
+var
+    Src : ISch_GraphicalObject;
+    Obj : ISch_GraphicalObject;
+begin
+    Result := False;
+    Src := nil;
+    if (SpecField(Rec, 5) <> '') then
+    begin
+        Src := FindSheetObjectByUid(Doc, SpecField(Rec, 5));
+        if (Src = nil) then
+        begin
+            Misses.Add('note_style_from:' + SpecField(Rec, 5));
+            Exit;
+        end;
+        if (Src.ObjectId <> 2) then
+        begin
+            Misses.Add('note_style_from (not a note):' + SpecField(Rec, 5));
+            Exit;
+        end;
+        Obj := Src.Replicate;
+        RenewUniqueIds(Obj);
+    end
+    else
+        Obj := SchServer.SchObjectFactory(2, eCreate_Default);
+    if (Obj = nil) then
+    begin
+        Misses.Add('note:' + SpecField(Rec, 6));
+        Exit;
+    end;
+    Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 1))), MilsToCoord(StrToInt(SpecField(Rec, 2))));
+    Obj.Corner := Point(MilsToCoord(StrToInt(SpecField(Rec, 3))), MilsToCoord(StrToInt(SpecField(Rec, 4))));
+    Obj.Text := SpecField(Rec, 6);
+    ApplyNoteStyle(Obj, Rec, 7);
+    Doc.RegisterSchObjectInContainer(Obj);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
+    Obj.GraphicallyInvalidate;
+    Result := True;
+end;
+
+// NOTEUPD|uid|<set text 1/0>|text|x1|y1|x2|y2|<style fields>: change a sheet
+// note's text (its size, colours and font stay), corners ('' = keep) and
+// style. False (Misses names it) when there is no such note.
+function UpdateSheetNote(Doc: ISch_Document; Rec: String; Misses: TStringList): Boolean;
+var
+    Obj : ISch_GraphicalObject;
+begin
+    Result := False;
+    Obj := FindSheetObjectByUid(Doc, SpecField(Rec, 1));
+    if (Obj = nil) then
+    begin
+        Misses.Add('note:' + SpecField(Rec, 1));
+        Exit;
+    end;
+    if (Obj.ObjectId <> 2) and (Obj.ObjectId <> 13) then
+    begin
+        Misses.Add('note (not a note or text frame):' + SpecField(Rec, 1));
+        Exit;
+    end;
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    if (SpecField(Rec, 2) = '1') then
+        Obj.Text := SpecField(Rec, 3);
+    if (SpecField(Rec, 4) <> '') then
+    begin
+        Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 4))), MilsToCoord(StrToInt(SpecField(Rec, 5))));
+        Obj.Corner := Point(MilsToCoord(StrToInt(SpecField(Rec, 6))), MilsToCoord(StrToInt(SpecField(Rec, 7))));
+    end;
+    ApplyNoteStyle(Obj, Rec, 8);
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+    Obj.GraphicallyInvalidate;
+    Result := True;
+end;
+
+// MOVEOBJ|uid|dx|dy: move a note (2), frame (4), picture (11), text frame
+// (13) or text (22) the sheet owns by dx, dy mils. False (Misses names it)
+// for anything else: connectors move with CONNECTOR, wires with REROUTE.
+function MoveSheetObject(Doc: ISch_Document; Rec: String; Misses: TStringList): Boolean;
+var
+    Obj : ISch_GraphicalObject;
+    Id  : Integer;
+begin
+    Result := False;
+    Obj := FindSheetObjectByUid(Doc, SpecField(Rec, 1));
+    Id := -1;
+    if (Obj <> nil) then Id := Obj.ObjectId;
+    if (Id <> 2) and (Id <> 4) and (Id <> 11) and (Id <> 13) and (Id <> 22) then
+    begin
+        Misses.Add('move:' + SpecField(Rec, 1));
+        Exit;
+    end;
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    Obj.MoveByXY(MilsToCoord(StrToInt(SpecField(Rec, 2))), MilsToCoord(StrToInt(SpecField(Rec, 3))));
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+    Obj.GraphicallyInvalidate;
+    Result := True;
+end;
+
+// Remove an object from Doc as the GUI's delete does (with what it holds).
+procedure RemoveSheetObject(Doc: ISch_Document; Obj: ISch_GraphicalObject);
+begin
+    Obj.GraphicallyInvalidate;
+    Doc.RemoveSchObject(Obj);
+    SchServer.RobotManager.SendMessage(Doc.I_ObjectAddress, c_BroadCast,
+        SCHM_PrimitiveRegistration, Obj.I_ObjectAddress);
 end;
 
 // Add wires, splices, no-connect directives, and net labels to the current wiring diagram or schematic
@@ -3185,6 +3388,9 @@ var
     CopyDesNew    : TStringList;
     CopyTxtOld    : TStringList;
     CopyTxtNew    : TStringList;
+    NotesPlaced   : Integer;
+    NotesUpdated  : Integer;
+    ObjectsMoved  : Integer;
 begin
     Result := '{"success": false, "error": "wiring did not run"}';
 
@@ -3310,6 +3516,9 @@ begin
         HiddenCleared := 0;
         BreaksUpdated := 0;
         KindCount := 0;
+        NotesPlaced := 0;
+        NotesUpdated := 0;
+        ObjectsMoved := 0;
         ForceReload := False;
         // Wire geometry changed: twists, shields, cables and wire breaks
         // must then be linked again (see the reopen below)
@@ -3342,13 +3551,15 @@ begin
             end
             else if (Kind = 'COPYFROM') then
             begin
-                // COPYFROM|<source path>|x1|y1|x2|y2|dx|dy|<excluded ObjectIds, comma-separated>
+                // COPYFROM|<source path>|x1|y1|x2|y2|dx|dy|<excluded ObjectIds>|
+                // <only these ObjectIds, '' = all>|<excluded UniqueIds> (comma-separated)
                 j := CopyHarnessObjects(TargetDoc,
                     StringReplace(SpecField(Rec, 1), '/', '\', REPLACEALL),
                     StrToInt(SpecField(Rec, 2)), StrToInt(SpecField(Rec, 3)),
                     StrToInt(SpecField(Rec, 4)), StrToInt(SpecField(Rec, 5)),
                     StrToInt(SpecField(Rec, 6)), StrToInt(SpecField(Rec, 7)),
-                    SpecField(Rec, 8), CopyDesOld, CopyDesNew, CopyTxtOld, CopyTxtNew, Misses);
+                    SpecField(Rec, 8), SpecField(Rec, 9), SpecField(Rec, 10),
+                    CopyDesOld, CopyDesNew, CopyTxtOld, CopyTxtNew, Misses);
                 if (j = 0) then
                     Misses.Add('copy_region:' + SpecField(Rec, 1))
                 else
@@ -3361,13 +3572,16 @@ begin
             end
             else if (Kind = 'CONNECTOR') then
             begin
-                // CONNECTOR|<Designator>|<x_mils>|<y_mils>
+                // CONNECTOR|<Designator>|<x_mils>|<y_mils>[|<part id, 1 = A>]
                 ConnDes := SpecField(Rec, 1);
                 ConnX := MilsToCoord(StrToInt(SpecField(Rec, 2)));
                 ConnY := MilsToCoord(StrToInt(SpecField(Rec, 3)));
-                Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                if (SpecField(Rec, 4) <> '') then
+                    Obj := FindPlacedPart(TargetDoc, ConnDes, StrToInt(SpecField(Rec, 4)))
+                else
+                    Obj := FindPlacedComponent(TargetDoc, ConnDes);
                 if (Obj = nil) then
-                    Misses.Add('connector:' + ConnDes)
+                    Misses.Add('connector:' + ConnDes + PartSuffix(SpecField(Rec, 4)))
                 else
                 begin
                     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
@@ -3544,21 +3758,48 @@ begin
             end
             else if (Kind = 'NETLABEL') or (Kind = 'LABEL') or (Kind = 'TEXT') then
             begin
-                // NETLABEL|x|y|orientation|Text
+                // LABEL|x|y|orientation|Text[|<font from: unique id of a text>|<font name:size>|
+                // colour|justification 0-8] ('' = default, or the font-from text's)
+                // A font-from text gives its font, colour, justification and,
+                // unless one is given, its orientation.
+                Prim := nil;
+                if (SpecField(Rec, 5) <> '') then
+                begin
+                    Prim := FindSheetObjectByUid(TargetDoc, SpecField(Rec, 5));
+                    if (Prim <> nil) then
+                        if (Prim.ObjectId <> eLabel) then
+                            Prim := nil;
+                    if (Prim = nil) then
+                        Misses.Add('font_from:' + SpecField(Rec, 5));
+                end;
                 Obj := SchServer.SchObjectFactory(eLabel, eCreate_GlobalCopy);
                 if (Obj <> nil) then
                 begin
                     Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 1))),
                                           MilsToCoord(StrToInt(SpecField(Rec, 2))));
-                    try
+                    Obj.Color := 8388608;
+                    if (Prim <> nil) then
+                    begin
+                        Obj.FontID := Prim.FontID;
+                        Obj.Color := Prim.Color;
+                        Obj.Justification := Prim.Justification;
+                        Obj.Orientation := Prim.Orientation;
+                    end;
+                    if (SpecField(Rec, 3) <> '') then
                         Obj.Orientation := StrToInt(SpecField(Rec, 3));
-                    except
+                    if (SpecField(Rec, 6) <> '') then
+                    begin
+                        j := FontIDFromSpec(SpecField(Rec, 6));
+                        if (j > 0) then
+                            Obj.FontID := j
+                        else
+                            Misses.Add('font:' + SpecField(Rec, 6));
                     end;
+                    if (SpecField(Rec, 7) <> '') then
+                        Obj.Color := StrToInt(SpecField(Rec, 7));
+                    if (SpecField(Rec, 8) <> '') then
+                        Obj.Justification := StrToInt(SpecField(Rec, 8));
                     Obj.Text := SpecField(Rec, 4);
-                    try
-                        Obj.Color := 8388608;
-                    except
-                    end;
 
                     TargetDoc.RegisterSchObjectInContainer(Obj);
                     SchServer.RobotManager.SendMessage(TargetDoc.I_ObjectAddress, c_BroadCast,
@@ -3989,35 +4230,46 @@ begin
                         CrimpCount := CrimpCount + 1;
                 end;
             end
-            else if (Kind = 'ASSOCPART') then
+            else if (Kind = 'ASSOCPART') or (Kind = 'ASSOCPARTP') then
             begin
                 // ASSOCPART|<Connector or splice designator>|<PartNumber>|<SourceLibraryName>|<DatabaseTableName>|<Description>[|Name|Value...]
+                // ASSOCPARTP|<Connector designator>|<part id, 1 = A>|<PartNumber>|... (the
+                // part of a multi-part connector; ASSOCPART takes the first part found)
                 // Boots, backshells, heat shrink... The first record for an
                 // owner in a run replaces its associated parts; an empty
                 // PartNumber only removes them.
+                fld := 0;
+                if (Kind = 'ASSOCPARTP') then fld := 1;
                 ConnDes := SpecField(Rec, 1);
-                PVal    := SpecField(Rec, 2);
-                Obj := FindPlacedComponent(TargetDoc, ConnDes);
-                if (Obj = nil) then
+                PVal    := SpecField(Rec, 2 + fld);
+                PName   := '';
+                if (fld = 1) then
+                begin
+                    PName := PartSuffix(SpecField(Rec, 2));
+                    Obj := FindPlacedPart(TargetDoc, ConnDes, StrToInt(SpecField(Rec, 2)));
+                end
+                else
+                    Obj := FindPlacedComponent(TargetDoc, ConnDes);
+                if (Obj = nil) and (fld = 0) then
                     Obj := FindHarnessSplice(TargetDoc, ConnDes);
                 if (Obj = nil) then
                 begin
-                    if (Misses.IndexOf('owner:' + ConnDes) < 0) then
-                        Misses.Add('owner:' + ConnDes);
+                    if (Misses.IndexOf('owner:' + ConnDes + PName) < 0) then
+                        Misses.Add('owner:' + ConnDes + PName);
                 end
                 else
                 begin
-                    if (Cleared.IndexOf('ASSOC:' + AnsiUpperCase(ConnDes)) < 0) then
+                    if (Cleared.IndexOf('ASSOC:' + AnsiUpperCase(ConnDes + PName)) < 0) then
                     begin
                         Obj.RemoveAllAssociatedParts;
-                        Cleared.Add('ASSOC:' + AnsiUpperCase(ConnDes));
+                        Cleared.Add('ASSOC:' + AnsiUpperCase(ConnDes + PName));
                     end;
                     if (PVal <> '') then
                     begin
-                        Prim := NewHarnessPart(PVal, SpecField(Rec, 3), SpecField(Rec, 4), SpecField(Rec, 5));
+                        Prim := NewHarnessPart(PVal, SpecField(Rec, 3 + fld), SpecField(Rec, 4 + fld), SpecField(Rec, 5 + fld));
                         if (Prim <> nil) then
                         begin
-                            ApplySpecParameters(Prim, Rec, 6);
+                            ApplySpecParameters(Prim, Rec, 6 + fld);
                             Obj.AddAssociatedPart(Prim);
                             AssocCount := AssocCount + 1;
                         end;
@@ -4186,8 +4438,12 @@ begin
             else if (Kind = 'REMOVE') then
             begin
                 // REMOVE|UID|<UniqueId>, REMOVE|WIRE / SPLICE / NOCONNECT|<designator
-                // or no-connect name> or REMOVE|TEXT|x|y|<text> - deletes one
-                // harness wire, splice, no-connect or sheet text (never a connector)
+                // or no-connect name>, REMOVE|TEXT|x|y|<text> or
+                // REMOVE|CONNECTOR|<UniqueId of a connector part> - deletes one
+                // harness wire, splice, no-connect, sheet text, note, frame,
+                // picture (UID: never a connector) or connector part (only
+                // CONNECTOR, which the server sends for connectors no wire
+                // touches; its pins, cavity parts and associated parts go with it)
                 PName := SpecField(Rec, 1);
                 PVal := SpecField(Rec, 2);
                 Obj := nil;
@@ -4199,8 +4455,18 @@ begin
                 else if (PName = 'UID') then
                 begin
                     Obj := FindHarnessObjectByUid(TargetDoc, PVal);
-                    if (Obj <> nil) and (Obj.ObjectId = 81) then
-                        Obj := nil;
+                    if (Obj = nil) then
+                        Obj := FindSheetObjectByUid(TargetDoc, PVal);
+                    if (Obj <> nil) then
+                        if (Obj.ObjectId = 81) then
+                            Obj := nil;
+                end
+                else if (PName = 'CONNECTOR') then
+                begin
+                    Obj := FindHarnessObjectByUid(TargetDoc, PVal);
+                    if (Obj <> nil) then
+                        if (Obj.ObjectId <> 81) then
+                            Obj := nil;
                 end
                 else if (PName = 'WIRE') then
                     Obj := FindHarnessWire(TargetDoc, PVal)
@@ -4226,6 +4492,21 @@ begin
                     RemovedCount := RemovedCount + 1;
                     GeoChanged := True;
                 end;
+            end
+            else if (Kind = 'NOTE') then
+            begin
+                if PlaceSheetNote(TargetDoc, Rec, Misses) then
+                    NotesPlaced := NotesPlaced + 1;
+            end
+            else if (Kind = 'NOTEUPD') then
+            begin
+                if UpdateSheetNote(TargetDoc, Rec, Misses) then
+                    NotesUpdated := NotesUpdated + 1;
+            end
+            else if (Kind = 'MOVEOBJ') then
+            begin
+                if MoveSheetObject(TargetDoc, Rec, Misses) then
+                    ObjectsMoved := ObjectsMoved + 1;
             end
             else if (Kind = 'WIREBREAK') then
             begin
@@ -4359,6 +4640,9 @@ begin
                   ', "parts": ' + IntToStr(PartCount) +
                   ', "rectangles": ' + IntToStr(RectCount) +
                   ', "copied": ' + IntToStr(CopyCount) +
+                  ', "notes": ' + IntToStr(NotesPlaced) +
+                  ', "notes_updated": ' + IntToStr(NotesUpdated) +
+                  ', "objects_moved": ' + IntToStr(ObjectsMoved) +
                   ', "not_found": [' + InfoStr + ']}';
     finally
         CopyTxtNew.Free;
@@ -4914,6 +5198,12 @@ var
     Unsaved      : String;
     j            : Integer;
     InfoStr      : String;
+    NotesChanged : Integer;
+    GraphicsMoved : Integer;
+    GraphicsCopied : Integer;
+    CopyNone     : TStringList;
+    CopyTxtOld   : TStringList;
+    CopyTxtNew   : TStringList;
 begin
     Result := '{"success": false, "error": "layout edit did not run"}';
     if not FileExists(SpecPath) then
@@ -4925,6 +5215,9 @@ begin
     Spec := TStringList.Create;
     Misses := TStringList.Create;
     ViewUids := TStringList.Create;
+    CopyNone := TStringList.Create;
+    CopyTxtOld := TStringList.Create;
+    CopyTxtNew := TStringList.Create;
     try
         Spec.LoadFromFile(SpecPath);
         DocPath := '';
@@ -5039,6 +5332,9 @@ begin
         Unsaved := '';
         GeoChanged := False;
         Reloaded := False;
+        NotesChanged := 0;
+        GraphicsMoved := 0;
+        GraphicsCopied := 0;
 
         SchServer.ProcessControl.PreProcess(Doc, '');
         for i := 0 to Spec.Count - 1 do
@@ -5047,8 +5343,20 @@ begin
             Kind := SpecField(Rec, 0);
             if (Kind = 'DELETE') then
             begin
+                // Layout objects, or a note, frame, picture, text frame or
+                // text the sheet owns; never a connector or wire
                 Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
-                if (Obj = nil) or (Obj.ObjectId = 81) then
+                if (Obj = nil) then
+                begin
+                    Obj := FindSheetObjectByUid(Doc, SpecField(Rec, 1));
+                    if (Obj <> nil) then
+                        if (Obj.ObjectId <> 2) and (Obj.ObjectId <> 4) and (Obj.ObjectId <> 11) and
+                           (Obj.ObjectId <> 13) and (Obj.ObjectId <> 22) then
+                            Obj := nil;
+                end;
+                if (Obj = nil) then
+                    Misses.Add('delete:' + SpecField(Rec, 1))
+                else if (Obj.ObjectId = 81) or (Obj.ObjectId = 90) then
                     Misses.Add('delete:' + SpecField(Rec, 1))
                 else
                 begin
@@ -5411,6 +5719,44 @@ begin
                     WireLengths := WireLengths + 1;
                 end;
             end
+            else if (Kind = 'NOTE') then
+            begin
+                if PlaceSheetNote(Doc, Rec, Misses) then
+                    NotesChanged := NotesChanged + 1;
+            end
+            else if (Kind = 'NOTEUPD') then
+            begin
+                if UpdateSheetNote(Doc, Rec, Misses) then
+                    NotesChanged := NotesChanged + 1;
+            end
+            else if (Kind = 'MOVEOBJ') then
+            begin
+                if MoveSheetObject(Doc, Rec, Misses) then
+                    GraphicsMoved := GraphicsMoved + 1;
+            end
+            else if (Kind = 'COPYREGION') then
+            begin
+                // COPYREGION|x1|y1|x2|y2|dx|dy|<ObjectIds>|<excluded UniqueIds>: copy the
+                // notes, pictures, frames and texts of the drawing inside the region
+                // (mils), moved by dx, dy; COPYTEXT records before it replace text
+                n := CopyHarnessObjects(Doc, DocPath,
+                    StrToInt(SpecField(Rec, 1)), StrToInt(SpecField(Rec, 2)),
+                    StrToInt(SpecField(Rec, 3)), StrToInt(SpecField(Rec, 4)),
+                    StrToInt(SpecField(Rec, 5)), StrToInt(SpecField(Rec, 6)),
+                    '', SpecField(Rec, 7), SpecField(Rec, 8),
+                    CopyNone, CopyNone, CopyTxtOld, CopyTxtNew, Misses);
+                if (n = 0) then
+                    Misses.Add('copy_region:' + SpecField(Rec, 1) + ',' + SpecField(Rec, 2) + ',' +
+                               SpecField(Rec, 3) + ',' + SpecField(Rec, 4));
+                GraphicsCopied := GraphicsCopied + n;
+                CopyTxtOld.Clear;
+                CopyTxtNew.Clear;
+            end
+            else if (Kind = 'COPYTEXT') then
+            begin
+                CopyTxtOld.Add(SpecField(Rec, 1));
+                CopyTxtNew.Add(SpecField(Rec, 2));
+            end
             else if (Kind = 'TEXT') then
             begin
                 Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
@@ -5528,8 +5874,14 @@ begin
                   ', "views_rendered": ' + IntToStr(Rendered) +
                   ', "render_pending": [' + RenderPending + ']' +
                   ', "reloaded": ' + LowerCase(BoolToStr(Reloaded, True)) +
+                  ', "notes_changed": ' + IntToStr(NotesChanged) +
+                  ', "graphics_moved": ' + IntToStr(GraphicsMoved) +
+                  ', "graphics_copied": ' + IntToStr(GraphicsCopied) +
                   ', "not_found": [' + InfoStr + ']}';
     finally
+        CopyTxtNew.Free;
+        CopyTxtOld.Free;
+        CopyNone.Free;
         ViewUids.Free;
         Misses.Free;
         Spec.Free;

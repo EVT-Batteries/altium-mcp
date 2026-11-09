@@ -73,6 +73,7 @@ class TestHarnessParser(unittest.TestCase):
             "text_count": 1, "net_label_count": 0, "unique_net_count": 3,
             "twist_count": 1,
             "shield_count": 0, "cable_count": 0, "wire_break_count": 0,
+            "note_count": 0, "frame_count": 0, "picture_count": 0,
         })
         conns = {c["designator"]: c for c in res["connectors"]}
         p1, j1 = conns["P1"], conns["J1"]
@@ -850,6 +851,97 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[first + 3], f"COPYFROM|{src}|0|0|10|10|0|0|")
         self.assertLess(first + 3, lines.index("CONNECTOR|X7|100|200"))
         self.assertLess(first + 3, next(i for i, ln in enumerate(lines) if ln.startswith("WIRE|")))
+
+    async def test_add_harness_wiring_sheet_graphics(self):
+        """Notes, note updates, moves, label fonts, copy filters and the part of a
+        multi-part connector serialise as their records."""
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        src = str(Path(r"C:\test\src.WirDoc").resolve())
+        result = json.loads(await main.add_harness_wiring(
+            None,
+            document_path=r"C:\test\sheet.WirDoc",
+            notes=[{"x1": 900, "y1": 800, "x2": 100, "y2": 50, "text": "Line 1\nLine 2",
+                    "style_from": "NOTEUID"},
+                   {"x1": 0, "y1": 0, "x2": 10, "y2": 10, "text": "N", "area_color": 255,
+                    "alignment": "right", "show_border": False}],
+            note_updates=[{"unique_id": "NOTEUID", "text": "Done"},
+                          {"unique_id": "N2", "x1": 1, "y1": 2, "x2": 3, "y2": 4}],
+            move_objects=[{"unique_id": "PIC", "offset": [500, -100]}],
+            labels=[{"x": 10, "y": 20, "text": "T", "font_from": "TXT"},
+                    {"x": 10, "y": 20, "text": "U", "font": {"name": "Arial", "size": 10},
+                     "justification": "center"}],
+            copy_objects=[{"source": r"C:\test\src.WirDoc", "region": [0, 0, 10, 10],
+                           "types": ["connector", "frame", "note"], "exclude": ["A", "B"]}],
+            connectors=[{"designator": "FH1", "x": 100, "y": 200, "part": "B"}],
+            associated_parts=[{"owner": "FH1", "part": 2, "part_number": "BOOT"}],
+        ))
+        self.assertTrue(result["success"], result)
+        lines = read_altium_text(self.spec_file).splitlines()
+        # 7 style fields, all empty: kept from style_from
+        self.assertIn("NOTE|100|50|900|800|NOTEUID|Line 1%0D%0ALine 2|||||||", lines)
+        self.assertIn("NOTE|0|0|10|10||N|255|||0||2|", lines)
+        self.assertIn("NOTEUPD|NOTEUID|1|Done|||||||||||", lines)
+        self.assertIn("NOTEUPD|N2|0||1|2|3|4|||||||", lines)
+        self.assertIn("MOVEOBJ|PIC|500|-100", lines)
+        # font_from leaves the orientation to the source text
+        self.assertIn("LABEL|10|20||T|TXT|||", lines)
+        self.assertIn("LABEL|10|20|0|U||Arial:10||4", lines)
+        self.assertIn(f"COPYFROM|{src}|0|0|10|10|0|0||81,4,2|A,B", lines)
+        self.assertIn("CONNECTOR|FH1|100|200|2", lines)
+        self.assertTrue(any(ln.startswith("ASSOCPARTP|FH1|2|BOOT|") for ln in lines))
+        for bad in (
+            {"notes": [{"x1": 0, "y1": 0, "x2": 1, "text": "x"}]},
+            {"notes": [{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "text": ""}]},
+            {"notes": [{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "text": "x", "alignment": "up"}]},
+            {"note_updates": [{"text": "x"}]},
+            {"move_objects": [{"unique_id": "X"}]},
+            {"labels": [{"x": 0, "y": 0, "text": "x", "justification": "middle"}]},
+            {"labels": [{"x": 0, "y": 0, "text": "x", "font": "Arial"}]},
+            {"copy_objects": [{"source": "s", "region": [0, 0, 1, 1], "types": ["bus"]}]},
+            {"connectors": [{"designator": "FH1", "x": 0, "y": 0, "part": "AB"}]},
+        ):
+            self.mock_bridge.reset_mock()
+            res = json.loads(await main.add_harness_wiring(
+                None, document_path=r"C:\test\sheet.WirDoc", **bad))
+            self.assertFalse(res["success"], bad)
+            self.mock_bridge.assert_not_called()
+
+    async def test_add_harness_wiring_remove_connector(self):
+        """A connector no wire touches is removed with every part and the
+        no-connects on its pins; a wired one is refused unless its wires go in
+        the same call."""
+        import main
+        from altium_files import read_altium_text
+        self.mock_bridge.return_value = {"success": True, "result": {"success": True}}
+        # The fixture's unannotated X? on the branch sheet has no pins and no wires
+        res = json.loads(await main.add_harness_wiring(
+            None, document_path=str(BRANCH_WIRDOC),
+            remove_objects=[{"type": "connector", "designator": "X?"}]))
+        self.assertTrue(res["success"], res)
+        self.assertIn("REMOVE|CONNECTOR|XUID", read_altium_text(self.spec_file).splitlines())
+        # P1 on the main sheet carries W1-W3 and NC1 on pin 4
+        self.mock_bridge.reset_mock()
+        res = json.loads(await main.add_harness_wiring(
+            None, document_path=str(MAIN_WIRDOC),
+            remove_objects=[{"type": "connector", "designator": "P1"}]))
+        self.assertFalse(res["success"])
+        self.assertIn("P1.1 (W1)", res["error"])
+        self.mock_bridge.assert_not_called()
+        res = json.loads(await main.add_harness_wiring(
+            None, document_path=str(MAIN_WIRDOC),
+            remove_objects=[{"type": "wire", "designator": w} for w in ("W1", "W2", "W3")]
+            + [{"type": "connector", "designator": "P1"}]))
+        self.assertTrue(res["success"], res)
+        lines = read_altium_text(self.spec_file).splitlines()
+        self.assertIn("REMOVE|CONNECTOR|P1UID", lines)
+        self.assertIn("REMOVE|UID|NC1UID", lines)
+        self.assertLess(lines.index("REMOVE|WIRE|W3"), lines.index("REMOVE|CONNECTOR|P1UID"))
+        res = json.loads(await main.add_harness_wiring(
+            None, document_path=str(MAIN_WIRDOC),
+            remove_objects=[{"type": "connector", "designator": "P9"}]))
+        self.assertIn("no connector 'P9'", res["error"])
 
     async def test_add_harness_wiring_copy_objects_malformed(self):
         import main

@@ -145,6 +145,215 @@ def shield_pin(shield: dict[str, Any]) -> dict[str, float] | None:
     ][shield.get("rotation", 0) % 4]
 
 
+# TTextJustification by index: the corner or edge a text's location names
+TEXT_JUSTIFICATIONS = (
+    "bottom_left",
+    "bottom_center",
+    "bottom_right",
+    "center_left",
+    "center",
+    "center_right",
+    "top_left",
+    "top_center",
+    "top_right",
+)
+# Note alignment (RECORD 209 Alignment)
+NOTE_ALIGNMENTS = ("center", "left", "right")
+# Frame line style (RECORD 14 LineStyleExt; absent = solid)
+LINE_STYLES = ("solid", "dashed", "dotted", "dash_dotted")
+
+
+def _rect(props: dict[str, str]) -> dict[str, float]:
+    """Normalised corners (DXP units) of a Location / Corner record."""
+    xa, xb = _coord(props, "Location.X"), _coord(props, "Corner.X")
+    ya, yb = _coord(props, "Location.Y"), _coord(props, "Corner.Y")
+    return {"x1": min(xa, xb), "y1": min(ya, yb), "x2": max(xa, xb), "y2": max(ya, yb)}
+
+
+def note_text(value: str) -> str:
+    """Text of a note as written: Altium stores a line break as '~1'."""
+    return value.replace("~1", "\n")
+
+
+def font_table(records: list[dict[str, str]]) -> dict[int, dict[str, Any]]:
+    """The sheet's font table (RECORD 104: FontName<n>, Size<n>, Bold<n>, ...)
+    by the index texts and notes store in FontID. The index is the file's own:
+    Altium's font ids in memory differ, so fonts are given by name and size."""
+    sheet = next((r for r in records if r.get("RECORD") == "104"), {})
+    fonts: dict[int, dict[str, Any]] = {}
+    for n in range(1, int(sheet.get("FontIdCount", 0) or 0) + 1):
+        fonts[n] = {
+            "name": sheet.get(f"FontName{n}", ""),
+            "size": int(sheet.get(f"Size{n}", 0) or 0),
+            "bold": sheet.get(f"Bold{n}") == "T",
+            "italic": sheet.get(f"Italic{n}") == "T",
+        }
+    return fonts
+
+
+def sheet_graphics(records: list[dict[str, str]]) -> dict[str, list[dict[str, Any]]]:
+    """Notes (RECORD 209), frames (14), pictures (30) and texts (4) the sheet
+    itself owns (records with no OwnerIndex: connector bodies, the sheet
+    template and a connector's title are owned). Same records in a wiring
+    diagram and a layout drawing. Coordinates DXP units (1 = 10 mils); fonts
+    as {name, size, bold, italic} from the sheet's font table."""
+    fonts = font_table(records)
+    notes: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
+    pictures: list[dict[str, Any]] = []
+    texts: list[dict[str, Any]] = []
+    for props in records:
+        if "OwnerIndex" in props:
+            continue
+        rtype = props.get("RECORD")
+        uid = props.get("UniqueID", "")
+        if rtype == "209":
+            align = int(props.get("Alignment", 0) or 0)
+            notes.append(
+                {
+                    "text": note_text(props.get("Text", "")),
+                    **_rect(props),
+                    "font": fonts.get(int(props.get("FontID", 1) or 1)),
+                    "area_color": int(props.get("AreaColor", 0) or 0),
+                    "text_color": int(props.get("TextColor", 0) or 0),
+                    "show_border": props.get("ShowBorder") == "T",
+                    "solid": props.get("IsSolid") == "T",
+                    "alignment": NOTE_ALIGNMENTS[align]
+                    if 0 <= align < len(NOTE_ALIGNMENTS)
+                    else str(align),
+                    "word_wrap": props.get("WordWrap") == "T",
+                    "collapsed": props.get("Collapsed") == "T",
+                    "unique_id": uid,
+                }
+            )
+        elif rtype == "14":
+            style = int(props.get("LineStyleExt", props.get("LineStyle", 0)) or 0)
+            frames.append(
+                {
+                    **_rect(props),
+                    "line_width": int(props.get("LineWidth", 0) or 0),
+                    "line_style": LINE_STYLES[style]
+                    if 0 <= style < len(LINE_STYLES)
+                    else str(style),
+                    "color": int(props.get("Color", 0) or 0),
+                    "area_color": int(props.get("AreaColor", 0) or 0),
+                    "solid": props.get("IsSolid") == "T",
+                    "transparent": props.get("Transparent") == "T",
+                    "unique_id": uid,
+                }
+            )
+        elif rtype == "30":
+            pictures.append(
+                {
+                    **_rect(props),
+                    "file_name": props.get("FileName", ""),
+                    "embedded": props.get("EmbedImage") == "T",
+                    "keep_aspect": props.get("KeepAspect") == "T",
+                    "orientation": int(props.get("Orientation", 0) or 0),
+                    "unique_id": uid,
+                }
+            )
+        elif rtype == "4":
+            text = props.get("Text", "").strip()
+            if not text:
+                continue
+            just = int(props.get("Justification", 0) or 0)
+            texts.append(
+                {
+                    "text": text,
+                    "x": _coord(props, "Location.X"),
+                    "y": _coord(props, "Location.Y"),
+                    "color": props.get("Color", ""),
+                    "font": fonts.get(int(props.get("FontID", 1) or 1)),
+                    "orientation": int(props.get("Orientation", 0) or 0),
+                    "justification": TEXT_JUSTIFICATIONS[just]
+                    if 0 <= just < len(TEXT_JUSTIFICATIONS)
+                    else str(just),
+                    "mirrored": props.get("IsMirrored") == "T",
+                    "unique_id": uid,
+                }
+            )
+    return {"notes": notes, "frames": frames, "pictures": pictures, "texts": texts}
+
+
+# Rough text size in DXP units (1 = 10 mils) for bounding boxes
+_CHAR_WIDTH = 6
+_TEXT_HEIGHT = 10
+
+
+def _bbox(x1: float, y1: float, x2: float, y2: float) -> list[float]:
+    return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+
+
+def object_boxes(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every sheet object of parse_wirdoc output with its bounding box in mils
+    ([x1, y1, x2, y2]): type, name (designator, text or file name) and
+    unique_id. Text boxes are estimated (about 60 mils a character, 100 mils
+    high, from the text's justification); a connector's box covers its body,
+    pins and title, not its pin names' full width."""
+
+    def mils(box: list[float]) -> list[int]:
+        return [round(v * 10) for v in box]
+
+    out: list[dict[str, Any]] = []
+
+    def add(kind: str, name: str, uid: str, box: list[float]) -> None:
+        out.append({"type": kind, "name": name, "unique_id": uid, "bbox": mils(box)})
+
+    for c in parsed.get("connectors", []):
+        box = c.get("bbox")
+        if box:
+            add("connector", c.get("designator", "?"), c.get("unique_id", ""), box)
+    for w in parsed.get("wires", []):
+        pts = w.get("points") or []
+        if len(pts) >= 2:
+            xs, ys = pts[0::2], pts[1::2]
+            add("wire", w.get("designator", "?"), w.get("unique_id", ""),
+                [min(xs), min(ys), max(xs), max(ys)])
+    for s in parsed.get("splices", []):
+        x, y = s["location"]["x"], s["location"]["y"]
+        add("splice", s.get("designator", "?"), s.get("unique_id", ""), _bbox(x - 2, y - 2, x + 2, y + 2))
+    for n in parsed.get("no_connects", []):
+        add("no_connect", n.get("name", ""), n.get("unique_id", ""), _bbox(n["x"] - 2, n["y"] - 2, n["x"] + 2, n["y"] + 2))
+    for b in parsed.get("wire_breaks", []):
+        add("wire_break", b.get("designator", ""), b.get("unique_id", ""), _bbox(b["x"] - 5, b["y"] - 5, b["x"] + 5, b["y"] + 5))
+    for key, kind in (("twists", "twist"), ("shields", "shield"), ("cables", "cable")):
+        for o in parsed.get(key, []):
+            add(kind, o.get("designator", ""), o.get("unique_id", ""), [o["x1"], o["y1"], o["x2"], o["y2"]])
+    for n in parsed.get("notes", []):
+        add("note", n["text"], n["unique_id"], [n["x1"], n["y1"], n["x2"], n["y2"]])
+    for f in parsed.get("frames", []):
+        add("frame", "", f["unique_id"], [f["x1"], f["y1"], f["x2"], f["y2"]])
+    for p in parsed.get("pictures", []):
+        add("picture", p["file_name"], p["unique_id"], [p["x1"], p["y1"], p["x2"], p["y2"]])
+    for t in parsed.get("texts", []):
+        width = max(1, len(t["text"])) * _CHAR_WIDTH
+        just = t.get("justification", "bottom_left")
+        x, y = t["x"], t["y"]
+        x1 = x - width if just.endswith("right") else x - width / 2 if just.endswith("center") else x
+        y1 = y - _TEXT_HEIGHT if just.startswith("top") else y - _TEXT_HEIGHT / 2 if just.startswith("center") else y
+        if t.get("orientation", 0) % 2:  # vertical text: width runs along y
+            add("text", t["text"], t["unique_id"], [x - _TEXT_HEIGHT, y, x, y + width])
+        else:
+            add("text", t["text"], t["unique_id"], [x1, y1, x1 + width, y1 + _TEXT_HEIGHT])
+    return out
+
+
+def objects_in_region(parsed: dict[str, Any], region: list[int]) -> dict[str, Any]:
+    """Objects whose box lies inside region (mils, [x1, y1, x2, y2]) and those
+    only partly inside, from object_boxes(). copy_objects copies an object
+    only when Altium's own bounding box lies inside its region."""
+    x1, y1, x2, y2 = min(region[0], region[2]), min(region[1], region[3]), max(region[0], region[2]), max(region[1], region[3])
+    inside, partly = [], []
+    for o in object_boxes(parsed):
+        bx1, by1, bx2, by2 = o["bbox"]
+        if bx1 >= x1 and by1 >= y1 and bx2 <= x2 and by2 <= y2:
+            inside.append(o)
+        elif bx1 < x2 and bx2 > x1 and by1 < y2 and by2 > y1:
+            partly.append(o)
+    return {"region": [x1, y1, x2, y2], "inside": inside, "partly_inside": partly}
+
+
 def parse_wirdoc(file_path: Path | str) -> dict[str, Any]:
     """Parse an Altium Harness Wiring Diagram (.WirDoc) or Layout Drawing (.LdrDoc).
 
@@ -184,6 +393,8 @@ def parse_wirdoc_records(
     # Twists, shields, cables (rectangles across wires) and wire breaks
     rect_objects: dict[int, dict[str, Any]] = {}
     wire_breaks: list[dict[str, Any]] = []
+    # Points of each connector's own graphics (body, title) for its bbox
+    extents: dict[int, list[tuple[float, float]]] = {}
 
     # First pass: collect connectors, wires, splices, parameters, pins, and net labels
     for idx, props in enumerate(records):
@@ -312,6 +523,20 @@ def parse_wirdoc_records(
                     "unique_id": props.get("UniqueID", ""),
                 }
             )
+        elif rtype in ("14", "4") and int(props.get("OwnerIndex", -1)) in connectors:
+            # A connector's body rectangle and title: part of its bounding box
+            # (only the part drawn on this part object; other parts' bodies
+            # are listed too and carry their OwnerPartId)
+            owner = int(props["OwnerIndex"])
+            if int(props.get("OwnerPartId", 0) or 0) in (
+                -1,
+                0,
+                connectors[owner]["current_part_id"],
+            ):
+                pts = [(_coord(props, "Location.X"), _coord(props, "Location.Y"))]
+                if rtype == "14":
+                    pts.append((_coord(props, "Corner.X"), _coord(props, "Corner.Y")))
+                extents.setdefault(owner, []).extend(pts)
         elif rtype in ["34", "41"]:  # Component / Wire / Splice Parameter
             owner = int(props.get("OwnerIndex", -1))
             name = props.get("Name", "")
@@ -478,6 +703,15 @@ def parse_wirdoc_records(
                     }
                 )
         c["pins"] = visible
+
+    # Bounding box (DXP units) of each connector: location, body, title, pins
+    for idx, c in connectors.items():
+        pts = [(c["location"]["x"], c["location"]["y"]), *extents.get(idx, [])]
+        for pin in c["pins"]:
+            pts.append((pin["location"]["x"], pin["location"]["y"]))
+            pts.append((pin["hot_end"]["x"], pin["hot_end"]["y"]))
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        c["bbox"] = [min(xs), min(ys), max(xs), max(ys)]
 
     # Wires linked to twists/shields/cables and wire breaks, by designator
     wire_des_by_uid = {w["unique_id"]: w["designator"] for w in wires_dict.values()}
@@ -664,6 +898,9 @@ def parse_wirdoc_records(
 
     wires_list = sorted(wires_dict.values(), key=lambda w: w["designator"])
     splices_list = sorted(splices_dict.values(), key=lambda s: s["designator"])
+    graphics = sheet_graphics(records)
+    # Sheet texts with their font, orientation and justification
+    texts_list = graphics["texts"]
 
     return {
         "file_path": str(Path(file_path).resolve()),
@@ -686,6 +923,9 @@ def parse_wirdoc_records(
             "shield_count": len(rect_lists["shields"]),
             "cable_count": len(rect_lists["cables"]),
             "wire_break_count": len(wire_breaks),
+            "note_count": len(graphics["notes"]),
+            "frame_count": len(graphics["frames"]),
+            "picture_count": len(graphics["pictures"]),
         },
         "connectors": connector_list,
         "wires": wires_list,
@@ -696,6 +936,9 @@ def parse_wirdoc_records(
         "wire_breaks": wire_breaks,
         "no_connects": no_connects_list,
         "texts": texts_list,
+        "notes": graphics["notes"],
+        "frames": graphics["frames"],
+        "pictures": graphics["pictures"],
         "net_labels": net_labels,
         "nets": unique_nets,
         "net_connections": nets_to_pins,

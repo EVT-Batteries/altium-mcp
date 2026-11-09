@@ -10,9 +10,14 @@ errors   - diagonal segments, wire ends on neither a pin hot end nor a splice,
 warnings - crossings too close to a bend, parallel wires closer than 100 mils,
            vertical drops closer than 200 mils, channels in front of pin names,
            wire labels on other wires, labels, pins or sheet text, labels away
-           from their wire, twist marks not in the sheet style (rectangle 100
-           mils beyond each wire so the hook tips land on the wires, 500 mils
-           along them) or on wire labels.
+           from their wire, wires and labels inside the frame of a connector
+           the wire does not end on (a frame = a sheet rectangle drawn around a
+           connector), twist marks not in the sheet style (rectangle 100 mils
+           beyond each wire so the hook tips land on the wires, 500 mils along
+           them) or on wire labels.
+
+Wires are told apart by UniqueID: unannotated wires that share a designator
+('W?') are checked as separate wires and named '<designator> (<unique id>)'.
 
 Crossings are counted and listed but are not problems in themselves: a crossing
 that comes from the pin order of two connectors cannot be routed away.
@@ -215,21 +220,32 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
             item["at"] = list(at)
         problems.append(item)
 
+    raw_wires = parsed.get("wires", [])
+    names = [w.get("designator", "?") for w in raw_wires]
+
+    def wire_name(w: dict[str, Any]) -> str:
+        """The designator, or designator + UniqueID when it does not name one wire."""
+        des = w.get("designator", "?") or "?"
+        if "?" in des or names.count(des) > 1:
+            return f"{des} ({w.get('unique_id', '')})"
+        return des
+
     wires = [
         {
-            "designator": w.get("designator", "?"),
+            "designator": wire_name(w),
+            "unique_id": w.get("unique_id", ""),
             "net": w.get("net", ""),
             "points": [_mils(v) for v in w.get("points", [])],
             "labels": [
                 (w.get(key), text)
                 for key, text in (
-                    ("designator_pos", w.get("designator", "")),
+                    ("designator_pos", w.get("designator", "") or "?"),
                     ("comment_pos", w.get("net", "")),
                 )
                 if w.get(key)
             ],
         }
-        for w in parsed.get("wires", [])
+        for w in raw_wires
     ]
     pins = _pins(parsed)
     zones = _connector_zones(pins)
@@ -351,16 +367,18 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
     seg_by_wire = {w["designator"]: _segments(w["points"]) for w in wires}
 
     def beside(box: Box, s: Segment) -> bool:
-        """Label box just above/below a horizontal run, or next to a vertical one."""
+        """Label box just above/below a horizontal run, or next to a vertical
+        one: starting within LABEL_REACH of it, or ending within LABEL_REACH
+        to its left (a label left of the run reads towards it)."""
         if s[1] == s[3]:
             return (
                 min(s[0], s[2]) - LABEL_REACH <= box[0] <= max(s[0], s[2])
                 and abs(box[1] - s[1]) <= LABEL_REACH
             )
-        return (
-            min(s[1], s[3]) - LABEL_REACH <= box[1] <= max(s[1], s[3])
-            and abs(box[0] - s[0]) <= LABEL_REACH
-        )
+        along = min(s[1], s[3]) - LABEL_REACH <= box[1] <= max(s[1], s[3])
+        right = abs(box[0] - s[0]) <= LABEL_REACH
+        left = 0 <= s[0] - box[2] <= LABEL_REACH
+        return along and (right or left)
 
     # A wire's designator and comment are checked separately, reported once
     label_seen: set[tuple[str, ...]] = set()
@@ -423,6 +441,56 @@ def check_harness_wiring(document_path: Path | str) -> dict[str, Any]:
             )
         if along != TWIST_LENGTH:
             report("warning", "twist_placement", tw, f"{des} is {along} mils long, not {TWIST_LENGTH}", at)
+
+    # Frames: a sheet rectangle drawn around a connector (body, pin names,
+    # picture) is that connector's area. A wire that ends on none of the
+    # connectors inside a frame, and its labels, stay out of it. Frames
+    # around no connector (title blocks, notes) are not checked.
+    wire_conns: dict[str, set[str]] = {}
+    for w in wires:
+        pts = w["points"]
+        ends = [(pts[0], pts[1]), (pts[-2], pts[-1])] if len(pts) >= 4 else []
+        wire_conns[w["designator"]] = {
+            hot_ends[e]["connector"] for e in ends if e in hot_ends
+        }
+    for f in parsed.get("frames", []):
+        box = (_mils(f["x1"]), _mils(f["y1"]), _mils(f["x2"]), _mils(f["y2"]))
+        owners = {
+            c.get("designator", "?")
+            for c in parsed.get("connectors", [])
+            if c.get("location")
+            and box[0] <= _mils(c["location"]["x"]) <= box[2]
+            and box[1] <= _mils(c["location"]["y"]) <= box[3]
+        }
+        if not owners:
+            continue
+        inner = (box[0] + 1, box[1] + 1, box[2] - 1, box[3] - 1)
+        frame_of = ", ".join(sorted(owners))
+        # Wires that end inside the frame (on a splice, wire break or
+        # no-connect there) belong to it as well
+        ending_inside = {
+            w["designator"]
+            for w in wires
+            if len(w["points"]) >= 4
+            and any(
+                box[0] <= x <= box[2] and box[1] <= y <= box[3]
+                for x, y in ((w["points"][0], w["points"][1]), (w["points"][-2], w["points"][-1]))
+            )
+        }
+        for w in wires:
+            if wire_conns[w["designator"]] & owners or w["designator"] in ending_inside:
+                continue
+            seg = next((s for s in seg_by_wire[w["designator"]] if _segment_in_box(s, inner)), None)
+            if seg is not None:
+                report(
+                    "warning", "wire_in_frame", [w["designator"]],
+                    f"runs inside the frame of {frame_of}", seg[:2],
+                )
+        for des, lbox in label_boxes:
+            if wire_conns.get(des, set()) & owners or des in ending_inside:
+                continue
+            if _boxes_overlap(lbox, inner):
+                label_report("label_in_frame", [des], f"label inside the frame of {frame_of}", lbox[:2])
 
     errors = sum(p["severity"] == "error" for p in problems)
     counts: dict[str, int] = {}

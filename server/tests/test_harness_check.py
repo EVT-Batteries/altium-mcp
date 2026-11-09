@@ -154,6 +154,51 @@ class TestHarnessCheck(unittest.TestCase):
         twist = {"x1": 250, "y1": 460, "x2": 300, "y2": 510, "designator": "TW1", "wires": ["W1", "W2"]}
         self.assertIn("twist_on_label", self.types(self.check(_sheet(wires, twists=[twist]))))
 
+    def test_unannotated_wires_are_told_apart_by_unique_id(self):
+        # Two 'W?' wires drawn on top of each other: one wire per UniqueID
+        wires = [
+            {**_wire("W?", [120, 500, 500, 500]), "unique_id": "AAA"},
+            {**_wire("W?", [120, 500, 500, 500]), "unique_id": "BBB"},
+        ]
+        res = self.check(_sheet(wires))
+        self.assertEqual(res["summary"]["wire_count"], 2)
+        overlaps = [p for p in res["problems"] if p["type"] == "overlap"]
+        self.assertEqual(overlaps[0]["wires"], ["W? (AAA)", "W? (BBB)"])
+
+    def test_label_left_of_a_vertical_run(self):
+        # W1 runs up at x 300; a label ending 50 mils left of it is beside it,
+        # one starting 50 mils right too; one ending 400 mils left is not
+        wire = [120, 500, 300, 500, 300, 700]
+        brk = [{"x": 300, "y": 700}]
+
+        def off(label_x):
+            w = _wire("W1", wire)
+            w["designator_pos"] = {"x": label_x, "y": 600}
+            res = self.check(_sheet([w], breaks=brk))
+            return "label_off_wire" in self.types(res)
+
+        self.assertFalse(off(300 - 5 - 12))  # "W1" is 120 mils wide: ends at 2950
+        self.assertFalse(off(305))
+        self.assertTrue(off(300 - 40 - 12))
+
+    def test_wire_and_label_in_another_connectors_frame(self):
+        # A frame drawn around P2; W1 (J1 -> P1) runs through it, W2 ends on P2
+        p2 = {"designator": "P2", "location": {"x": 520, "y": 650},
+              "pins": [_pin("1", 500, 650, False)]}
+        frame = {"x1": 380, "y1": 600, "x2": 560, "y2": 700}
+        wires = [
+            _wire("W1", [120, 500, 400, 500, 400, 680, 450, 680, 450, 300, 500, 300], labels=(410, 681.5)),
+            _wire("W2", [120, 470, 200, 470, 200, 650, 500, 650]),
+        ]
+        res = self.check({**_sheet(wires, connectors=(J1, P1, p2)), "frames": [frame]})
+        in_frame = [p for p in res["problems"] if p["type"] in ("wire_in_frame", "label_in_frame")]
+        self.assertEqual({(p["type"], p["wires"][0]) for p in in_frame},
+                         {("wire_in_frame", "W1"), ("label_in_frame", "W1")})
+        self.assertIn("P2", in_frame[0]["detail"])
+        # A frame around no connector is not checked
+        res = self.check({**_sheet(wires, connectors=(J1, P1)), "frames": [frame]})
+        self.assertNotIn("wire_in_frame", self.types(res))
+
     def test_parser_keeps_visible_wire_label_positions(self):
         records = [
             {"HEADER": "x"},

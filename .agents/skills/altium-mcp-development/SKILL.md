@@ -208,6 +208,23 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   script it then always reads False, even right after `Modified := True` (verified
   2026-11-09: `if Doc.Modified` False, `BoolToStr(Doc.Modified, True)` 'True'). Use
   `DocumentModified(Doc)` (`other_utils.pas`), which reads it through `BoolToStr`.
+- A schematic object's `Selection` only resolves late-bound: in the bridge it is "Undeclared
+  identifier" on a typed `ISch_GraphicalObject`, and late-bound (`Sel : IDispatch; Sel := Obj`)
+  it stops the script on the iterator's internal objects. Touch it only on objects the sheet
+  owns (`Container.ObjectId = Doc.ObjectId`). `BoundingRectangle` the other way round: read
+  it typed (late-bound it has crashed Altium). See `ZoomSchToArea` in `other_utils.pas`.
+- `Sch:Zoom` parameters are those of the menu commands in Altium's
+  `System\advsch.rcs` (`PLSch:Zoom*`): zoom to selection is `Object=Selected` (not
+  `Action=Selected`, which does nothing), fit sheet `Action=Document`, `ZoomLevel=<x>`.
+  Zoom area / around point are interactive. Draftsman's are in its extension's
+  `Altium.Designer.PcbDrawing.rcs`: `FitSheet` fits the *selected* sheet, `Zoom Action=Area`
+  is interactive, and the editor shows one page at a time ("Page n of m"); no command found
+  turns the page from a script.
+- Font ids: a text's or note's `FontID` in memory indexes Altium's font manager, while the
+  saved file's `FontID` indexes the sheet's own font table (RECORD 104 `FontName<n>` /
+  `Size<n>`); the two differ (a label set to id 3 was saved as 2). Give fonts by name and size
+  (`FontIDFromSpec('Arial:10')`); `harness_parser.font_table` resolves a file's ids.
+- A note's line break is stored as `~1`; set `Text` with CR LF.
 - Keep CRLF line endings in `.pas` files (check: every line should end in `\r`).
 - Close a scratch document without saving:
   ```

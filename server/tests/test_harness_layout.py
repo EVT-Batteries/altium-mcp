@@ -498,6 +498,105 @@ class TestBuildLayoutSpec(unittest.TestCase):
         self.assertIn("multiple of 90", spec["errors"][0])
 
 
+class TestMergeAndGraphics(unittest.TestCase):
+    def merge_layout(self):
+        """CP_J1 -- B1 -- CPM (empty bend) -- B2 (manual 50 mm, covered by
+        COV1) -- CP_P1."""
+        layout = make_layout()
+        layout["connection_points"].append(_cp("CPM", "UCPM", 1500, 1000, [], ["B1", "B2"]))
+        layout["bundles"] = [
+            _bundle("B1", "UB1", [1000, 1000, 1500, 1000], "UCPJ1", "UCPM", "CP_J1", "CPM"),
+            {
+                **_bundle("B2", "UB2", [2000, 1200, 2000, 1000, 1500, 1000],
+                          "UCPP1", "UCPM", "CP_P1", "CPM"),
+                "length": _len(50),
+                "length_set_manually": True,
+            },
+        ]
+        layout["coverings"] = [{"designator": "COV1", "unique_id": "UCOV1", "items": ["B2"]}]
+        return layout
+
+    def test_merge_bundles_through_an_empty_point(self):
+        for merge in ({"connection_point": "CPM"}, {"bundles": ["B1", "B2"]}):
+            spec = build_layout_spec(self.merge_layout(), merge_bundles=[merge])
+            self.assertEqual(spec["errors"], [])
+            self.assertEqual(
+                [r[1] for r in records_of(spec, "DELETE")], ["UB2", "UCPM"]
+            )
+            bundle = records_of(spec, "BUNDLE")[0]
+            # B2 reversed so it starts at CPM; the straight-through point drops
+            self.assertEqual(bundle[1], "UB1")
+            self.assertEqual(bundle[7:], [10000, 10000, 20000, 10000, 20000, 12000])
+            self.assertEqual(bundle[4], mm_to_coord(75.4))  # 25.4 + 50 (manual)
+            covering = records_of(spec, "COVERING")[0]
+            self.assertEqual((covering[1], covering[8:]), ("UCOV1", ["UB1"]))
+            self.assertEqual(spec["expect"]["bundles"]["UB1"], ["UCPJ1", "UCPP1"])
+
+    def test_merge_refusals(self):
+        layout = self.merge_layout()
+        cases = [
+            ({"connection_point": "CP_J1"}, "joins 1 bundles"),
+            ({"connection_point": "NOPE"}, "no connection point"),
+            ({"bundles": ["B1"]}, "two bundles"),
+        ]
+        for merge, msg in cases:
+            spec = build_layout_spec(layout, merge_bundles=[merge])
+            self.assertTrue(any(msg in e for e in spec["errors"]), (merge, spec["errors"]))
+        layout["connection_points"][-1]["objects"] = ["SP2"]
+        spec = build_layout_spec(layout, merge_bundles=[{"connection_point": "CPM"}])
+        self.assertTrue(any("holds" in e for e in spec["errors"]))
+
+    def test_notes_pictures_and_region_copy(self):
+        layout = make_layout()
+        layout["notes"] = [{"unique_id": "N1", "text": "old"}]
+        layout["pictures"] = [{"unique_id": "PIC1"}]
+        spec = build_layout_spec(
+            layout,
+            delete=["PIC1"],
+            notes=[{"x1": 0, "y1": 0, "x2": 100, "y2": 50, "text": "new", "style_from": "N1"}],
+            note_updates=[{"unique_id": "N1", "text": "renamed"}],
+            move_objects=[{"unique_id": "N1", "offset": [10, 0]}],
+            copy_region=[{"region": [0, 0, 500, 500], "offset": [1000, 0],
+                          "types": ["note", "picture"], "replace_text": {"P1": "P2"}}],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(records_of(spec, "DELETE"), [["DELETE", "PIC1"]])
+        kinds = [r[0] for r in spec["records"]]
+        self.assertEqual(
+            kinds[kinds.index("COPYTEXT"):],
+            ["COPYTEXT", "COPYREGION", "NOTE", "NOTEUPD", "MOVEOBJ"],
+        )
+        self.assertEqual(records_of(spec, "COPYREGION")[0][7], "2,11")
+        spec = build_layout_spec(
+            layout,
+            note_updates=[{"unique_id": "GONE", "text": "x"}],
+            notes=[{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "text": "x", "style_from": "GONE"}],
+            delete=["GONE"],
+        )
+        self.assertEqual(len(spec["errors"]), 3, spec["errors"])
+
+
+class TestImportReport(unittest.TestCase):
+    def test_connectors_added_and_removed(self):
+        import main
+
+        before = make_layout()
+        after = make_layout()
+        after["connectors"] = [after["connectors"][0], {
+            "designator": "X9", "location": {"x": 300, "y": 400}, "unique_id": "UX9",
+            "origin_uid": "WX9", "connection_point": "CP_X9",
+        }]
+        after["connection_points"].append(_cp("CP_X9", "UCPX9", 320, 420, ["X9"]))
+        report = main._layout_import_report(before, after)
+        self.assertEqual(report["connectors_removed"], ["P1"])
+        added = report["connectors_added"][0]
+        self.assertEqual(added["designator"], "X9")
+        self.assertEqual(added["location_mils"], [3000, 4000])
+        self.assertEqual(added["connection_point"]["location_mils"], [3200, 4200])
+        self.assertEqual(added["connection_point"]["holds"], ["X9"])
+        self.assertEqual(report["splices_added"], [])
+
+
 class TestViewsAndWireLengths(unittest.TestCase):
     def setUp(self):
         self.layout = make_layout()
