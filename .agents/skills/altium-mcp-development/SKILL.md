@@ -213,6 +213,12 @@ connector while Altium routes by pin, so it reported every wire routed while Alt
   it stops the script on the iterator's internal objects. Touch it only on objects the sheet
   owns (`Container.ObjectId = Doc.ObjectId`). `BoundingRectangle` the other way round: read
   it typed (late-bound it has crashed Altium). See `ZoomSchToArea` in `other_utils.pas`.
+  Sheet-owned is not enough on a layout drawing: its sheet also owns harness data records
+  (ObjectId 90 wire data, 95, 97) with neither `Selection` nor `BoundingRectangle`; reading
+  either stops the script ("Undeclared identifier: Selection"). Layout graphics that do have
+  both: 2, 11, 18, 81, 85, 86. To find such a type, iterate the sheet's objects in a sandbox
+  run and `SandboxLog` each new ObjectId before touching the property: the last logged id is
+  the culprit.
 - `Sch:Zoom` parameters are those of the menu commands in Altium's
   `System\advsch.rcs` (`PLSch:Zoom*`): zoom to selection is `Object=Selected` (not
   `Action=Selected`, which does nothing), fit sheet `Action=Document`, `ZoomLevel=<x>`.

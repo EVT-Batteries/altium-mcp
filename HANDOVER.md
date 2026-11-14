@@ -47,6 +47,17 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 26 (2026-11-13): area zoom on layout drawings (uncommitted)
+
+- **`get_screenshot(view_type="sch", zoom=[x1, y1, x2, y2])` stopped on every layout drawing**
+  with "Undeclared identifier: Selection". The layout's sheet owns harness data records
+  (ObjectId 90 wire data, 95, 97) besides its graphics; they have neither `Selection` nor
+  `BoundingRectangle`, and `ZoomSchToArea` read `Selection` on every sheet-owned object.
+  Excluded now; found with a sandbox loop logging each new ObjectId before the read (dev skill
+  §5). Verified live on a layout drawing: 18 objects zoomed, nothing changed in the document.
+- Tool description: the area is in true mils; `get_harness_data` reports locations in DXP
+  units (10 mils). Passing those unchanged gave `zoom_warning` "no sheet object lies inside".
+
 ### Session 25 (2026-11-09): Draftsman page / area screenshots (`3a66f9c`)
 Verified after the restart through the MCP on a real six-page drawing: page 4 fitted; an
 85 x 80 mm area holding a rear view zoomed x8 and cropped.
@@ -1089,6 +1100,23 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    edits; text font from another text; `copy_objects` types / exclude; LdrDoc notes and
    pictures (edit, move, delete, region copy); import report of added connectors;
    `merge_bundles`; `connector_without_table` in the drawing review. See session 24.
+10. **Ideas from carrying CAD lengths into layouts (session 26, 2026-11-13).** Setting bundle
+    lengths on six layouts from 3D routes worked with `edit_harness_layout` +
+    `import_harness_changes`; what cost time:
+    - **Units.** `get_harness_data` reports locations in DXP units (10 mils) while every write
+      tool and `get_screenshot(zoom)` take mils; a zoom built from `get_harness_data` matched
+      nothing. Report mils (or both, labelled) in `get_harness_data`.
+    - **Output size.** A 40-wire layout's `get_harness_data(summary_only=True)` is ~60 kB, most of
+      it texts and no-connects; checking lengths only needs bundles (ends, length, wires) and
+      wires (ends, routed length). A `fields=["bundles", "wires"]` filter would cut it ~5x.
+    - **Length check.** Comparing each wire's routed length with an expected list (here: cut
+      lengths from CAD) took a script; `get_harness_data(expected_lengths={wire: mm})` returning
+      the differences would make the check one call.
+    - **Termination allowances.** A wire's length offset (strip + insertion depth) has no script
+      setter (item 4); decompiling how the Properties panel sets `LengthOffset` would let the
+      wiring list show cut lengths if a project wants them.
+    - **Drawing import report.** Every `import_harness_changes` on a drawing repeats
+      `missing_template` for each page; one line per distinct template would read better.
 
 ## 9. How to verify
 ```powershell

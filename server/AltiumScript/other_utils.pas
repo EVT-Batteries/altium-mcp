@@ -1213,8 +1213,11 @@ begin
             // Only objects the sheet owns: the iterator also reaches internal
             // objects that have no Selection (a late-bound read then stops the
             // script). BoundingRectangle is read typed (late-bound it has
-            // crashed Altium).
-            if (OwnerId = Doc.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) then
+            // crashed Altium). A layout drawing's sheet also owns harness data
+            // records (ObjectId 90 wire data, 95, 97) that have neither
+            // Selection nor BoundingRectangle: reading either stops the script.
+            if (OwnerId = Doc.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) and
+               (Obj.ObjectId <> 90) and (Obj.ObjectId <> 95) and (Obj.ObjectId <> 97) then
             begin
                 Sel := Obj;
                 if (BoolToStr(Sel.Selection, True) = 'True') then

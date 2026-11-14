@@ -8219,12 +8219,14 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             schematic, harness, multi-board or Draftsman document to focus
             and capture (it must be open in Altium or openable).
         zoom (optional): 'sch' view: "document" fits the whole sheet;
-            [x1, y1, x2, y2] (mils) zooms onto the objects the sheet owns that
-            lie inside that area (connectors, wires, texts, notes, ...; Altium
-            fits their extent, so the frame can be a little smaller or larger
-            than the area). get_harness_data(region=...) lists what an area
-            holds. The selection is restored afterwards and nothing is
-            changed in the document.
+            [x1, y1, x2, y2] (true mils) zooms onto the objects the sheet owns
+            that lie wholly inside that area (connectors, wires, bundles,
+            connection points, texts, notes, ...; Altium fits their extent, so
+            the frame can be a little smaller or larger than the area).
+            get_harness_data reports locations in DXP units (10 mils): multiply
+            them by 10. get_harness_data(region=...) lists what an area holds.
+            The selection is restored afterwards and nothing is changed in the
+            document; zoom_warning says when nothing lay inside.
             'dwf' view (needs document_path): "document" shows every page;
             a page number (1-based, as get_harness_drawing_data numbers
             them) fits that page; {"page": n, "area": [x1, y1, x2, y2]} (mm
