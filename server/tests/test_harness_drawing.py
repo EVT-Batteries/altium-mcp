@@ -146,6 +146,10 @@ class DrawingTests(unittest.TestCase):
             ["empty_component_view", "missing_template", "overlap", "todo_text"],
         )
         self.assertEqual([len(p["items"]) for p in r["pages"]], [1, 3])
+        missing = [i for i in r["issues"] if i["kind"] == "missing_template"]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0]["template"], self.missing)
+        self.assertEqual(missing[0]["pages"], [missing[0]["page"]])
         self.assertEqual(r["component_views"][0]["view_side"], "Top")
         self.assertEqual(r["component_views"][0]["projection_lines"], 0)
         self.assertEqual(r["source"], "C:\\h\\H.LdrDoc")

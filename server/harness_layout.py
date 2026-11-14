@@ -577,6 +577,50 @@ def unrouted_reasons(layout: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def check_wire_lengths(
+    layout: dict[str, Any], expected: dict[str, float], tolerance_mm: float = 0.5
+) -> dict[str, Any]:
+    """Compare each wire's total length (as Altium computes it for its length type:
+    routed + offset, user or fixed) with expected lengths in mm, e.g. cut lengths
+    from a 3D model. Returns the wires outside the tolerance, the expected wires the
+    layout lacks or has unrouted, and how many matched."""
+    by_name = {w["designator"]: w for w in layout.get("wires", [])}
+    mismatches, missing, unrouted = [], [], []
+    matched = 0
+    for name, mm in expected.items():
+        w = by_name.get(name)
+        if w is None:
+            missing.append(name)
+            continue
+        total = (w.get("length") or {}).get("mm")
+        if total is None:
+            unrouted.append(name)
+            continue
+        diff = round(total - float(mm), 3)
+        if abs(diff) > tolerance_mm:
+            mismatches.append(
+                {
+                    "wire": name,
+                    "expected_mm": float(mm),
+                    "layout_mm": total,
+                    "difference_mm": diff,
+                    "length_type": w.get("length_type"),
+                    "route": w.get("route", []),
+                }
+            )
+        else:
+            matched += 1
+    return {
+        "tolerance_mm": tolerance_mm,
+        "checked": len(expected),
+        "matched": matched,
+        "mismatches": mismatches,
+        "missing_wires": missing,
+        "unrouted_wires": unrouted,
+        "ok": not (mismatches or missing or unrouted),
+    }
+
+
 def _mils(point: dict[str, float]) -> tuple[int, int]:
     return round(point["x"] * 10), round(point["y"] * 10)
 

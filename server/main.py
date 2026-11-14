@@ -55,6 +55,7 @@ from exchange_lock import ExchangeLock
 from harness_layout import (
     build_layout_spec,
     check_layout,
+    check_wire_lengths,
     parse_ldrdoc,
     unrouted_reasons,
 )
@@ -9035,6 +9036,9 @@ async def get_harness_data(
     summary_only: bool = False,
     designators: list | None = None,
     region: list | None = None,
+    fields: list | None = None,
+    expected_lengths: dict | None = None,
+    length_tolerance_mm: float = 0.5,
 ) -> str:
     """
     Read an Altium Harness Wiring Diagram (.WirDoc) or Harness Project (.PrjHar).
@@ -9076,8 +9080,13 @@ async def get_harness_data(
     a connector over its body, title and pins; Altium's own box can be slightly larger),
     so keep a margin. Wiring diagrams only.
 
-    A full wiring diagram can be very large; use summary_only or designators to keep
-    the answer small.
+    A full wiring diagram can be very large; use summary_only, designators or fields to
+    keep the answer small.
+
+    Units: object locations and points are DXP units (1 = 10 mils), while the write tools
+    (add_harness_wiring, edit_harness_layout) and get_screenshot's zoom take true mils;
+    lengths are given in mils and mm. The answer's "units" block says so: multiply a
+    location by 10 before passing it to a write tool or a zoom.
 
     Args:
         file_path (str, optional): Full path to the .WirDoc, .LdrDoc, or .PrjHar file.
@@ -9086,6 +9095,14 @@ async def get_harness_data(
         designators (list, optional): Only these connectors (with their pins) and the wires
             that touch them.
         region (list, optional): [x1, y1, x2, y2] in mils; adds objects_in_region.
+        fields (list, optional): Keep only these top-level keys (plus file_path, summary,
+            units and source), e.g. ["bundles", "wires"] to check a layout's lengths
+            (a 40-wire layout answers ~60 kB otherwise, mostly texts and no-connects).
+        expected_lengths (dict, optional, .LdrDoc): {wire: mm}, e.g. cut lengths from a
+            3D model. Adds length_check: each wire's total length as Altium computes it
+            (routed + offset, user or fixed) against it, the wires outside
+            length_tolerance_mm (default 0.5) with the difference, and the expected wires
+            the layout lacks or leaves unrouted.
 
     Returns:
         str: JSON with file_path, summary (connector_count, total_pins,
@@ -9200,6 +9217,21 @@ async def get_harness_data(
                     "error": f"Unsupported file type '{p.suffix}'. Expected .WirDoc, .LdrDoc, or .PrjHar"
                 }
             )
+        if expected_lengths:
+            if p.suffix.lower() != ".ldrdoc":
+                return json.dumps(
+                    {"error": "expected_lengths needs a layout drawing (.LdrDoc)"}
+                )
+            data["length_check"] = check_wire_lengths(
+                data, expected_lengths, length_tolerance_mm
+            )
+        data["units"] = {
+            "locations": "DXP units (1 = 10 mils): x 10 for write tools and zooms",
+            "lengths": "mils and mm, as labelled",
+        }
+        if fields:
+            keep = set(fields) | {"file_path", "summary", "units", "length_check"}
+            data = {k: v for k, v in data.items() if k in keep}
     except Exception as e:
         return json.dumps({"error": f"Could not parse harness document: {e}"})
     data.update(_disk_source(p))

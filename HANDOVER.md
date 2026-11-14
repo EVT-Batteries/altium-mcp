@@ -47,6 +47,27 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 27 (2026-11-14): length checks and lighter reads (uncommitted)
+
+From §8 item 10 (carrying cut lengths from a 3D model into a layout):
+- **`get_harness_data(expected_lengths={wire: mm}, length_tolerance_mm=0.5)`** (.LdrDoc):
+  `length_check` compares each wire's total length as Altium computes it for its length type
+  (routed + offset, user, or fixed "MCAD") with the expected list: mismatches with the
+  difference, expected wires missing or unrouted, `ok`. Pure function
+  `harness_layout.check_wire_lengths` (unit test `TestWireLengthCheck`).
+- **`get_harness_data(fields=[...])`**: keep only the named top-level keys (plus file_path,
+  summary, units, length_check, source), e.g. `["bundles", "wires"]` for a length check.
+- **Units labelled**: every `get_harness_data` answer has `units` (locations in DXP units,
+  x 10 for the write tools and zooms; lengths in mils and mm). Locations were left in DXP
+  units (converting them would break every caller that already multiplies).
+- **Drawing review**: one `missing_template` issue per missing template file with `pages`
+  (was one per page; `page` kept = the first).
+- Cut lengths in the wiring list: a fixed wire length (`edit_harness_layout(wires=...)`,
+  "MCAD CoDesigner" type) = the cut length from CAD, bundles = routed lengths. Verified on a
+  two-wire layout (read back: `length_type: mcad`, fixed 647.69 mm, routed 632.49 mm) and the
+  drawing re-imported. The `LengthOffset` setter (item 4) is not needed for that and stays open.
+- Tests: 472 passed, 7 skipped.
+
 ### Session 26 (2026-11-13): area zoom on layout drawings (uncommitted)
 
 - **`get_screenshot(view_type="sch", zoom=[x1, y1, x2, y2])` stopped on every layout drawing**
@@ -1100,7 +1121,8 @@ in Altium before overwriting it on disk (a file-changed prompt blocks the bridge
    edits; text font from another text; `copy_objects` types / exclude; LdrDoc notes and
    pictures (edit, move, delete, region copy); import report of added connectors;
    `merge_bundles`; `connector_without_table` in the drawing review. See session 24.
-10. **Ideas from carrying CAD lengths into layouts (session 26, 2026-11-13).** Setting bundle
+10. **Ideas from carrying CAD lengths into layouts (session 26, 2026-11-13; done in session 27
+    except the `LengthOffset` setter and converting locations to mils).** Setting bundle
     lengths on six layouts from 3D routes worked with `edit_harness_layout` +
     `import_harness_changes`; what cost time:
     - **Units.** `get_harness_data` reports locations in DXP units (10 mils) while every write

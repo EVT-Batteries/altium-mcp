@@ -531,19 +531,25 @@ def review_drawing(path: Path, include_template_items: bool = False) -> dict:
     issues: list[dict] = []
 
     out_pages = []
+    # One issue per missing template file, naming every page that uses it (a five-page
+    # drawing on one moved template repeated the same issue five times).
+    missing: dict[str, dict] = {}
     for page in pages:
         template = page["template"]
         exists = bool(template) and Path(template).exists()
         if template and not exists:
-            issues.append(
-                {
+            if template in missing:
+                missing[template]["pages"].append(page["index"])
+            else:
+                missing[template] = {
                     "kind": "missing_template",
                     "page": page["index"],
+                    "pages": [page["index"]],
                     "template": template,
-                    "detail": "the page's sheet template file does not exist; "
-                    "Altium cannot update the page from it",
+                    "detail": "the sheet template file of these pages does not exist; "
+                    "Altium cannot update the pages from it",
                 }
-            )
+                issues.append(missing[template])
         page_items = [i for i in items if i.page == page["index"]]
         own = [i for i in page_items if not i.from_template]
         out_pages.append(

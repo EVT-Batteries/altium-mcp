@@ -22,6 +22,7 @@ from harness_layout import (
     _wire_length,
     build_layout_spec,
     check_layout,
+    check_wire_lengths,
     coord_to_mm,
     mm_to_coord,
     parse_ldrdoc,
@@ -180,6 +181,25 @@ class TestUnits(unittest.TestCase):
         )
         # two-point bundle: only the end moves
         self.assertEqual(_follow_end([0, 0, 100, 0], False, 100, 50), [0, 0, 100, 50])
+
+
+class TestWireLengthCheck(unittest.TestCase):
+    def test_expected_lengths(self):
+        layout = {
+            "wires": [
+                {"designator": "W1", "length": {"mm": 520.2}, "length_type": "calculated", "route": ["B1"]},
+                {"designator": "W2", "length": {"mm": 700.0}, "length_type": "mcad", "route": ["B1", "B2"]},
+                {"designator": "W3", "length": None, "length_type": "calculated", "route": []},
+            ]
+        }
+        r = check_wire_lengths(layout, {"W1": 520.0, "W2": 690.0, "W3": 100, "W9": 5}, 0.5)
+        self.assertEqual(r["matched"], 1)
+        self.assertEqual([m["wire"] for m in r["mismatches"]], ["W2"])
+        self.assertEqual(r["mismatches"][0]["difference_mm"], 10.0)
+        self.assertEqual(r["unrouted_wires"], ["W3"])
+        self.assertEqual(r["missing_wires"], ["W9"])
+        self.assertFalse(r["ok"])
+        self.assertTrue(check_wire_lengths(layout, {"W1": 520.0}, 0.5)["ok"])
 
 
 class TestBuildLayoutSpec(unittest.TestCase):
