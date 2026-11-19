@@ -59,8 +59,9 @@ User review of the flattened layouts: a 19 mm branch drawn as long as (or longer
 - **Placement rewrite** (`harness_flat_layout.py`): the trunk, then each side branch (innermost
   first) at the nearest offset clear of everything placed (bundle segments, connector picture
   and text boxes; runs side by side keep lane_spacing, default 400); the bend counts toward
-  the drawn length (tail = drawn - bend, min_tail_mils 300); a branch is placed with its own
-  branches and moves out when they find no room (rollback); a bend blocked at every offset
+  the drawn length (tail = drawn - bend, min_tail_mils 300); a branch's own run must be
+  clear (rollback), its branches then search outward (first version re-tried the parent for
+  every failing child: minutes on a 13-bundle layout with photos); a bend blocked at every offset
   turns steeper (60, 75, 90). Ties on wire count: the shorter bundle continues the run (a
   branch always carries its bend). Report `branches_not_clear`.
 - **Visible picture part**: `harness_layout.read_image_contents` / `image_extents` decode the
@@ -76,6 +77,35 @@ User review of the flattened layouts: a 19 mm branch drawn as long as (or longer
 - Tests: 488 pass, 4 new (equal legs drawn equal, short branch shorter, labels clear, image extents).
 - Applied to six real layouts through the dev entry point; re-planning the saved files moves
   nothing.
+
+Second user review (same day): drawings off the sheet's centre, and the visual aids (a photo
+behind each plug, arrows from a plug to its "To ..." note) broken by the first re-layout.
+
+- **Lines**: `sheet_graphics` now lists sheet-owned lines / polylines (`lines`: points, width,
+  colour, start_shape / end_shape); before, arrows were invisible to every tool and stayed
+  behind. `move_objects` moves them, and `{"unique_id", "points": [...]}` gives a polyline new
+  vertices (bridge `SETVERTS`, `SetSheetVertices`; `MoveSheetObject` accepts ePolyline /
+  eLine). Tested on a scratch copy (three-vertex arrow, offset move), then used.
+- **Graphics clusters**: touching graphics (within group_gap_mils 200) form a cluster, split
+  so graphics nearest different connectors stay apart (an inset goes with its host picture, a
+  line with the picture / note nearest it); `anchors` {uid: designator} overrides the nearest
+  guess. A cluster keeps its place relative to its anchor, turned with the connector (each
+  graphic keeps its own orientation; an arrow end at the anchor is turned onto it, so the
+  arrow is re-pointed); a photo the connector is drawn on (backdrop) only translates and is
+  never pushed. Clusters are computed BEFORE placement and reserved in the connector's boxes
+  (`reserve_graphics`), so lanes leave room for a photo or note.
+- **Centring**: `center` true (the sheet from `parse_ldrdoc(...)["sheet"]`: TSheetStyle
+  size table or the custom size, border margin) or an area; everything moves by one
+  50-mil-snapped shift, reported as `centered_by_mils`.
+- **Placement speed**: a failing sub-branch no longer re-tries its parent (minutes on a
+  13-bundle layout with reserved photos); the branch's own run must be clear, its branches
+  search outward afterwards (`lay_chain` / `lay_sides`).
+- **`find_dblib` skips `*.template.DbLib`**: on a machine where the generated library was
+  missing, `sync_harness_library` picked the template and wrote its name into every wire's
+  library link (put back by re-running it with `dblib_path`).
+- Restoring a layout whose graphics a previous re-layout scattered: plan with the current
+  bundles but the connectors, their connection points and the graphics of the older file
+  (workspace scratch script; the tool plans from the document's current state).
 
 ### Session 29 (2026-11-18/19): flat layout on five more harnesses, picture resize (committed `cea74d0`)
 

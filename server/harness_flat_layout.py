@@ -9,9 +9,10 @@ the way a harness is drawn on a formboard, without the glitches of a 3D-projecte
 - every side branch leaves its node at 45 degrees and turns parallel to the trunk at the
   nearest offset that is clear of everything placed before it (bundles, connector pictures
   and their texts), so branches never cross or lie on top of each other: on each side the
-  branch nearest the trunk end is placed first (innermost), a branch is placed together with
-  its own branches (it moves out when they find no room), and a bend that is blocked
-  whatever the offset turns steeper (60, 75, 90 degrees);
+  branch nearest the trunk end is placed first (innermost), a branch's own branches then
+  find lanes outward of it, a bend that is blocked whatever the offset turns steeper (60, 75,
+  90 degrees), and each connector reserves the place of the notes, photos and arrows it
+  carries (reserve_graphics), so lanes leave room for them;
 - branches alternate above / below the trunk (first_side), node by node;
 - drawn lengths follow the physical lengths (one scale; a branch's slanted part counts) but
   never fall below min_bundle_mils, so a 4 mm bundle between two breakouts stays readable;
@@ -86,8 +87,12 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     shown parameters in rows below it (text_gap_mils 50, text_row_mils 130); 'keep': each text
     keeps its place relative to the body, turned with the connector; a connector without a
     view picture always keeps),
-    attach_mils (6000: notes / pictures lying within it of a connector's picture or a free wire
-    end move with the nearest one; 0 = none),
+    attach_mils (6000: notes / pictures / lines lying within it of a connector's picture or a
+    free wire end move with the nearest one; 0 = none), anchors ({graphic unique_id: connector
+    designator or free-end connection point}: which one a graphic goes with, whatever is
+    nearest), group_gap_mils (200: graphics this close form one cluster), reserve_graphics
+    (True), center (true: the sheet's middle, or an area [x1, y1, x2, y2] mils: the whole
+    drawing is moved there, snapped to 50 mils),
     break_symbols (True: on bundles whose drawn length differs from the physical one by > 2 %)."""
     o = dict(options or {})
     lengths_in = {str(k): float(v) for k, v in (o.get("lengths") or {}).items()}
@@ -212,6 +217,8 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             return str(c.get("part_number") or c.get("comment") or "")
         return str((c.get("parameters") or {}).get(name) or "") or "x" * 20
 
+    conn_k: dict[str, int] = {}             # quarter turns given to each connector
+
     def conn_place(n: str, x: float, y: float) -> tuple[dict[str, Any], list] | None:
         """the request entry of the connector on node n with its connection point at (x, y),
         and the boxes it takes (its picture and its texts, mils); None: no connector there"""
@@ -226,6 +233,7 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
         want = -1 if n == root else 1                      # the root faces left, the others right
         best = max(range(4), key=lambda k: (_rot(ox_, oy_, k)[0] * want, -k))
         rx, ry = _rot(ox_, oy_, best)
+        conn_k[d] = best
         nx, ny = x + rx, y + ry
         ce: dict[str, Any] = {
             "designator": d, "x": round(nx), "y": round(ny),
@@ -235,6 +243,7 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
         vbox = _view_box(c, best, nx, ny)
         shown = [(name, t) for name, t in (c.get("texts") or {}).items() if not t.get("hidden")]
         boxes = [vbox] if vbox else [(min(x, nx) - 100, min(y, ny) - 100, max(x, nx) + 100, max(y, ny) + 100)]
+        boxes += reserved(d, best, (nx, ny))
         tx: dict[str, Any] = {}
         if vbox and conn_texts == "around":
             # designator just above the connector's picture, the other shown texts (comment,
@@ -261,9 +270,155 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             ce["_picture"] = True
         return ce, boxes
 
+    # ---- graphics: notes, pictures and lines (arrows) of the sheet, in clusters (graphics
+    # touching each other: an inset photo on a photo, an arrow and the note it points at), each
+    # anchored to the nearest connector (its picture as it is now) or free wire end (a leaf
+    # connection point without a connector) within attach_mils. A connector reserves its
+    # clusters' place while the branches are laid out (reserve_graphics), so lanes leave room
+    # for a photo or a note beside it.
+    attach = float(o.get("attach_mils", 6000))
+    gap = float(o.get("group_gap_mils", 200))
+    reserve = bool(o.get("reserve_graphics", True))
+    graphics: dict[str, dict[str, Any]] = {}
+    for g in list(layout.get("notes", [])) + list(layout.get("pictures", [])):
+        if all(k in g for k in ("x1", "y1", "x2", "y2", "unique_id")):
+            graphics[g["unique_id"]] = {"box": (min(g["x1"], g["x2"]) * 10.0, min(g["y1"], g["y2"]) * 10.0,
+                                                max(g["x1"], g["x2"]) * 10.0, max(g["y1"], g["y2"]) * 10.0)}
+    for g in layout.get("lines", []) or []:
+        p = g.get("points") or []
+        if g.get("unique_id") and len(p) >= 4:
+            pts = [(p[i] * 10.0, p[i + 1] * 10.0) for i in range(0, len(p) - 1, 2)]
+            graphics[g["unique_id"]] = {"pts": pts, "box": (min(q[0] for q in pts), min(q[1] for q in pts),
+                                                            max(q[0] for q in pts), max(q[1] for q in pts))}
+
+    def g_dist(a: str, b: str) -> float:
+        ga, gb = graphics[a], graphics[b]
+        if "pts" in ga and "pts" in gb:
+            return min(math.dist(p, q) for p in ga["pts"] for q in gb["pts"])
+        if "pts" in ga:
+            ga, gb = gb, ga
+        if "pts" in gb:
+            return min(_seg_box_dist(gb["pts"][i], gb["pts"][i + 1], ga["box"]) for i in range(len(gb["pts"]) - 1))
+        return _box_dist(ga["box"], gb["box"])
+
+    parent_of = {u: u for u in graphics}
+
+    def find(u: str) -> str:
+        while parent_of[u] != u:
+            parent_of[u] = parent_of[parent_of[u]]
+            u = parent_of[u]
+        return u
+
+    ids = list(graphics)
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            if g_dist(a, b) <= gap:
+                parent_of[find(a)] = find(b)
+    clusters: dict[str, list[str]] = {}
+    for u in ids:
+        clusters.setdefault(find(u), []).append(u)
+
+    anchor_old: dict[str, tuple[float, float]] = {}
+    anchor_box: dict[str, tuple] = {}
+    for d, c in conns.items():
+        if cp_of_conn.get(d) in adj:
+            anchor_old[d] = _mils(c["location"])
+            anchor_box[d] = _view_box(c, 0, *anchor_old[d]) or (*anchor_old[d], *anchor_old[d])
+    free_ends = [n for n in adj if n not in conn_of_cp and len(adj[n]) == 1 and n in cps]
+    for n in free_ends:
+        anchor_old[n] = _mils(cps[n]["location"])
+        anchor_box[n] = (*anchor_old[n], *anchor_old[n])
+
+    def a_dist(u: str, k: str) -> float:
+        g = graphics[u]
+        if "pts" in g:          # a line counts by its ends (an arrow points at what it labels)
+            return min(_box_dist((*q, *q), anchor_box[k]) for q in (g["pts"][0], g["pts"][-1]))
+        return _box_dist(g["box"], anchor_box[k])
+
+    def union(boxes):
+        return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    if anchor_old:
+        # touching graphics of different anchors (two plugs' photos side by side) stay apart:
+        # each picture / note goes with its own nearest anchor (an inset with its host
+        # picture), a line with the picture / note it is nearest
+        def inside(a: str, b: str) -> bool:
+            ra, rb = graphics[a]["box"], graphics[b]["box"]
+            return a != b and rb[0] <= ra[0] and rb[1] <= ra[1] and ra[2] <= rb[2] and ra[3] <= rb[3]
+
+        # anchors given explicitly: {graphic unique_id: connector designator or free end}
+        pinned_to = {str(u): str(a) for u, a in (o.get("anchors") or {}).items()}
+        bad = sorted({a for a in pinned_to.values() if a not in anchor_old})
+        if bad:
+            raise FlatLayoutError(f"anchors name no connector or free end: {bad}")
+        host_of: dict[str, str] = {}
+        split: dict[str, list[str]] = {}
+        for root_u, members in clusters.items():
+            solid = [u for u in members if "pts" not in graphics[u]]
+            own = {u: pinned_to[u] for u in members if u in pinned_to}
+            for u in solid:
+                if u in own:
+                    continue
+                host = max((h for h in solid if inside(u, h)), default=None,
+                           key=lambda h: (graphics[h]["box"][2] - graphics[h]["box"][0]) * (graphics[h]["box"][3] - graphics[h]["box"][1]))
+                if host:
+                    host_of[u] = host
+                own[u] = min(anchor_old, key=lambda k: a_dist(host or u, k))
+            for u in members:
+                if u not in own:
+                    own[u] = own[min(solid, key=lambda v: g_dist(u, v))] if solid else min(anchor_old, key=lambda k: a_dist(u, k))
+                if u in host_of:
+                    own[u] = own[host_of[u]]
+            for u in members:
+                split.setdefault(f"{root_u}|{own[u]}", []).append(u)
+        clusters = split
+
+    cluster_of: dict[str, str] = {}          # cluster root -> anchor
+    anchored: dict[str, list[str]] = {}      # anchor -> cluster roots
+    backdrops: set[str] = set()              # clusters the connector is drawn on (its photo)
+    if attach > 0 and anchor_old:
+        for root_u, members in clusters.items():
+            dist, best = min((min(a_dist(u, k) for u in members), k) for k in anchor_old)
+            given = {pinned_to[u] for u in members if u in pinned_to}
+            if given:
+                dist, best = 0.0, given.pop()
+            if dist <= attach:
+                cluster_of[root_u] = best
+                anchored.setdefault(best, []).append(root_u)
+                if best in conns and _view_box(conns[best], 0, 0, 0) and any(
+                        "pts" not in graphics[u] and _box_dist(graphics[u]["box"], anchor_box[best]) <= 0 for u in members):
+                    backdrops.add(root_u)
+
+    def cluster_move(root_u: str, k: int, new_loc: tuple[float, float]) -> tuple[float, float]:
+        """the shift of a cluster whose anchor turned k quarter turns and moved to new_loc: its
+        centre keeps its place relative to the anchor (turned with it)"""
+        a = cluster_of[root_u]
+        ox0, oy0 = anchor_old[a]
+        if root_u in backdrops:
+            k = 0                    # a photo under the connector does not turn with it
+        members = clusters[root_u]
+        solid = [u for u in members if "pts" not in graphics[u]]
+        r = union([graphics[u]["box"] for u in (solid or members)])
+        cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+        rx, ry = _rot(cx - ox0, cy - oy0, k)
+        return new_loc[0] + rx - cx, new_loc[1] + ry - cy
+
+    def reserved(a: str, k: int, new_loc: tuple[float, float]) -> list:
+        """the boxes the clusters anchored to a take once it is placed"""
+        out = []
+        if not reserve:
+            return out
+        for root_u in anchored.get(a, []):
+            dx, dy = cluster_move(root_u, k, new_loc)
+            for u in clusters[root_u]:
+                if "pts" not in graphics[u]:
+                    b = graphics[u]["box"]
+                    out.append((b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy))
+        return out
+
     # ---- placement: the trunk, then each side branch in the first lane that is clear of all
-    # placed so far (bundles, connector pictures and texts); a nested branch is placed with
-    # its parent, so a parent that leaves no room for it moves out
+    # placed so far (bundles, connector pictures and texts, the graphics a connector carries);
+    # a branch's own run must be clear, its branches then find lanes outward of it
     pos: dict[str, tuple[float, float]] = {root: (ox, oy)}
     bundle_pts: dict[str, list[tuple[float, float]]] = {}
     # a connector's boxes carry its connection point: the bundles ending there may touch them
@@ -296,6 +451,11 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     def add_conn(n: str) -> bool:
         g = conn_place(n, *pos[n])
         if g is None:
+            if n in anchored:            # a free end with its label / photo
+                mine = reserved(n, 0, pos[n])
+                ok = all(box_free(b, pos[n]) for b in mine)
+                boxes.extend((*b, pos[n]) for b in mine)
+                return ok
             return True
         ok = all(box_free(b, pos[n]) for b in g[1])
         boxes.extend((*b, pos[n]) for b in g[1])
@@ -316,9 +476,14 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     def lay_run(start: str, x: float, y: float, outward: int, up_first: bool) -> bool:
         """lay the run of `start` (already placed at x, y) to the right, then its side
         branches: outward (+1 up / -1 down) when outward != 0, else alternating starting with
-        up_first. False when part of it is not clear."""
+        up_first. False when the run itself is not clear."""
+        ok = lay_chain(start, x, y)
+        lay_sides(start, outward, up_first)
+        return ok
+
+    def lay_chain(start: str, x: float, y: float) -> bool:
+        """the run of `start` (placed at x, y) to the right with its connectors: clear?"""
         run = chain(start)
-        nodes = [start] + [m for m, _ in run]
         ok = True
         xx = x
         for m, e in run:
@@ -330,6 +495,11 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             bundle_pts[e] = [a, pos[m]]
         for m, _ in run:
             ok = add_conn(m) and ok
+        return ok
+
+    def lay_sides(start: str, outward: int, up_first: bool) -> None:
+        """the side branches of the run of `start`, each with its own branches"""
+        nodes = [start] + [m for m, _ in chain(start)]
         branches = []
         flip = up_first
         for i, k in enumerate(nodes):
@@ -340,13 +510,13 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
                 branches.append((i, k, m, e, s))
         # on each side the branch nearest the run's end first: it takes the innermost lane
         for i, k, m, e, s in sorted(branches, key=lambda b: -b[0]):
-            ok = place_branch(k, m, e, s, up_first) and ok
-        return ok
+            place_branch(k, m, e, s, up_first)
 
     def place_branch(k: str, m: str, e: str, s: int, up_first: bool) -> bool:
         """the branch k -> m leaves k at 45 degrees (steeper when 45 is blocked) and runs
         parallel to the trunk at the nearest clear offset; its drawn length (bend included)
-        follows the physical one"""
+        follows the physical one. The branch's own run (to its first fork's end) must be
+        clear; its own branches then find their lanes outward of it."""
         kx, ky = pos[k]
         target = drawn(e)
         tries = [(ang, lane + step * i) for ang in (45, 60, 75, 90) for i in range(steps + 1)]
@@ -361,13 +531,12 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             segs.extend([d1, d2])
             bundle_pts[e] = [(kx, ky), (bx, by), pos[m]]
             ok = add_conn(m) and ok
+            ok = lay_chain(m, pos[m][0], by) and ok
             if ok or last:
-                ok = lay_run(m, pos[m][0], by, s, up_first) and ok
-            if ok:
-                return True
-            if last:
-                unclear.append(e)
-                return False
+                if not ok:
+                    unclear.append(e)
+                lay_sides(m, s, up_first)
+                return ok
             rollback(snap)
         return False
 
@@ -379,14 +548,21 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     out_conns, out_cps, out_bundles = [], [], []
     keep_out: list[tuple[float, float, float, float]] = []      # what graphics keep clear of
     conn_entry: dict[str, dict[str, Any]] = {}
+    conn_boxes: dict[str, list] = {}         # the keep-out boxes of each connector
     for n, (x, y) in pos.items():
         g = conn_place(n, x, y)
         if g:
             conn_entry[n] = g[0]
             # without a picture the body box is only an estimate: graphics may sit beside it
-            keep_out.extend(g[1] if g[0].get("_picture") else g[1][1:])
+            mine = g[1] if g[0].get("_picture") else g[1][1:]
+            conn_boxes[g[0]["designator"]] = list(mine)
+            keep_out.extend(mine)
             g[0].pop("_picture", None)
             out_conns.append(g[0])
+        elif n in anchored:
+            mine = reserved(n, 0, (x, y))
+            conn_boxes[n] = list(mine)
+            keep_out.extend(mine)
 
     # texts: each bundle's designator and length as a pair, at the first clear place along it
     # (a straight's middle, then towards its ends; beside a slanted part), then each connection
@@ -472,50 +648,37 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             out_cps.append(entry)
     keep_out.extend(placed)
 
-    # notes and pictures beside a connector or a free end (its label, a photo) travel with it:
-    # each group (a graphic and the graphics lying inside it, e.g. an inset photo) is moved by
-    # the offset of the anchor nearest its centre (within attach_mils), then pushed until it
-    # clears the bundles, the connectors with their texts and the groups placed before it:
-    # in the shortest of the four ways (away from the anchor's point vertically or outward first)
+    # notes, pictures and lines (arrows) beside a connector or a free end travel with it, as
+    # clusters: graphics touching each other (an inset photo on a photo, an arrow and the note
+    # it points at) stay together. Each cluster follows the anchor nearest to it (a connector's
+    # picture as it was, or a free wire end) within attach_mils: it keeps its place relative to
+    # the anchor, turned with a turned connector (each graphic keeps its own orientation), and
+    # an arrow end at the anchor stays on it. A cluster under its connector (a photo the plug
+    # sits on) stays there; any other is pushed clear of bundles, connectors with their texts
+    # and the clusters placed before it, the shortest of four ways (biggest cluster first).
     move_objects = []
     shifted = []
-    attach = float(o.get("attach_mils", 6000))
     clear = float(o.get("graphic_clearance_mils", 100))
-    # anchors: every connector (moved by its own offset) and every free end, a leaf connection
-    # point without a connector (a wire end on a no-connect, a terminal): its own offset
-    anchor_at = {c["designator"]: _mils(conns[c["designator"]]["location"]) for c in out_conns}
-    moved = {c["designator"]: (c["x"] - anchor_at[c["designator"]][0],
-                               c["y"] - anchor_at[c["designator"]][1]) for c in out_conns}
-    cp_at = {c["designator"]: (c["connection_point"]["x"], c["connection_point"]["y"]) for c in out_conns}
-    for n, (x, y) in pos.items():
-        if n not in conn_of_cp and len(adj.get(n, [])) == 1 and n in cps and n not in anchor_at:
-            anchor_at[n] = _mils(cps[n]["location"])
-            moved[n] = (x - anchor_at[n][0], y - anchor_at[n][1])
-            cp_at[n] = (x, y)
-    # what a graphic is measured from: the connector's picture where it has one (its place now)
-    anchor_box = {k: (_view_box(conns[k], 0, *p) if k in conns else None) or (*p, *p) for k, p in anchor_at.items()}
-    graphics = [g for g in list(layout.get("notes", [])) + list(layout.get("pictures", []))
-                if all(k in g for k in ("x1", "y1", "x2", "y2", "unique_id"))]
-    rect = {g["unique_id"]: (min(g["x1"], g["x2"]) * 10.0, min(g["y1"], g["y2"]) * 10.0,
-                             max(g["x1"], g["x2"]) * 10.0, max(g["y1"], g["y2"]) * 10.0) for g in graphics}
+    # where each anchor ended: connectors and free ends
+    anchor_new: dict[str, tuple[float, float]] = {}
+    anchor_k: dict[str, int] = {}
+    cp_at: dict[str, tuple[float, float]] = {}
+    for c in out_conns:
+        d = c["designator"]
+        anchor_new[d] = (float(c["x"]), float(c["y"]))
+        anchor_k[d] = conn_k.get(d, 0)
+        cp_at[d] = (c["connection_point"]["x"], c["connection_point"]["y"])
+    for n in free_ends:
+        if n in pos:
+            anchor_new[n] = pos[n]
+            anchor_k[n] = 0
+            cp_at[n] = pos[n]
+    own_boxes = {d: conn_boxes.get(d, []) for d in anchor_new}
+    has_pic = {d for d in anchor_old if d in conns and _view_box(conns[d], 0, 0, 0)}
 
-    def inside(a, b):
-        return a != b and rect[b][0] <= rect[a][0] and rect[b][1] <= rect[a][1] and rect[a][2] <= rect[b][2] and rect[a][3] <= rect[b][3]
-
-    groups: dict[str, list[str]] = {}
-    for g in graphics:
-        u = g["unique_id"]
-        hosts = [h["unique_id"] for h in graphics if inside(u, h["unique_id"])]
-        if hosts:
-            top = max(hosts, key=lambda h: (rect[h][2] - rect[h][0]) * (rect[h][3] - rect[h][1]))
-            while any(inside(top, h["unique_id"]) for h in graphics):
-                top = next(h["unique_id"] for h in graphics if inside(top, h["unique_id"]))
-            groups.setdefault(top, []).append(u)
-        else:
-            groups.setdefault(u, []).insert(0, u)
     segs = [(p[i], p[i + 1]) for p in bundle_pts.values() for i in range(len(p) - 1)]
 
-    def hits(r):
+    def hits(r, skip=()):
         """(x1, y1, x2, y2, clearance) of the first obstacle the box r touches, else None:
         bundles keep `clear` (graphic_clearance_mils), boxes (pictures, texts, placed
         graphics) a third of it, so a label may sit close beside a connector picture. A
@@ -524,6 +687,8 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
         c = clear / 3.0
         x1, y1, x2, y2 = r[0] - c, r[1] - c, r[2] + c, r[3] + c
         for k in keep_out:
+            if k in skip:
+                continue
             if x1 < k[2] and k[0] < x2 and y1 < k[3] and k[1] < y2:
                 return (*k, c)
         x1, y1, x2, y2 = r[0] - clear, r[1] - clear, r[2] + clear, r[3] + clear
@@ -534,56 +699,153 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
                 return xlo, ylo, xhi, yhi, clear
         return None
 
-    def settle(r, way):
-        """push r one way (up, down, right, left) until it is clear: (shift, box) or None"""
+    def settle(boxes, way, skip=()):
+        """push the boxes together one way (up, down, right, left) until all are clear:
+        shift, or None"""
         total = 0.0
         for _ in range(200):
-            h = hits(r)
+            h = next((h for h in (hits(b, skip) for b in boxes) if h), None)
             if h is None:
-                return total, r
+                return total
             ox1, oy1, ox2, oy2, c = h
+            r = union(boxes)
             if way in ("up", "down"):
                 step = (oy2 + c - r[1] + 1) if way == "up" else (oy1 - c - r[3] - 1)
-                r = (r[0], r[1] + step, r[2], r[3] + step)
+                boxes = [(b[0], b[1] + step, b[2], b[3] + step) for b in boxes]
             else:
                 step = (ox2 + c - r[0] + 1) if way == "right" else (ox1 - c - r[2] - 1)
-                r = (r[0] + step, r[1], r[2] + step, r[3])
+                boxes = [(b[0] + step, b[1], b[2] + step, b[3]) for b in boxes]
             total += step
         return None
 
-    face_of = {d: facing.get(cp_of_conn.get(d), 1) for d in moved if d in conns}
-    face_of.update({n: facing.get(n, 1) for n in moved if n not in conns})
-    if attach > 0 and moved:
-        # the biggest first: a photo has fewer places to go than a one-line note
-        for host, members in sorted(groups.items(), key=lambda hm: -(rect[hm[0]][2] - rect[hm[0]][0]) * (rect[hm[0]][3] - rect[hm[0]][1])):
-            r0 = rect[host]
-            gx, gy = (r0[0] + r0[2]) / 2, (r0[1] + r0[3]) / 2
-            d, best = min((_box_dist(r0, anchor_box[k]), k) for k in moved)
-            if d > attach:
+    face_of = {d: facing.get(cp_of_conn.get(d), 1) for d in anchor_old if d in conns}
+    face_of.update({n: facing.get(n, 1) for n in anchor_old if n not in conns})
+    final: dict[str, Any] = {}           # unique_id -> ("box", (dx, dy)) | ("pts", [points])
+    if cluster_of:
+        area = lambda cl: (lambda r: (r[2] - r[0]) * (r[3] - r[1]))(union([graphics[u]["box"] for u in cl]))  # noqa: E731
+        for root_u in sorted(cluster_of, key=lambda r: -area(clusters[r])):
+            members = clusters[root_u]
+            best = cluster_of[root_u]
+            if best not in anchor_new:
                 continue
-            dx, dy = moved[best]
-            r = (r0[0] + dx, r0[1] + dy, r0[2] + dx, r0[3] + dy)
-            # away from the anchor's point vertically, or outward (the way its connector faces),
-            # else the other two ways:
-            # whichever moves the group least
-            vert = "up" if (r[1] + r[3]) / 2 >= cp_at[best][1] else "down"
-            out = "right" if face_of.get(best, 1) > 0 else "left"
-            back = "left" if out == "right" else "right"
-            other = "down" if vert == "up" else "up"
-            tries = [(w, settle(r, w)) for w in (vert, out, other, back)]
-            tries = [(w, t) for w, t in tries if t is not None]
+            ox0, oy0 = anchor_old[best]
+            nx0, ny0 = anchor_new[best]
+            kq = 0 if root_u in backdrops else anchor_k[best]
+
+            def tf(p):          # a point carried with the anchor (turned with it)
+                rx, ry = _rot(p[0] - ox0, p[1] - oy0, kq)
+                return nx0 + rx, ny0 + ry
+
+            solid = [u for u in members if "pts" not in graphics[u]]
+            ref_box = union([graphics[u]["box"] for u in (solid or members)])
+            ref = ((ref_box[0] + ref_box[2]) / 2, (ref_box[1] + ref_box[3]) / 2)
+            nref = tf(ref)
+            dx, dy = nref[0] - ref[0], nref[1] - ref[1]
+            moved_boxes = [(graphics[u]["box"][0] + dx, graphics[u]["box"][1] + dy,
+                            graphics[u]["box"][2] + dx, graphics[u]["box"][3] + dy) for u in solid]
+            # a cluster lying on its connector's picture (the plug drawn on its photo) stays
+            backdrop = root_u in backdrops
             px = py = 0.0
-            if tries:
-                # the shortest move; on a tie the preferred way (listed first)
-                way, (shift, r) = min(tries, key=lambda wt: abs(wt[1][0]))
-                if shift:
-                    px, py = (0.0, shift) if way in ("up", "down") else (shift, 0.0)
-                    shifted.append({"graphics": members, "connector": best, "pushed_mils": round(shift), "way": way})
-            keep_out.append(r)
-            off = (round(dx + px), round(dy + py))
+            if moved_boxes and not backdrop:
+                vert = "up" if (ref_box[1] + ref_box[3]) / 2 + dy >= cp_at[best][1] else "down"
+                out = "right" if face_of.get(best, 1) > 0 else "left"
+                back = "left" if out == "right" else "right"
+                other = "down" if vert == "up" else "up"
+                skip = set(own_boxes.get(best, []))
+                tries = [(w, settle(moved_boxes, w, skip)) for w in (vert, out, other, back)]
+                tries = [(w, t) for w, t in tries if t is not None]
+                if tries:
+                    # the shortest move; on a tie the preferred way (listed first)
+                    way, shift = min(tries, key=lambda wt: abs(wt[1]))
+                    if shift:
+                        px, py = (0.0, shift) if way in ("up", "down") else (shift, 0.0)
+                        shifted.append({"graphics": members, "connector": best, "pushed_mils": round(shift), "way": way})
+            for b in moved_boxes:
+                keep_out.append((b[0] + px, b[1] + py, b[2] + px, b[3] + py))
+            for u in members:
+                g = graphics[u]
+                if "pts" not in g:
+                    final[u] = ("box", (dx + px, dy + py))
+                    continue
+                # an arrow end at the anchor stays on it (turned with it); the rest goes
+                # with the cluster
+                ends = (g["pts"][0], g["pts"][-1])
+                near = [_box_dist((*q, *q), anchor_box[best]) for q in ends]
+                to_solid = [min((_box_dist((*q, *q), graphics[s]["box"]) for s in solid), default=math.inf) for q in ends]
+                pinned = {i for i, (a, s) in zip((0, len(g["pts"]) - 1), zip(near, to_solid)) if a < s}
+                if not solid:
+                    pinned = set(range(len(g["pts"])))
+                pts = [tf(q) if (i in pinned) else (q[0] + dx + px, q[1] + dy + py) for i, q in enumerate(g["pts"])]
+                final[u] = ("pts", pts)
+
+    # ---- centre the drawing on the sheet (center: true) or in an area [x1, y1, x2, y2] mils
+    cen = o.get("center")
+    shift_c = (0.0, 0.0)
+    if cen:
+        if cen is True or cen == "sheet":
+            sh = layout.get("sheet") or {}
+            if not sh.get("width"):
+                raise FlatLayoutError("center: the drawing's sheet size is unknown; give an area [x1, y1, x2, y2]")
+            m = float(sh.get("margin", 20)) * 10.0
+            area_c = (m, m, sh["width"] * 10.0 - m, sh["height"] * 10.0 - m)
+        else:
+            area_c = tuple(float(v) for v in cen)
+        ext = [b for b in keep_out]
+        ext += [(min(a[0], b[0]), min(a[1], b[1]), max(a[0], b[0]), max(a[1], b[1])) for a, b in segs]
+        for u, g in graphics.items():
+            f = final.get(u)
+            if f is None:
+                ext.append(g["box"])
+            elif f[0] == "box":
+                ext.append((g["box"][0] + f[1][0], g["box"][1] + f[1][1], g["box"][2] + f[1][0], g["box"][3] + f[1][1]))
+            else:
+                ext.append((min(q[0] for q in f[1]), min(q[1] for q in f[1]), max(q[0] for q in f[1]), max(q[1] for q in f[1])))
+        e = union(ext)
+        snap = 50.0
+        shift_c = (round(((area_c[0] + area_c[2]) / 2 - (e[0] + e[2]) / 2) / snap) * snap,
+                   round(((area_c[1] + area_c[3]) / 2 - (e[1] + e[3]) / 2) / snap) * snap)
+        sx, sy = shift_c
+        if sx or sy:
+            for c in out_conns:
+                c["x"] += round(sx); c["y"] += round(sy)
+                c["connection_point"] = {"x": c["connection_point"]["x"] + round(sx), "y": c["connection_point"]["y"] + round(sy)}
+                for t in (c.get("texts") or {}).values():
+                    t["x"] += round(sx); t["y"] += round(sy)
+            for c in out_cps:
+                if "x" in c:
+                    c["x"] += round(sx); c["y"] += round(sy)
+                for t in (c.get("texts") or {}).values():
+                    t["x"] += round(sx); t["y"] += round(sy)
+            for b in out_bundles:
+                b["points"] = [v + round(sx) if i % 2 == 0 else v + round(sy) for i, v in enumerate(b["points"])]
+                for t in (b.get("texts") or {}).values():
+                    t["x"] += round(sx); t["y"] += round(sy)
+            for n in list(pos):
+                pos[n] = (pos[n][0] + sx, pos[n][1] + sy)
+            for u in graphics:
+                f = final.get(u)
+                if f is None:
+                    final[u] = ("box", (sx, sy)) if "pts" not in graphics[u] else ("pts", [(q[0] + sx, q[1] + sy) for q in graphics[u]["pts"]])
+                elif f[0] == "box":
+                    final[u] = ("box", (f[1][0] + sx, f[1][1] + sy))
+                else:
+                    final[u] = ("pts", [(q[0] + sx, q[1] + sy) for q in f[1]])
+
+    for u, f in final.items():
+        if f[0] == "box":
+            off = (round(f[1][0]), round(f[1][1]))
             if off != (0, 0):
-                for u in members:
-                    move_objects.append({"unique_id": u, "offset": list(off)})
+                move_objects.append({"unique_id": u, "offset": list(off)})
+        else:
+            old = graphics[u]["pts"]
+            new = [(round(q[0]), round(q[1])) for q in f[1]]
+            offs = {(n[0] - round(q[0]), n[1] - round(q[1])) for q, n in zip(old, new)}
+            if offs == {(0, 0)}:
+                continue
+            if len(offs) == 1:
+                move_objects.append({"unique_id": u, "offset": list(offs.pop())})
+            else:
+                move_objects.append({"unique_id": u, "points": [v for q in new for v in q]})
 
     xs = [p[0] for p in pos.values()]
     ys = [p[1] for p in pos.values()]
@@ -598,6 +860,7 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             "scale_mils_per_mm": round(scale, 3),
             **({"graphics_pushed": shifted} if shifted else {}),
             **({"branches_not_clear": unclear} if unclear else {}),
+            **({"centered_by_mils": [round(shift_c[0]), round(shift_c[1])]} if cen else {}),
             "extent_mils": [round(min(xs)), round(min(ys)), round(max(xs)), round(max(ys))],
         },
     }
@@ -608,6 +871,21 @@ def _box_dist(a: tuple, b: tuple) -> float:
     dx = max(b[0] - a[2], a[0] - b[2], 0.0)
     dy = max(b[1] - a[3], a[1] - b[3], 0.0)
     return math.hypot(dx, dy)
+
+
+def _seg_box_dist(a: tuple, b: tuple, box: tuple) -> float:
+    """distance between the segment a-b and a box (0 when they touch)"""
+    if _seg_hits_box(a[0], a[1], b[0], b[1], *box):
+        return 0.0
+
+    def pt_seg(p, q, r):
+        dx, dy = r[0] - q[0], r[1] - q[1]
+        ll = dx * dx + dy * dy
+        t = 0.0 if ll == 0 else max(0.0, min(1.0, ((p[0] - q[0]) * dx + (p[1] - q[1]) * dy) / ll))
+        return math.dist(p, (q[0] + t * dx, q[1] + t * dy))
+
+    corners = [(box[0], box[1]), (box[0], box[3]), (box[2], box[1]), (box[2], box[3])]
+    return min([_box_dist((*a, *a), box), _box_dist((*b, *b), box)] + [pt_seg(c, a, b) for c in corners])
 
 
 def _seg_hits_box(ax: float, ay: float, bx: float, by: float, x1: float, y1: float, x2: float, y2: float) -> bool:

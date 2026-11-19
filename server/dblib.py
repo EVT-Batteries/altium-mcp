@@ -130,7 +130,9 @@ def load_dblib(path: Path | str) -> DbLib:
 def find_dblib(start: Path | str) -> Path | None:
     """The database library for a document: $ALTIUM_DBLIB_PATH, or the first
     .DbLib found walking up from start (in each folder, then one and two
-    levels below it) whose tables can be loaded."""
+    levels below it) whose tables can be loaded. A '*.template.DbLib' (the
+    template a setup script turns into the machine's library) is never taken:
+    its name would be written into every part's library link."""
     env = os.environ.get("ALTIUM_DBLIB_PATH")
     if env and Path(env).exists():
         return Path(env)
@@ -138,6 +140,8 @@ def find_dblib(start: Path | str) -> Path | None:
     for folder in [start, *start.parents] if start.is_dir() else start.parents:
         for pattern in ("*.DbLib", "*/*.DbLib", "*/*/*.DbLib"):
             for candidate in sorted(folder.glob(pattern)):
+                if candidate.stem.lower().endswith(".template"):
+                    continue
                 try:
                     if load_dblib(candidate).tables:
                         return candidate

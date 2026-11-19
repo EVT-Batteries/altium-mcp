@@ -3109,11 +3109,14 @@ async def add_harness_wiring(
         note_updates (list): Change existing notes by unique_id: "text" (its size,
             colours and font stay), new corners x1, y1, x2, y2 (move / resize) and any
             style field of notes, e.g. [{"unique_id": "KIPAZCBM", "text": "Done"}].
-        move_objects (list): Move notes, frames, pictures, texts and text frames by
-            unique_id, e.g. [{"unique_id": "2563fb3b-...", "offset": [500, 0]}] (mils), or
-            place a picture, frame, note or text frame at new corners (moved and resized):
-            [{"unique_id": ..., "rect": [x1, y1, x2, y2]}] (keep a picture's aspect ratio).
-            Connectors move with connectors, wires with reroutes.
+        move_objects (list): Move notes, frames, pictures, texts, text frames, lines and
+            polylines (e.g. arrows) by unique_id, e.g. [{"unique_id": "2563fb3b-...",
+            "offset": [500, 0]}] (mils), or place a picture, frame, note or text frame at new
+            corners (moved and resized): [{"unique_id": ..., "rect": [x1, y1, x2, y2]}] (keep
+            a picture's aspect ratio), or give a line / polyline new vertices:
+            [{"unique_id": ..., "points": [x1, y1, x2, y2, ...]}] (get_harness_data lists
+            them under "lines" with their arrow shapes). Connectors move with connectors,
+            wires with reroutes.
         net_labels (list): Deprecated alias of labels.
         wire_updates (list): Parameters to upsert on existing wires, and names of parameters
             to delete from them, e.g.:
@@ -3797,8 +3800,10 @@ async def edit_harness_layout(
       note_updates: [{"unique_id", "text"?, "x1".."y2"?, <style>}] change a note's text
         (size and style stay), move / resize it.
       move_objects: [{"unique_id", "offset": [dx, dy]}] move notes, pictures, frames,
-        texts (mils); [{"unique_id", "rect": [x1, y1, x2, y2]}] places a picture, frame,
-        note or text frame at new corners (moved and resized; keep a picture's aspect).
+        texts, lines and polylines (mils); [{"unique_id", "rect": [x1, y1, x2, y2]}] places
+        a picture, frame, note or text frame at new corners (moved and resized; keep a
+        picture's aspect); [{"unique_id", "points": [x1, y1, ...]}] gives a line or
+        polyline (an arrow: "lines" in get_harness_data) new vertices.
       copy_region: [{"region": [x1, y1, x2, y2], "offset": [dx, dy], "types": ["note",
         "picture"], "exclude": [unique ids], "replace_text": {"OLD": "NEW"}}] copy the
         graphics inside the region (all of note, picture, frame, text, text_frame unless
@@ -3818,8 +3823,8 @@ async def edit_harness_layout(
     left. Every side branch leaves at 45 degrees and runs parallel to the trunk at the
     nearest offset clear of everything placed before it (bundles, connector pictures, their
     texts): branches never cross or overlap, alternate above / below (first_side "up" |
-    "down"), are placed together with their own branches, and turn steeper (60 - 90 degrees)
-    when a 45 degree bend is blocked. Drawn lengths follow the physical ones at one scale
+    "down"), leave room for the notes / photos their connector carries (reserve_graphics),
+    and turn steeper (60 - 90 degrees) when a 45 degree bend is blocked. Drawn lengths follow the physical ones at one scale
     (mils per mm; default: the trunk fills width_mils, 8000), a branch's bend included, but
     stay >= min_bundle_mils (400), with the break symbol on bundles not drawn to scale.
     lane_spacing (400 mils): least offset between two runs side by side; clearance_mils
@@ -3835,11 +3840,17 @@ async def edit_harness_layout(
     straight's middle, then towards its ends, then beside a slanted part); point names
     beside the point, above first (sizes estimated: text_char_mils 60, text_height_mils 100;
     place_texts: False keeps texts). Needs one tree (no loop); explicit connectors /
-    connection_points / bundles entries of the same call override the computed ones. Notes
-    and pictures within attach_mils (default 6000; 0 = none) of a connector's picture or a
-    free wire end move with the nearest one, biggest first, then are pushed clear of
-    bundles, pictures, texts and each other by the shortest move (graphics_pushed). The
-    result's "flat_layout" reports trunk, scale, extent and branches_not_clear (branches that
+    connection_points / bundles entries of the same call override the computed ones.
+    Graphics (notes, pictures, lines / arrows) travel in clusters (touching within
+    group_gap_mils 200: a photo and its inset, an arrow and its note), each with the
+    connector (or free wire end) nearest it within attach_mils (6000; 0 = none), or the one
+    named in anchors {graphic unique_id: designator}: a cluster keeps its place relative to
+    it, turned with a turned connector, an arrow end at it stays on it, a photo the
+    connector is drawn on stays under it; connectors reserve their clusters' room while the
+    branches are placed (reserve_graphics, True); a cluster still in the way is pushed the
+    shortest of four ways (graphics_pushed). center: true moves the whole drawing to the
+    middle of its sheet (or [x1, y1, x2, y2] mils: of that area). The result's "flat_layout"
+    reports trunk, scale, extent, centered_by_mils and branches_not_clear (branches that
     found no clear lane; placed at their farthest try).
     Not supported (Altium's script interface has no setter): wire length offsets
     ("Offset Length", calculated type), user-defined wire lengths and manual wire paths.
@@ -9133,9 +9144,13 @@ async def get_harness_data(
     Both document types also list the graphics the sheet owns, each with its unique_id
     (what remove_objects / note_updates / move_objects / delete address): notes (text,
     corners, font, colours, border, alignment), frames (rectangles: corners, line
-    style and width, colours), pictures (corners, file name) and texts (with font
+    style and width, colours), pictures (corners, file name), texts (with font
     {name, size, bold, italic}, orientation and justification; font_from in
-    add_harness_wiring copies them).
+    add_harness_wiring copies them) and lines (lines and polylines, e.g. arrows: points,
+    width, colour, start_shape / end_shape). A layout drawing also gives its sheet (style,
+    width / height and border margin, DXP units) and, per connector view picture,
+    image.content_half: the half size of the part the picture shows (its plain background
+    left out).
 
     region [x1, y1, x2, y2] (mils) adds objects_in_region: the sheet objects (connectors,
     wires, splices, no-connects, wire breaks, twists, shields, cables, notes, frames,

@@ -609,9 +609,35 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         "wires": by_des(wires.values()),
         "unrouted_wires": sorted(unrouted),
         **{k: by_des(v) for k, v in synced_lists.items()},
-        # Sheet graphics: notes, frames, pictures and texts the sheet owns
+        # Sheet graphics: notes, frames, pictures, texts and lines the sheet owns
         **graphics,
+        "sheet": sheet_size(records),
     }
+
+
+# Standard sheet sizes (DXP units, landscape) by TSheetStyle ordinal
+SHEET_SIZES = {0: (1150, 760), 1: (1550, 1110), 2: (2230, 1570), 3: (3150, 2230), 4: (4460, 3150),
+               5: (950, 750), 6: (1500, 950), 7: (2000, 1500), 8: (3200, 2000), 9: (4200, 3200),
+               10: (1100, 850), 11: (1400, 850), 12: (1700, 1100)}
+
+
+def sheet_size(records: list[dict[str, str]]) -> dict[str, Any] | None:
+    """The drawing's sheet (its header record, RECORD 105 in a layout drawing): size and
+    border margin in DXP units; None when the style is unknown."""
+    head = next((r for r in records if r.get("RECORD") in ("105", "31")), None)
+    if head is None:
+        return None
+    style = int(head.get("SheetStyle", 0) or 0)
+    if head.get("UseCustomSheet") == "T":
+        w, h = int(head.get("CustomX", 0) or 0), int(head.get("CustomY", 0) or 0)
+    elif style in SHEET_SIZES:
+        w, h = SHEET_SIZES[style]
+        if head.get("WorkspaceOrientation") == "1":
+            w, h = h, w
+    else:
+        return None
+    margin = int(head.get("CustomMarginWidth", 20) or 20) if head.get("UseCustomSheet") == "T" else 20
+    return {"style": style, "width": w, "height": h, "margin": margin}
 
 
 # --- Edit spec ---------------------------------------------------------------
@@ -1040,7 +1066,7 @@ def build_layout_spec(
     # Sheet graphics (notes, frames, pictures, texts) by UniqueID
     graphics = {
         g["unique_id"]: g
-        for key in ("notes", "frames", "pictures", "texts")
+        for key in ("notes", "frames", "pictures", "texts", "lines")
         for g in layout.get(key, [])
         if g.get("unique_id")
     }

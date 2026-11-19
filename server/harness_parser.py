@@ -192,16 +192,19 @@ def font_table(records: list[dict[str, str]]) -> dict[int, dict[str, Any]]:
 
 
 def sheet_graphics(records: list[dict[str, str]]) -> dict[str, list[dict[str, Any]]]:
-    """Notes (RECORD 209), frames (14), pictures (30) and texts (4) the sheet
-    itself owns (records with no OwnerIndex: connector bodies, the sheet
-    template and a connector's title are owned). Same records in a wiring
-    diagram and a layout drawing. Coordinates DXP units (1 = 10 mils); fonts
-    as {name, size, bold, italic} from the sheet's font table."""
+    """Notes (RECORD 209), frames (14), pictures (30), texts (4) and lines
+    (polylines 6, lines 13: e.g. arrows) the sheet itself owns (records with no
+    OwnerIndex: connector bodies, the sheet template and a connector's title are
+    owned). Same records in a wiring diagram and a layout drawing. Coordinates
+    DXP units (1 = 10 mils); fonts as {name, size, bold, italic} from the
+    sheet's font table. A line gives its points [x1, y1, x2, y2, ...], width,
+    colour and its end shapes (start_shape / end_shape: 0 none, 1 arrow, ...)."""
     fonts = font_table(records)
     notes: list[dict[str, Any]] = []
     frames: list[dict[str, Any]] = []
     pictures: list[dict[str, Any]] = []
     texts: list[dict[str, Any]] = []
+    lines: list[dict[str, Any]] = []
     for props in records:
         if "OwnerIndex" in props:
             continue
@@ -253,6 +256,27 @@ def sheet_graphics(records: list[dict[str, str]]) -> dict[str, list[dict[str, An
                     "unique_id": uid,
                 }
             )
+        elif rtype in ("6", "13"):
+            if rtype == "6":
+                pts = []
+                for i in range(1, int(props.get("LocationCount", 0) or 0) + 1):
+                    pts.extend([_coord(props, f"X{i}"), _coord(props, f"Y{i}")])
+            else:
+                pts = [_coord(props, "Location.X"), _coord(props, "Location.Y"),
+                       _coord(props, "Corner.X"), _coord(props, "Corner.Y")]
+            if len(pts) < 4:
+                continue
+            lines.append(
+                {
+                    "points": pts,
+                    "kind": "polyline" if rtype == "6" else "line",
+                    "line_width": int(props.get("LineWidth", 0) or 0),
+                    "color": int(props.get("Color", 0) or 0),
+                    "start_shape": int(props.get("StartLineShape", 0) or 0),
+                    "end_shape": int(props.get("EndLineShape", 0) or 0),
+                    "unique_id": uid,
+                }
+            )
         elif rtype == "4":
             text = props.get("Text", "").strip()
             if not text:
@@ -273,7 +297,7 @@ def sheet_graphics(records: list[dict[str, str]]) -> dict[str, list[dict[str, An
                     "unique_id": uid,
                 }
             )
-    return {"notes": notes, "frames": frames, "pictures": pictures, "texts": texts}
+    return {"notes": notes, "frames": frames, "pictures": pictures, "texts": texts, "lines": lines}
 
 
 # Rough text size in DXP units (1 = 10 mils) for bounding boxes
@@ -939,6 +963,7 @@ def parse_wirdoc_records(
         "notes": graphics["notes"],
         "frames": graphics["frames"],
         "pictures": graphics["pictures"],
+        "lines": graphics["lines"],
         "net_labels": net_labels,
         "nets": unique_nets,
         "net_connections": nets_to_pins,

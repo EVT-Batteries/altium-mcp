@@ -3261,10 +3261,10 @@ begin
 end;
 
 // MOVEOBJ|uid|dx|dy[|x1|y1|x2|y2]: move a note (2), frame (4), picture (11),
-// text frame (13) or text (22) the sheet owns by dx, dy mils; with corners
-// (not for a text), place it there instead (moved and resized). False
-// (Misses names it) for anything else: connectors move with CONNECTOR, wires
-// with REROUTE.
+// text frame (13), text (22), line or polyline the sheet owns by dx, dy mils;
+// with corners (not for a text, line or polyline), place it there instead
+// (moved and resized). False (Misses names it) for anything else: connectors
+// move with CONNECTOR, wires with REROUTE.
 function MoveSheetObject(Doc: ISch_Document; Rec: String; Misses: TStringList): Boolean;
 var
     Obj : ISch_GraphicalObject;
@@ -3274,14 +3274,15 @@ begin
     Obj := FindSheetObjectByUid(Doc, SpecField(Rec, 1));
     Id := -1;
     if (Obj <> nil) then Id := Obj.ObjectId;
-    if (Id <> 2) and (Id <> 4) and (Id <> 11) and (Id <> 13) and (Id <> 22) then
+    if (Id <> 2) and (Id <> 4) and (Id <> 11) and (Id <> 13) and (Id <> 22)
+        and (Id <> ePolyline) and (Id <> eLine) then
     begin
         Misses.Add('move:' + SpecField(Rec, 1));
         Exit;
     end;
-    if (SpecField(Rec, 4) <> '') and (Id = 22) then
+    if (SpecField(Rec, 4) <> '') and ((Id = 22) or (Id = ePolyline) or (Id = eLine)) then
     begin
-        Misses.Add('resize (a text has no corners):' + SpecField(Rec, 1));
+        Misses.Add('resize (no corners; a line takes points):' + SpecField(Rec, 1));
         Exit;
     end;
     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
@@ -3292,6 +3293,47 @@ begin
     end
     else
         Obj.MoveByXY(MilsToCoord(StrToInt(SpecField(Rec, 2))), MilsToCoord(StrToInt(SpecField(Rec, 3))));
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
+    Obj.GraphicallyInvalidate;
+    Result := True;
+end;
+
+// SETVERTS|uid|n|x1|y1|...|xn|yn: give a polyline the sheet owns these n
+// vertices (mils), or a line its two ends (n = 2), e.g. to re-point an arrow.
+function SetSheetVertices(Doc: ISch_Document; Rec: String; Misses: TStringList): Boolean;
+var
+    Obj  : ISch_GraphicalObject;
+    Id   : Integer;
+    n, v : Integer;
+begin
+    Result := False;
+    Obj := FindSheetObjectByUid(Doc, SpecField(Rec, 1));
+    Id := -1;
+    if (Obj <> nil) then Id := Obj.ObjectId;
+    if (Id <> ePolyline) and (Id <> eLine) then
+    begin
+        Misses.Add('points (not a line or polyline):' + SpecField(Rec, 1));
+        Exit;
+    end;
+    n := StrToInt(SpecField(Rec, 2));
+    if (n < 2) or ((Id = eLine) and (n <> 2)) then
+    begin
+        Misses.Add('points (count):' + SpecField(Rec, 1));
+        Exit;
+    end;
+    SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
+    if (Id = ePolyline) then
+    begin
+        Obj.VerticesCount := n;
+        for v := 1 to n do
+            Obj.Vertex[v] := Point(MilsToCoord(StrToInt(SpecField(Rec, 1 + 2 * v))),
+                                   MilsToCoord(StrToInt(SpecField(Rec, 2 + 2 * v))));
+    end
+    else
+    begin
+        Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 3))), MilsToCoord(StrToInt(SpecField(Rec, 4))));
+        Obj.Corner := Point(MilsToCoord(StrToInt(SpecField(Rec, 5))), MilsToCoord(StrToInt(SpecField(Rec, 6))));
+    end;
     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
     Obj.GraphicallyInvalidate;
     Result := True;
@@ -4521,6 +4563,11 @@ begin
                 if MoveSheetObject(TargetDoc, Rec, Misses) then
                     ObjectsMoved := ObjectsMoved + 1;
             end
+            else if (Kind = 'SETVERTS') then
+            begin
+                if SetSheetVertices(TargetDoc, Rec, Misses) then
+                    ObjectsMoved := ObjectsMoved + 1;
+            end
             else if (Kind = 'WIREBREAK') then
             begin
                 // WIREBREAK|x|y[|<style 0 left, 1 right>|<orientation 0-3>] - on a
@@ -5745,6 +5792,11 @@ begin
             else if (Kind = 'MOVEOBJ') then
             begin
                 if MoveSheetObject(Doc, Rec, Misses) then
+                    GraphicsMoved := GraphicsMoved + 1;
+            end
+            else if (Kind = 'SETVERTS') then
+            begin
+                if SetSheetVertices(Doc, Rec, Misses) then
                     GraphicsMoved := GraphicsMoved + 1;
             end
             else if (Kind = 'COPYREGION') then

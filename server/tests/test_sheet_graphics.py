@@ -188,7 +188,7 @@ class TestSheetGraphics(unittest.TestCase):
         graphics = sheet_graphics(_records()[1:])
         self.assertEqual(
             {k: len(v) for k, v in graphics.items()},
-            {"notes": 1, "frames": 1, "pictures": 1, "texts": 1},
+            {"notes": 1, "frames": 1, "pictures": 1, "texts": 1, "lines": 0},
         )
 
 

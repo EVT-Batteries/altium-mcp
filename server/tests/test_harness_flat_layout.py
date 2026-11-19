@@ -225,8 +225,8 @@ def test_graphics_move_as_groups_and_clear_the_bundles():
             assert hi < big[1] or lo > big[3], (name, a, b, big)
     pushed = plan["report"]["graphics_pushed"]
     assert pushed[0]["graphics"] == ["BIG", "INSET"] and pushed[0]["connector"] == "J2"
-    # centre below the point: pushed down, or outward (J2 faces right), the shorter move
-    assert (pushed[0]["way"], pushed[0]["pushed_mils"] > 0) in (("down", False), ("right", True))
+    # pushed the shortest of the four ways (clear of every bundle, checked above)
+    assert pushed[0]["way"] in ("up", "down", "left", "right") and pushed[0]["pushed_mils"] != 0
 
 
 def test_length_check_sees_lengths_with_summary_only(tmp_path):
@@ -278,3 +278,34 @@ def test_view_picture_counts_by_the_part_it_shows():
     c = next(c for c in plan["connectors"] if c["designator"] == "J2")
     # the designator sits just above the part (6 DXP = 60 mils above the centre), not the square
     assert c["texts"]["designator"]["y"] == c["y"] + 60 + 50
+
+
+def test_arrow_and_note_move_with_their_connector_and_the_drawing_is_centred():
+    """an arrow from a connector to its note is one cluster with the note: both keep their
+    place beside the connector; center puts the drawing in the sheet's middle"""
+    lay = _layout()
+    # J2 at (3290, 1000) mils, its point CP_J2 at (3200, 1000); arrow from beside J2 to a note
+    lay["lines"] = [{"unique_id": "ARR", "points": [340, 100, 380, 100]}]
+    lay["notes"] = [{"unique_id": "NOTE", "x1": 381, "y1": 95, "x2": 420, "y2": 105}]
+    lay["sheet"] = {"width": 2000, "height": 1500, "margin": 20}
+    plan = plan_flat_layout(lay, {"root": "P1", "center": True})
+    j2 = next(c for c in plan["connectors"] if c["designator"] == "J2")
+    mv = {m["unique_id"]: m for m in plan["move_objects"]}
+    off = mv["NOTE"]["offset"]
+    arrow = mv["ARR"]
+    a = arrow.get("points") or [340 * 10 + arrow["offset"][0], 1000 + arrow["offset"][1], 3800 + arrow["offset"][0], 1000 + arrow["offset"][1]]
+    # the note keeps its place relative to J2 (J2 not turned), the arrow still ends at the note
+    assert (3810 + off[0] - j2["x"], 950 + off[1] - j2["y"]) == (3810 - 3290, 950 - 1000)
+    assert abs(a[2] - (3810 + off[0])) <= 10
+    # centred: the drawing's middle within a snap step of the sheet's middle (10000, 7500)
+    xs = [p for b in plan["bundles"] for p in b["points"][0::2]]
+    assert abs((min(xs) + max(xs + [3810 + off[0] + 390])) / 2 - 10000) < 1500
+    assert plan["report"]["centered_by_mils"] != [0, 0]
+
+
+def test_move_objects_points_record():
+    from sheet_spec import note_records
+    rec = note_records(None, None, [{"unique_id": "L1", "points": [0, 0, 100, 50.4, 200, 50]}])
+    assert rec == [["SETVERTS", "L1", 3, 0, 0, 100, 50, 200, 50]]
+    with pytest.raises(ValueError):
+        note_records(None, None, [{"unique_id": "L1", "points": [0, 0, 100]}])

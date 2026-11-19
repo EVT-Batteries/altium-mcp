@@ -89,7 +89,9 @@ def note_records(
     notes: [{x1, y1, x2, y2, text, style_from?, <style>}]; note_updates:
     [{unique_id, text?, x1..y2?, <style>}]; move_objects: [{unique_id,
     offset: [dx, dy]}] (or dx / dy), or [{unique_id, rect: [x1, y1, x2, y2]}] to
-    place a picture, frame, note or text frame at new corners (resizing it)."""
+    place a picture, frame, note or text frame at new corners (resizing it), or
+    [{unique_id, points: [x1, y1, x2, y2, ...]}] to give a line or polyline new
+    vertices (SETVERTS)."""
     records: list[list[Any]] = []
     for n in notes or []:
         if not isinstance(n, dict) or not str(n.get("text", "")):
@@ -123,6 +125,15 @@ def note_records(
         )
     for m in moves or []:
         uid = str((m or {}).get("unique_id") or "").strip()
+        pts = m.get("points")
+        if pts is not None:
+            # a polyline's vertices (a line's two ends), e.g. an arrow re-pointed
+            if not uid or not isinstance(pts, (list, tuple)) or len(pts) < 4 or len(pts) % 2:
+                raise ValueError(
+                    f"move_objects entry with points needs unique_id and points [x1, y1, x2, y2, ...] (mils): {m!r}"
+                )
+            records.append(["SETVERTS", uid, len(pts) // 2, *[int(round(float(v))) for v in pts]])
+            continue
         rect = m.get("rect")
         if rect is not None:
             # absolute corners: moves and resizes a picture, frame, note or text frame
