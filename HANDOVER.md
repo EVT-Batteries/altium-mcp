@@ -47,6 +47,34 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 29 (2026-11-18/19): flat layout on five more harnesses, picture resize (uncommitted)
+
+- `flat_layout` connector texts: `connector_texts` "around" (default) puts the designator just
+  above the connector's main view picture and the comment / shown parameters in rows below it
+  (`text_gap_mils`, `text_row_mils`); "keep" keeps each text's place relative to the body,
+  turned with the connector (before, texts only shifted: a turned plug's comment landed on its
+  bundle).
+- `flat_layout` graphics: a graphic and the graphics inside it (an inset photo) move as one
+  group, anchored to the nearest connector OR free end (a leaf connection point without a
+  connector, e.g. wire ends on no-connects); after the move a group is pushed clear of the
+  bundles (`graphic_clearance_mils`, 100), the connector pictures with their text bands, the
+  bundle texts and earlier groups, either vertically away from its anchor or outward, whichever
+  is shorter (`report.graphics_pushed`). A re-plan of an already flattened sheet moves nothing.
+- `move_objects` entries take `rect: [x1, y1, x2, y2]` (mils): a picture, frame, note or text
+  frame is placed at those corners, i.e. moved AND resized (`MOVEOBJ|uid|0|0|x1|y1|x2|y2`;
+  Pascal `MoveSheetObject` sets Location / Corner). Verified live on a scratch copy of a
+  layout drawing: only the target picture changed (still embedded), bundles / connectors /
+  wires untouched.
+- New bundles: Altium leaves a new bundle's Comment text SHOWN at the sheet origin (and its
+  Description there, hidden); that stretched the Draftsman layout view down to (0, 0). The
+  bundle records of a new bundle now place both on its first point, hidden (the comment shown
+  only when the call gives one), unless the call places them itself.
+- Finding: Draftsman keeps a layout drawing view (`LayoutDrawingViewData`) at 1:1: a
+  `set_view_scale` on it is not kept, and its Size follows the layout's extent (+ ~50 mm). A
+  layout that no longer fits its page has to shrink in the `.LdrDoc` (big pictures first).
+- Finding: `get_harness_data` silently ignores an unknown keyword (e.g. `document_path` instead
+  of `file_path`) and reads the focused project instead; pass `file_path`.
+
 ### Session 28 (2026-11-18): flattened harness layout (uncommitted)
 
 - **`edit_harness_layout(flat_layout={...})`** (`server/harness_flat_layout.py`, pure geometry,

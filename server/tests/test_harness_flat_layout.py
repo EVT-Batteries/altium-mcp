@@ -105,6 +105,39 @@ def test_connectors_face_outward():
             assert bx >= 0, c
 
 
+def test_connector_texts_turn_with_the_connector():
+    """a connector turned a quarter turn keeps its texts beside its body, not on the bundle"""
+    lay = _layout()
+    j2 = next(c for c in lay["connectors"] if c["designator"] == "J2")
+    j2["location"] = {"x": 320, "y": 109}                                  # body above its point
+    j2["texts"] = {"Comment": {"x": 300, "y": 109, "hidden": False, "justification": "bottom_left"}}
+    plan = plan_flat_layout(lay, {"root": "P1", "connector_texts": "keep"})
+    c = next(c for c in plan["connectors"] if c["designator"] == "J2")
+    cpx, cpy = c["connection_point"]["x"], c["connection_point"]["y"]
+    assert (c["x"] - cpx, c["y"] - cpy) == (90, 0)                         # turned to face right
+    # the comment sat 200 mils left of the body; turned with it, it sits 200 mils above it
+    assert (c["texts"]["comment"]["x"] - c["x"], c["texts"]["comment"]["y"] - c["y"]) == (0, 200)
+
+
+def test_connector_texts_around_the_picture():
+    """default: designator above the connector's picture, comment and parameters below it"""
+    lay = _layout()
+    j2 = next(c for c in lay["connectors"] if c["designator"] == "J2")
+    j2["location"] = {"x": 320, "y": 109}
+    j2["views"] = [{"main": True, "hidden": False, "image": {"x1": 316, "y1": 103, "x2": 324, "y2": 117}}]
+    j2["texts"] = {"Designator": {"x": 300, "y": 120, "hidden": False}, "Comment": {"x": 300, "y": 109, "hidden": False},
+                   "Supplier": {"x": 300, "y": 90, "hidden": False}, "Hidden": {"x": 0, "y": 0, "hidden": True}}
+    plan = plan_flat_layout(lay, {"root": "P1"})
+    c = next(c for c in plan["connectors"] if c["designator"] == "J2")
+    # picture 80 x 140 mils about the body, turned a quarter turn: 140 wide, 80 high
+    x1, y1, y2 = c["x"] - 60, c["y"] - 40, c["y"] + 40
+    t = c["texts"]
+    assert t["designator"] == {"x": x1, "y": y2 + 50, "justification": "bottom_left"}
+    assert t["comment"] == {"x": x1, "y": y1 - 50, "justification": "top_left"}
+    assert t["supplier"] == {"x": x1, "y": y1 - 180, "justification": "top_left"}
+    assert "hidden" not in t
+
+
 def test_loop_is_refused():
     lay = _layout()
     lay["bundles"].append(_bundle("B9", "CP_J1", "CP_J2", 10, ["W1"]))
@@ -126,6 +159,27 @@ def test_notes_and_pictures_follow_their_connector():
     moved = {m["unique_id"]: m["offset"] for m in plan["move_objects"]}
     assert moved["N1"] == [j2["x"] - 3290, j2["y"] - 1000]
     assert "PIC1" not in moved
+
+
+def test_graphics_move_as_groups_and_clear_the_bundles():
+    """a photo with an inset photo inside it moves as one; a group lying across a bundle after
+    the move is pushed off it, away from its connector's point, and the report says so"""
+    lay = _layout()
+    # a big picture across the trunk end near J2 (connection point CP_J2 at 3200, 1000), with
+    # an inset picture inside it
+    lay["pictures"] = [{"unique_id": "BIG", "x1": 300, "y1": 80, "x2": 360, "y2": 110},
+                       {"unique_id": "INSET", "x1": 310, "y1": 85, "x2": 320, "y2": 95}]
+    plan = plan_flat_layout(lay, {"root": "P1"})
+    mv = {m["unique_id"]: m["offset"] for m in plan["move_objects"]}
+    assert mv["BIG"] == mv["INSET"]
+    big = [3000 + mv["BIG"][0], 800 + mv["BIG"][1], 3600 + mv["BIG"][0], 1100 + mv["BIG"][1]]
+    for name, a, b in _segments(plan):
+        lo, hi = min(a[1], b[1]), max(a[1], b[1])
+        if min(a[0], b[0]) <= big[2] and max(a[0], b[0]) >= big[0]:
+            assert hi < big[1] or lo > big[3], (name, a, b, big)
+    pushed = plan["report"]["graphics_pushed"]
+    assert pushed[0]["graphics"] == ["BIG", "INSET"] and pushed[0]["connector"] == "J2"
+    assert pushed[0]["pushed_mils"] < 0          # centre below the point: pushed down
 
 
 def test_length_check_sees_lengths_with_summary_only(tmp_path):

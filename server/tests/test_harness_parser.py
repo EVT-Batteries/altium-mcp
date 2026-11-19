@@ -868,7 +868,8 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
                     "alignment": "right", "show_border": False}],
             note_updates=[{"unique_id": "NOTEUID", "text": "Done"},
                           {"unique_id": "N2", "x1": 1, "y1": 2, "x2": 3, "y2": 4}],
-            move_objects=[{"unique_id": "PIC", "offset": [500, -100]}],
+            move_objects=[{"unique_id": "PIC", "offset": [500, -100]},
+                          {"unique_id": "PIC2", "rect": [900, 800, 100, 50]}],
             labels=[{"x": 10, "y": 20, "text": "T", "font_from": "TXT"},
                     {"x": 10, "y": 20, "text": "U", "font": {"name": "Arial", "size": 10},
                      "justification": "center"}],
@@ -885,6 +886,8 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("NOTEUPD|NOTEUID|1|Done|||||||||||", lines)
         self.assertIn("NOTEUPD|N2|0||1|2|3|4|||||||", lines)
         self.assertIn("MOVEOBJ|PIC|500|-100", lines)
+        # rect: absolute corners, normalised (moves and resizes)
+        self.assertIn("MOVEOBJ|PIC2|0|0|100|50|900|800", lines)
         # font_from leaves the orientation to the source text
         self.assertIn("LABEL|10|20||T|TXT|||", lines)
         self.assertIn("LABEL|10|20|0|U||Arial:10||4", lines)
@@ -897,6 +900,7 @@ class TestHarnessMCPFallbacks(unittest.IsolatedAsyncioTestCase):
             {"notes": [{"x1": 0, "y1": 0, "x2": 1, "y2": 1, "text": "x", "alignment": "up"}]},
             {"note_updates": [{"text": "x"}]},
             {"move_objects": [{"unique_id": "X"}]},
+            {"move_objects": [{"unique_id": "X", "rect": [0, 0, 1]}]},
             {"labels": [{"x": 0, "y": 0, "text": "x", "justification": "middle"}]},
             {"labels": [{"x": 0, "y": 0, "text": "x", "font": "Arial"}]},
             {"copy_objects": [{"source": "s", "region": [0, 0, 1, 1], "types": ["bus"]}]},

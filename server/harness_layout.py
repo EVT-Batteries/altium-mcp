@@ -1334,9 +1334,20 @@ def build_layout_spec(
         if points is not None:
             record.extend(points)
         bundle_records.append(record)
+        texts = item.get("texts")
+        if bundle is None and points is not None and (texts is None or isinstance(texts, dict)):
+            # Altium puts a new bundle's Comment (shown) and Description at the sheet
+            # origin, which stretches the layout's drawing view down to it: put them
+            # on the bundle's first point, the comment shown only when there is one
+            given = {str(k).lower() for k in (texts or {})}
+            default = {
+                "Comment": {"x": points[0], "y": points[1], "hidden": not item.get("comment")},
+                "Description": {"x": points[0], "y": points[1], "hidden": True},
+            }
+            texts = {**{k: v for k, v in default.items() if k.lower() not in given}, **(texts or {})}
         text_records += _text_records(
             f"DES:{des}" if bundle is None else bundle["unique_id"],
-            item.get("texts"),
+            texts,
             f"bundle '{des}'",
             errors,
             None if bundle is None else bundle.get("texts"),

@@ -244,6 +244,14 @@ class TestBuildLayoutSpec(unittest.TestCase):
             spec["expect"]["bundles"],
             {"B2": ["UCP1", "DES:CP2"], "B3": ["DES:CP2", "UCPP1"]},
         )
+        # a new bundle's Comment / Description go to its first point, hidden (Altium
+        # leaves them at the sheet origin, the comment shown)
+        texts = [r for r in records_of(spec, "TEXT") if r[1] == "DES:B2"]
+        self.assertEqual(
+            texts,
+            [["TEXT", "DES:B2", "Comment", 12000, 12000, "1", 0],
+             ["TEXT", "DES:B2", "Description", 12000, 12000, "1", 0]],
+        )
 
     def test_moving_a_connection_point_moves_its_bundle_ends(self):
         spec = build_layout_spec(
@@ -419,8 +427,9 @@ class TestBuildLayoutSpec(unittest.TestCase):
             bundles=[{"designator": "B2", "from": "CP1", "to": "CP_P1"}],
         )
         self.assertEqual(spec["errors"], [])
+        # TEXT last: the new bundle's hidden Comment / Description
         self.assertEqual(
-            [r[0] for r in spec["records"]], ["DELETE", "DELETE", "BUNDLE"]
+            [r[0] for r in spec["records"]], ["DELETE", "DELETE", "BUNDLE", "TEXT", "TEXT"]
         )
 
     def test_errors(self):
@@ -796,6 +805,8 @@ class TestTexts(unittest.TestCase):
                 ["TEXT", "UB1", "Comment", "", "", "1", ""],
                 ["TEXT", "UB1", "Designator", 11000, 10050, "0", 0],
                 # a bundle created in the same call is found by its designator
+                ["TEXT", "DES:B2", "Comment", 9500, 10000, "1", 0],
+                ["TEXT", "DES:B2", "Description", 9500, 10000, "1", 0],
                 ["TEXT", "DES:B2", "designator", 15000, 10050, "", 0],
             ],
         )

@@ -3110,7 +3110,9 @@ async def add_harness_wiring(
             colours and font stay), new corners x1, y1, x2, y2 (move / resize) and any
             style field of notes, e.g. [{"unique_id": "KIPAZCBM", "text": "Done"}].
         move_objects (list): Move notes, frames, pictures, texts and text frames by
-            unique_id, e.g. [{"unique_id": "2563fb3b-...", "offset": [500, 0]}] (mils).
+            unique_id, e.g. [{"unique_id": "2563fb3b-...", "offset": [500, 0]}] (mils), or
+            place a picture, frame, note or text frame at new corners (moved and resized):
+            [{"unique_id": ..., "rect": [x1, y1, x2, y2]}] (keep a picture's aspect ratio).
             Connectors move with connectors, wires with reroutes.
         net_labels (list): Deprecated alias of labels.
         wire_updates (list): Parameters to upsert on existing wires, and names of parameters
@@ -3795,7 +3797,8 @@ async def edit_harness_layout(
       note_updates: [{"unique_id", "text"?, "x1".."y2"?, <style>}] change a note's text
         (size and style stay), move / resize it.
       move_objects: [{"unique_id", "offset": [dx, dy]}] move notes, pictures, frames,
-        texts (mils).
+        texts (mils); [{"unique_id", "rect": [x1, y1, x2, y2]}] places a picture, frame,
+        note or text frame at new corners (moved and resized; keep a picture's aspect).
       copy_region: [{"region": [x1, y1, x2, y2], "offset": [dx, dy], "types": ["note",
         "picture"], "exclude": [unique ids], "replace_text": {"OLD": "NEW"}}] copy the
         graphics inside the region (all of note, picture, frame, text, text_frame unless
@@ -3817,8 +3820,10 @@ async def edit_harness_layout(
     default: the trunk fills width_mils, 8000) but stay >= min_bundle_mils (400), with the
     break symbol on bundles not drawn to scale; lane_spacing (700 mils); origin [x, y]
     (mils) of the root's connection point (default where it is). Connectors are turned by
-    quarter turns so their body lies beyond their connection point, and keep their texts
-    beside them; bundle designators / lengths go above / below their longest straight,
+    quarter turns so their body lies beyond their connection point; their designator goes
+    just above their view picture and the comment / shown parameters in rows below it
+    (connector_texts "around", default; "keep": each text keeps its place relative to the
+    body, turned with it); bundle designators / lengths go above / below their longest straight,
     point names above the point (place_texts: False keeps texts). Needs one tree (no
     loop); explicit connectors / connection_points / bundles entries of the same call
     override the computed ones. Notes and pictures near a connector

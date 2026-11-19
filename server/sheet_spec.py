@@ -88,7 +88,8 @@ def note_records(
 
     notes: [{x1, y1, x2, y2, text, style_from?, <style>}]; note_updates:
     [{unique_id, text?, x1..y2?, <style>}]; move_objects: [{unique_id,
-    offset: [dx, dy]}] (or dx / dy)."""
+    offset: [dx, dy]}] (or dx / dy), or [{unique_id, rect: [x1, y1, x2, y2]}] to
+    place a picture, frame, note or text frame at new corners (resizing it)."""
     records: list[list[Any]] = []
     for n in notes or []:
         if not isinstance(n, dict) or not str(n.get("text", "")):
@@ -122,6 +123,16 @@ def note_records(
         )
     for m in moves or []:
         uid = str((m or {}).get("unique_id") or "").strip()
+        rect = m.get("rect")
+        if rect is not None:
+            # absolute corners: moves and resizes a picture, frame, note or text frame
+            if not uid or not isinstance(rect, (list, tuple)) or len(rect) != 4:
+                raise ValueError(
+                    f"move_objects entry with rect needs unique_id and rect [x1, y1, x2, y2] (mils): {m!r}"
+                )
+            box = corners(dict(zip(("x1", "y1", "x2", "y2"), rect)), "move_objects rect")
+            records.append(["MOVEOBJ", uid, 0, 0, *box])
+            continue
         offset = m.get("offset")
         if offset is None and ("dx" in m or "dy" in m):
             offset = [m.get("dx", 0), m.get("dy", 0)]

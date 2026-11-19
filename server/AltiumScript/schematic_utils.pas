@@ -3260,9 +3260,11 @@ begin
     Result := True;
 end;
 
-// MOVEOBJ|uid|dx|dy: move a note (2), frame (4), picture (11), text frame
-// (13) or text (22) the sheet owns by dx, dy mils. False (Misses names it)
-// for anything else: connectors move with CONNECTOR, wires with REROUTE.
+// MOVEOBJ|uid|dx|dy[|x1|y1|x2|y2]: move a note (2), frame (4), picture (11),
+// text frame (13) or text (22) the sheet owns by dx, dy mils; with corners
+// (not for a text), place it there instead (moved and resized). False
+// (Misses names it) for anything else: connectors move with CONNECTOR, wires
+// with REROUTE.
 function MoveSheetObject(Doc: ISch_Document; Rec: String; Misses: TStringList): Boolean;
 var
     Obj : ISch_GraphicalObject;
@@ -3277,8 +3279,19 @@ begin
         Misses.Add('move:' + SpecField(Rec, 1));
         Exit;
     end;
+    if (SpecField(Rec, 4) <> '') and (Id = 22) then
+    begin
+        Misses.Add('resize (a text has no corners):' + SpecField(Rec, 1));
+        Exit;
+    end;
     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_BeginModify, c_NoEventData);
-    Obj.MoveByXY(MilsToCoord(StrToInt(SpecField(Rec, 2))), MilsToCoord(StrToInt(SpecField(Rec, 3))));
+    if (SpecField(Rec, 4) <> '') then
+    begin
+        Obj.Location := Point(MilsToCoord(StrToInt(SpecField(Rec, 4))), MilsToCoord(StrToInt(SpecField(Rec, 5))));
+        Obj.Corner := Point(MilsToCoord(StrToInt(SpecField(Rec, 6))), MilsToCoord(StrToInt(SpecField(Rec, 7))));
+    end
+    else
+        Obj.MoveByXY(MilsToCoord(StrToInt(SpecField(Rec, 2))), MilsToCoord(StrToInt(SpecField(Rec, 3))));
     SchServer.RobotManager.SendMessage(Obj.I_ObjectAddress, c_BroadCast, SCHM_EndModify, c_NoEventData);
     Obj.GraphicallyInvalidate;
     Result := True;
