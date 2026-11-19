@@ -52,6 +52,7 @@ from altium_files import (
 from altium_install import find_altium_exe
 from dblib import color_to_tcolor, find_dblib, load_csv_table, load_dblib
 from exchange_lock import ExchangeLock
+from harness_flat_layout import FlatLayoutError, plan_flat_layout
 from harness_layout import (
     build_layout_spec,
     check_layout,
@@ -3683,6 +3684,7 @@ async def edit_harness_layout(
     move_objects: list | None = None,
     copy_region: list | None = None,
     merge_bundles: list | None = None,
+    flat_layout: dict | None = None,
 ) -> str:
     """
     Create, move, edit and delete objects on a Harness Layout Drawing (.LdrDoc): connectors
@@ -3806,6 +3808,21 @@ async def edit_harness_layout(
     second and the point are deleted; its length is the sum of both when either was set
     manually, else computed from the drawing; coverings on the second cover the first.
 
+    flat_layout: lay the whole bundle tree out as a flattened (formboard) harness and set
+    the physical lengths in the same call, e.g. {"root": "P1", "lengths": {"B1": 170.2,
+    "B2": 4.4}}. The trunk (the main bundle, most wires, from the root connector) is horizontal, root on
+    the left; every side branch leaves at 45 degrees and runs parallel to the trunk in a
+    lane of its own (branches never cross or overlap; they alternate above / below,
+    first_side "up" | "down"); drawn lengths follow the physical ones (scale mils per mm,
+    default: the trunk fills width_mils, 8000) but stay >= min_bundle_mils (400), with the
+    break symbol on bundles not drawn to scale; lane_spacing (700 mils); origin [x, y]
+    (mils) of the root's connection point (default where it is). Connectors are turned by
+    quarter turns so their body lies beyond their connection point, and keep their texts
+    beside them; bundle designators / lengths go above / below their longest straight,
+    point names above the point (place_texts: False keeps texts). Needs one tree (no
+    loop); explicit connectors / connection_points / bundles entries of the same call
+    override the computed ones. Notes and pictures near a connector
+    move with their nearest connector (attach_mils, default 6000; 0 = none). The result's "flat_layout" reports trunk, scale and extent.
     Not supported (Altium's script interface has no setter): wire length offsets
     ("Offset Length", calculated type), user-defined wire lengths and manual wire paths.
     get_harness_data reports all of them once set in Altium (length_type, length_offset,
@@ -3822,8 +3839,16 @@ async def edit_harness_layout(
         return json.dumps(
             {"success": False, "error": f"not an existing .LdrDoc: {doc_path}"}
         )
+    flat_report = None
     try:
         layout = parse_ldrdoc(doc_path)
+        if flat_layout:
+            plan = plan_flat_layout(layout, flat_layout)
+            flat_report = plan["report"]
+            connectors = _merge_items(plan["connectors"], connectors)
+            connection_points = _merge_items(plan["connection_points"], connection_points)
+            bundles = _merge_items(plan["bundles"], bundles)
+            move_objects = (plan.get("move_objects") or []) + list(move_objects or [])
         spec = build_layout_spec(
             layout,
             connectors=connectors,
@@ -3839,6 +3864,8 @@ async def edit_harness_layout(
             copy_region=copy_region,
             merge_bundles=merge_bundles,
         )
+    except FlatLayoutError as e:
+        return json.dumps({"success": False, "error": f"flat_layout: {e}"})
     except (KeyError, TypeError, ValueError, IndexError) as e:
         return json.dumps({"success": False, "error": f"invalid request: {e!r}"})
     if spec["errors"]:
@@ -3863,6 +3890,7 @@ async def edit_harness_layout(
                 "records": lines,
                 "warnings": spec["warnings"],
                 "expect": spec["expect"],
+                **({"flat_layout": flat_report} if flat_report else {}),
             },
             indent=2,
         )
@@ -3926,6 +3954,8 @@ async def edit_harness_layout(
         )
     if spec["warnings"]:
         result["warnings"] = spec["warnings"]
+    if flat_report:
+        result["flat_layout"] = flat_report
     if result.get("saved"):
         try:
             after = parse_ldrdoc(doc_path)
@@ -3945,6 +3975,23 @@ async def edit_harness_layout(
                 result["problems"] = problems
                 result["success"] = False
     return json.dumps(result, indent=2)
+
+
+def _merge_items(computed: list, given: list | None) -> list:
+    """computed entries with the given ones merged over them (same designator / unique_id),
+    given entries for other objects appended."""
+    out = [dict(c) for c in computed]
+    for g in given or []:
+        key = g.get("designator") or g.get("unique_id")
+        hit = next((c for c in out if key and key in (c.get("designator"), c.get("unique_id"))), None)
+        if hit is None:
+            out.append(g)
+        else:
+            texts = {**(hit.get("texts") or {}), **(g.get("texts") or {})}
+            hit.update(g)
+            if texts:
+                hit["texts"] = texts
+    return out
 
 
 @_tool()
@@ -9144,6 +9191,11 @@ async def get_harness_data(
                     for w in data["wires"]
                     if {w["end1"].split(".")[0], w["end2"].split(".")[0]} & wanted
                 ]
+            if expected_lengths:
+                # on the full wire records: the summary below drops each wire's length
+                data["length_check"] = check_wire_lengths(
+                    data, expected_lengths, length_tolerance_mm
+                )
             if summary_only:
                 for c in data["connectors"]:
                     c.pop("views", None)
@@ -9153,6 +9205,8 @@ async def get_harness_data(
                         "end1": w["end1"],
                         "end2": w["end2"],
                         "routed_length": w["routed_length"],
+                        "length": w.get("length"),
+                        "length_type": w.get("length_type"),
                     }
                     for w in data["wires"]
                 ]
@@ -9217,13 +9271,9 @@ async def get_harness_data(
                     "error": f"Unsupported file type '{p.suffix}'. Expected .WirDoc, .LdrDoc, or .PrjHar"
                 }
             )
-        if expected_lengths:
-            if p.suffix.lower() != ".ldrdoc":
-                return json.dumps(
-                    {"error": "expected_lengths needs a layout drawing (.LdrDoc)"}
-                )
-            data["length_check"] = check_wire_lengths(
-                data, expected_lengths, length_tolerance_mm
+        if expected_lengths and p.suffix.lower() != ".ldrdoc":
+            return json.dumps(
+                {"error": "expected_lengths needs a layout drawing (.LdrDoc)"}
             )
         data["units"] = {
             "locations": "DXP units (1 = 10 mils): x 10 for write tools and zooms",

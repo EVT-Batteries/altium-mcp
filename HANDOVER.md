@@ -47,6 +47,30 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 28 (2026-11-18): flattened harness layout (uncommitted)
+
+- **`edit_harness_layout(flat_layout={...})`** (`server/harness_flat_layout.py`, pure geometry,
+  tests in `server/tests/test_harness_flat_layout.py`): lays a layout drawing's bundle tree out
+  as a formboard harness from its own topology and sets the physical lengths in the same call.
+  Trunk = from the root connector along the bundle with the most wires at each node (ties: the
+  longer way), horizontal; every side branch leaves at 45 deg and runs parallel to the trunk in
+  a lane of its own (the branch nearest the trunk end takes the innermost lane, a branch with
+  branches reserves their lanes outward), branches alternate above / below; drawn lengths
+  follow the physical ones but never below `min_bundle_mils`, break symbol where not to scale;
+  connectors turned by quarter turns so their body continues the bundle (the body offset from
+  the connection point is rotated toward the outward direction); bundle name / length above /
+  below the longest straight, point names a row higher and staggered when neighbours touch;
+  notes and pictures within `attach_mils` of a connector move with their nearest connector.
+  The plan is merged under the call's explicit entries, so anything can still be placed by hand.
+  Written for a real harness after a 3D-projected (CAD) flatten drew per-cavity fan legs as
+  crossing lines, branches leaving within 15 deg on top of each other and no connectors.
+- Live (a 4-connector, 5-bundle harness): 4 connectors moved and turned, 5 bundles redrawn
+  with lengths, 16 fixed wire lengths, 24 texts, graphics moved; read back clean
+  (`problems` none, no unrouted wire), `length_check` 16 / 16.
+- Fixed: `get_harness_data(summary_only=True, expected_lengths=...)` checked the slimmed wire
+  records (no lengths) and reported every wire unrouted; the check now runs on the full records
+  and the summary keeps `length` / `length_type`.
+
 ### Session 27 (2026-11-14): length checks and lighter reads (uncommitted)
 
 From §8 item 10 (carrying cut lengths from a 3D model into a layout):
