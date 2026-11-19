@@ -128,6 +128,61 @@ def read_connection_point_streams(
     return result
 
 
+def read_image_contents(file_path: Path | str) -> dict[str, tuple[float, float]]:
+    """Visible extent of each embedded image (the 'Storage' stream), keyed by its FileName:
+    (half width, half height) of the non-background part around the image centre, as
+    fractions of the image (0.5 = reaches the edge). Altium renders a connector's physical
+    view into a square bitmap with a plain background around the part; this is how much of
+    the view's box the part really takes.
+
+    The stream is a record header, then per image: 0xD0, a length byte, the name (FileName,
+    or FileName|Orientation=... for a turned copy), an int32 size and that many bytes of zlib
+    holding a BMP."""
+    try:
+        with olefile.OleFileIO(str(file_path)) as ole:
+            if not ole.exists("Storage"):
+                return {}
+            data = ole.openstream("Storage").read()
+    except OSError:
+        return {}
+    return image_extents(data)
+
+
+def image_extents(data: bytes) -> dict[str, tuple[float, float]]:
+    """read_image_contents on the bytes of a 'Storage' stream"""
+    out: dict[str, tuple[float, float]] = {}
+    i = 0
+    while True:
+        i = data.find(bytes([0xD0]), i)
+        if i < 0 or i + 2 >= len(data):
+            break
+        n = data[i + 1]
+        j = i + 2 + n
+        if j + 6 > len(data) or data[j + 4:j + 5] != b"x":
+            i += 1
+            continue
+        (size,) = struct.unpack_from("<i", data, j)
+        name = data[i + 2:j].decode("latin-1")
+        blob = data[j + 4:j + 4 + size]
+        i = j + 4 + max(size, 0)
+        key = name.split("|", 1)[0]
+        if "|" in name or key in out:
+            continue
+        try:
+            from PIL import Image, ImageChops
+            import io
+            im = Image.open(io.BytesIO(zlib.decompress(blob))).convert("RGB")
+        except Exception:  # not an image we can read: no content box
+            continue
+        w, h = im.size
+        bg = Image.new("RGB", im.size, im.getpixel((0, 0)))
+        box = ImageChops.difference(im, bg).convert("L").point(lambda v: 255 if v > 12 else 0).getbbox()
+        if not box or w <= 0 or h <= 0:
+            continue
+        out[key] = (max(w / 2 - box[0], box[2] - w / 2) / w, max(h / 2 - box[1], box[3] - h / 2) / h)
+    return out
+
+
 def _points(props: dict[str, str]) -> list[float]:
     pts: list[float] = []
     for i in range(1, int(props.get("LocationCount", 0) or 0) + 1):
@@ -167,6 +222,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     raw = extract_ole_records(file_path, "FileHeader")
     records = raw[1:]
     cp_objects = read_connection_point_streams(file_path)
+    image_contents: dict[str, tuple[float, float]] | None = None
 
     connectors: dict[int, dict[str, Any]] = {}
     pins: dict[str, dict[str, Any]] = {}  # pin uid -> pin
@@ -314,6 +370,15 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "x2": _coord(props, "Corner.X"),
                 "y2": _coord(props, "Corner.Y"),
             }
+            if image_contents is None:
+                image_contents = read_image_contents(file_path)
+            ext = image_contents.get(props.get("FileName", ""))
+            if ext:
+                # the visible part, about the box centre (DXP units): half width / height,
+                # turned with the picture's own orientation (quarter turns)
+                hx, hy = ext if int(props.get("Orientation", 0) or 0) % 2 == 0 else ext[::-1]
+                im = image_views[int(props["OwnerIndex"])]["image"]
+                im["content_half"] = [round(hx * abs(im["x2"] - im["x1"]), 3), round(hy * abs(im["y2"] - im["y1"]), 3)]
         elif rtype in ("34", "41") and owned:
             owner = int(props["OwnerIndex"])
             name, val = props.get("Name", ""), _text(props, "Text")

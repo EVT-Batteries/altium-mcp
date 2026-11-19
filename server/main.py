@@ -3813,21 +3813,34 @@ async def edit_harness_layout(
 
     flat_layout: lay the whole bundle tree out as a flattened (formboard) harness and set
     the physical lengths in the same call, e.g. {"root": "P1", "lengths": {"B1": 170.2,
-    "B2": 4.4}}. The trunk (the main bundle, most wires, from the root connector) is horizontal, root on
-    the left; every side branch leaves at 45 degrees and runs parallel to the trunk in a
-    lane of its own (branches never cross or overlap; they alternate above / below,
-    first_side "up" | "down"); drawn lengths follow the physical ones (scale mils per mm,
-    default: the trunk fills width_mils, 8000) but stay >= min_bundle_mils (400), with the
-    break symbol on bundles not drawn to scale; lane_spacing (700 mils); origin [x, y]
-    (mils) of the root's connection point (default where it is). Connectors are turned by
-    quarter turns so their body lies beyond their connection point; their designator goes
-    just above their view picture and the comment / shown parameters in rows below it
-    (connector_texts "around", default; "keep": each text keeps its place relative to the
-    body, turned with it); bundle designators / lengths go above / below their longest straight,
-    point names above the point (place_texts: False keeps texts). Needs one tree (no
-    loop); explicit connectors / connection_points / bundles entries of the same call
-    override the computed ones. Notes and pictures near a connector
-    move with their nearest connector (attach_mils, default 6000; 0 = none). The result's "flat_layout" reports trunk, scale and extent.
+    "B2": 4.4}}. The trunk (from the root connector along the bundle with the most wires;
+    ties: the shorter bundle, as a branch is drawn with its bend) is horizontal, root on the
+    left. Every side branch leaves at 45 degrees and runs parallel to the trunk at the
+    nearest offset clear of everything placed before it (bundles, connector pictures, their
+    texts): branches never cross or overlap, alternate above / below (first_side "up" |
+    "down"), are placed together with their own branches, and turn steeper (60 - 90 degrees)
+    when a 45 degree bend is blocked. Drawn lengths follow the physical ones at one scale
+    (mils per mm; default: the trunk fills width_mils, 8000), a branch's bend included, but
+    stay >= min_bundle_mils (400), with the break symbol on bundles not drawn to scale.
+    lane_spacing (400 mils): least offset between two runs side by side; clearance_mils
+    (100) around pictures and texts; min_tail_mils (300): straight end after a branch's
+    bend; origin [x, y] (mils) of the root's connection point (default where it is).
+    A connector picture counts by the part it shows (the stored view bitmap's non-background
+    extent, get_harness_data views[].image.content_half), not its whole square.
+    Connectors are turned by quarter turns so their body lies beyond their connection point;
+    their designator goes just above their view picture and the comment / shown parameters
+    in rows below it (connector_texts "around", default; "keep": each text keeps its place
+    relative to the body, turned with it). Each bundle's designator and length go as a pair
+    (designator above, length below) at the first clear place along it (its longest
+    straight's middle, then towards its ends, then beside a slanted part); point names
+    beside the point, above first (sizes estimated: text_char_mils 60, text_height_mils 100;
+    place_texts: False keeps texts). Needs one tree (no loop); explicit connectors /
+    connection_points / bundles entries of the same call override the computed ones. Notes
+    and pictures within attach_mils (default 6000; 0 = none) of a connector's picture or a
+    free wire end move with the nearest one, biggest first, then are pushed clear of
+    bundles, pictures, texts and each other by the shortest move (graphics_pushed). The
+    result's "flat_layout" reports trunk, scale, extent and branches_not_clear (branches that
+    found no clear lane; placed at their farthest try).
     Not supported (Altium's script interface has no setter): wire length offsets
     ("Offset Length", calculated type), user-defined wire lengths and manual wire paths.
     get_harness_data reports all of them once set in Altium (length_type, length_offset,

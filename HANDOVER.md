@@ -47,7 +47,37 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
-### Session 29 (2026-11-18/19): flat layout on five more harnesses, picture resize (uncommitted)
+### Session 30 (2026-11-19): flat layout in proportion, lanes by collision, labels placed clear (uncommitted)
+
+User review of the flattened layouts: a 19 mm branch drawn as long as (or longer than) a
+467 mm trunk bundle, equal legs drawn unequal, bundle labels on top of point names.
+
+- **Cause**: a branch was drawn as a full lane diagonal (lane_number x lane_spacing x sqrt 2)
+  PLUS its scaled length, and lane_spacing had to be ~2400 because a connector picture was
+  counted as its whole 50 mm square. Labels went to the middle of the longest straight, which
+  on a branch is its short end next to the connector.
+- **Placement rewrite** (`harness_flat_layout.py`): the trunk, then each side branch (innermost
+  first) at the nearest offset clear of everything placed (bundle segments, connector picture
+  and text boxes; runs side by side keep lane_spacing, default 400); the bend counts toward
+  the drawn length (tail = drawn - bend, min_tail_mils 300); a branch is placed with its own
+  branches and moves out when they find no room (rollback); a bend blocked at every offset
+  turns steeper (60, 75, 90). Ties on wire count: the shorter bundle continues the run (a
+  branch always carries its bend). Report `branches_not_clear`.
+- **Visible picture part**: `harness_layout.read_image_contents` / `image_extents` decode the
+  'Storage' stream (0xD0, name length, FileName, int32 size, zlib BMP) and measure the
+  non-background extent about the centre; `parse_ldrdoc` adds `image.content_half` (DXP, turned
+  with the image record's Orientation); `_view_box` uses it. A DTM plug fills 84 x 37 % of its
+  square.
+- **Texts**: each bundle's designator / length pair at the first clear spot (longest straight's
+  middle, then towards its ends, then beside a slanted part); point names beside the point
+  (8 spots, above first); sizes estimated (60 mil / char, 100 mil high).
+- **Graphics**: anchored to the connector whose picture is nearest (box distance, was centre to
+  location: a note beside J2 went to J1), placed biggest first, pushed the shortest of four ways.
+- Tests: 488 pass, 4 new (equal legs drawn equal, short branch shorter, labels clear, image extents).
+- Applied to six real layouts through the dev entry point; re-planning the saved files moves
+  nothing.
+
+### Session 29 (2026-11-18/19): flat layout on five more harnesses, picture resize (committed `cea74d0`)
 
 - `flat_layout` connector texts: `connector_texts` "around" (default) puts the designator just
   above the connector's main view picture and the comment / shown parameters in rows below it

@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from harness_flat_layout import FlatLayoutError, plan_flat_layout, segments_cross  # noqa: E402
+from harness_flat_layout import FlatLayoutError, _seg_hits_box, plan_flat_layout, segments_cross  # noqa: E402
 
 
 def _cp(des, x, y):
@@ -52,7 +52,8 @@ def _segments(plan):
 def test_trunk_is_horizontal_from_the_root():
     plan = plan_flat_layout(_layout(), {"root": "P1", "width_mils": 6000})
     rep = plan["report"]
-    assert rep["trunk"] == ["CP_P1", "CPA", "CPB", "CP_J2"]   # B2 carries 12 wires, B3 4
+    # B2 carries 12 wires, B3 4; at CPB B4 and B5 tie on wires: the shorter B4 continues
+    assert rep["trunk"] == ["CP_P1", "CPA", "CPB", "CP_J1"]
     b1 = next(b for b in plan["bundles"] if b["designator"] == "B1")
     assert b1["points"][1] == b1["points"][3] == 1000          # root at its place, trunk at y = 1000
     assert b1["points"][0] == 1000 and b1["points"][2] > 1000
@@ -86,13 +87,58 @@ def test_branches_alternate_and_take_lanes():
     pos = {c["designator"]: (c["x"], c["y"]) for c in plan["connection_points"] if "x" in c}
     pos |= {c["designator"]: (c["connection_point"]["x"], c["connection_point"]["y"]) for c in plan["connectors"]}
     y0 = pos["P1"][1]
-    above = [d for d in ("J1", "P6") if pos[d][1] > y0]
-    below = [d for d in ("J1", "P6") if pos[d][1] < y0]
+    above = [d for d in ("J2", "P6") if pos[d][1] > y0]
+    below = [d for d in ("J2", "P6") if pos[d][1] < y0]
     assert len(above) == 1 and len(below) == 1                  # one branch on each side
-    # on the branch through CPC the run continues to P7 (tie on wires: the longer way) and P6
-    # leaves it outward, one lane further out
-    assert pos["P7"][1] == pos["CPC"][1]
-    assert abs(pos["P6"][1] - y0) > abs(pos["CPC"][1] - y0)
+    # on the branch through CPC the run continues to P6 (tie on wires: the shorter bundle) and
+    # P7 leaves it outward, one lane further out
+    assert pos["P6"][1] == pos["CPC"][1]
+    assert abs(pos["P7"][1] - y0) > abs(pos["CPC"][1] - y0)
+
+
+def _drawn(plan, name):
+    b = next(b for b in plan["bundles"] if b.get("designator") == name)
+    p = list(zip(b["points"][0::2], b["points"][1::2]))
+    return sum(math.dist(p[i], p[i + 1]) for i in range(len(p) - 1))
+
+
+def _y_layout(leg1, leg2, trunk=175):
+    """J1 - B1 - CP1, then two legs B2 (to CP2, the trunk end) and B3 (to CP3), free ends"""
+    cps = [_cp("CP_J1", 100, 100), _cp("CP1", 200, 100), _cp("CP2", 300, 100), _cp("CP3", 300, 150)]
+    return {"connection_points": cps, "connectors": [_conn("J1", "CP_J1", 90, 100)],
+            "bundles": [_bundle("B1", "CP_J1", "CP1", trunk, ["W1", "W2"]),
+                        _bundle("B2", "CP1", "CP2", leg1, ["W1"]), _bundle("B3", "CP1", "CP3", leg2, ["W2"])]}
+
+
+def test_branch_drawn_length_counts_its_bend():
+    """two equal legs are drawn equal, the slanted one included"""
+    plan = plan_flat_layout(_y_layout(19.1, 19.1), {"root": "J1", "width_mils": 6000, "min_bundle_mils": 1000})
+    assert abs(_drawn(plan, "B2") - _drawn(plan, "B3")) < 2
+    assert "branches_not_clear" not in plan["report"]
+
+
+def test_short_branch_drawn_shorter_than_the_trunk_it_leaves():
+    plan = plan_flat_layout(_y_layout(467, 28, 1616), {"root": "J1", "width_mils": 8000, "min_bundle_mils": 300})
+    assert _drawn(plan, "B3") < _drawn(plan, "B2") / 2
+
+
+def test_bundle_texts_clear_of_bundles_and_each_other():
+    lay = _layout()
+    mm = {b["designator"]: b["length"]["mm"] for b in lay["bundles"]}
+    plan = plan_flat_layout(lay, {"root": "P1"})
+    boxes = []
+    for b in plan["bundles"]:
+        for name, t in b["texts"].items():
+            w = 60 * len(b["designator"] if name == "designator" else f"{mm[b['designator']]:.2f}mm")
+            x = t["x"] - (w / 2 if "center" in t["justification"] else w if t["justification"].endswith("right") else 0)
+            y = t["y"] - (100 if t["justification"].startswith("top") else 0)
+            boxes.append((b["designator"], (x, y, x + w, y + 100)))
+    for (n1, r1), (n2, r2) in itertools.combinations(boxes, 2):
+        assert not (r1[0] < r2[2] and r2[0] < r1[2] and r1[1] < r2[3] and r2[1] < r1[3]), (n1, n2)
+    for name, r in boxes:
+        for n2, a, b in _segments(plan):
+            if n2 != name:
+                assert not _seg_hits_box(*a, *b, *r), (name, n2)
 
 
 def test_connectors_face_outward():
@@ -179,7 +225,8 @@ def test_graphics_move_as_groups_and_clear_the_bundles():
             assert hi < big[1] or lo > big[3], (name, a, b, big)
     pushed = plan["report"]["graphics_pushed"]
     assert pushed[0]["graphics"] == ["BIG", "INSET"] and pushed[0]["connector"] == "J2"
-    assert pushed[0]["pushed_mils"] < 0          # centre below the point: pushed down
+    # centre below the point: pushed down, or outward (J2 faces right), the shorter move
+    assert (pushed[0]["way"], pushed[0]["pushed_mils"] > 0) in (("down", False), ("right", True))
 
 
 def test_length_check_sees_lengths_with_summary_only(tmp_path):
@@ -200,3 +247,34 @@ def test_length_check_sees_lengths_with_summary_only(tmp_path):
         out = json.loads(asyncio.run(main.get_harness_data(None, str(doc), summary_only=True,
                                                            expected_lengths={"W1": 120.0})))
     assert out["length_check"]["matched"] == 1 and out["length_check"]["ok"], out["length_check"]
+
+
+def test_view_picture_counts_by_the_part_it_shows():
+    """the stored view bitmap's non-background extent gives the picture's real size"""
+    import io
+    import struct
+    import zlib
+
+    from PIL import Image
+
+    from harness_layout import image_extents
+
+    im = Image.new("RGB", (100, 100), (255, 255, 255))
+    for x in range(20, 80):
+        for y in range(40, 60):
+            im.putpixel((x, y), (40, 40, 40))
+    buf = io.BytesIO()
+    im.save(buf, format="BMP")
+    blob = zlib.compress(buf.getvalue())
+    head = b"\x1e\x00\x00\x00|HEADER=Icon storage|Weight=1\x00"
+    entry = lambda name: bytes([0xD0, len(name)]) + name + struct.pack("<i", len(blob)) + blob  # noqa: E731
+    ext = image_extents(head + entry(b"ABCDEFGH") + entry(b"ABCDEFGH|Orientation=90 Degrees"))
+    assert ext == {"ABCDEFGH": (0.3, 0.1)}
+    lay = _layout()
+    j2 = next(c for c in lay["connectors"] if c["designator"] == "J2")
+    j2["views"] = [{"main": True, "hidden": False,
+                    "image": {"x1": 300, "y1": 70, "x2": 360, "y2": 130, "content_half": [18, 6]}}]
+    plan = plan_flat_layout(lay, {"root": "P1"})
+    c = next(c for c in plan["connectors"] if c["designator"] == "J2")
+    # the designator sits just above the part (6 DXP = 60 mils above the centre), not the square
+    assert c["texts"]["designator"]["y"] == c["y"] + 60 + 50

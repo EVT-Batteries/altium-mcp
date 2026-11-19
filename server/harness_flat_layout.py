@@ -4,21 +4,26 @@ The physical harness is a tree: connection points joined by bundles. This module
 the way a harness is drawn on a formboard, without the glitches of a 3D-projected flatten:
 
 - the trunk (from the root connector along the bundle with the most wires at each node,
-  ties: the longer way) is horizontal,
+  ties: the shorter bundle, since a branch is drawn with its bend) is horizontal,
   root connector on the left facing left, every other connector on the right facing right;
-- every side branch leaves its node at 45 degrees and turns parallel to the trunk, each in a
-  lane of its own (lane_spacing apart), so branches never cross or lie on top of each other:
-  on each side the branch nearest the trunk end takes the innermost lane, and a branch with
-  branches of its own reserves the lanes they need, outward of its own run;
+- every side branch leaves its node at 45 degrees and turns parallel to the trunk at the
+  nearest offset that is clear of everything placed before it (bundles, connector pictures
+  and their texts), so branches never cross or lie on top of each other: on each side the
+  branch nearest the trunk end is placed first (innermost), a branch is placed together with
+  its own branches (it moves out when they find no room), and a bend that is blocked
+  whatever the offset turns steeper (60, 75, 90 degrees);
 - branches alternate above / below the trunk (first_side), node by node;
-- drawn lengths follow the physical lengths (scale) but never fall below min_bundle_mils, so
-  a 4 mm bundle between two breakouts stays readable; the length text carries the true value
-  and the break symbol marks a bundle not drawn to scale;
+- drawn lengths follow the physical lengths (one scale; a branch's slanted part counts) but
+  never fall below min_bundle_mils, so a 4 mm bundle between two breakouts stays readable;
+  the length text carries the true value and the break symbol marks a bundle not drawn to
+  scale;
 - each connector is turned (quarter turns) so that its body lies beyond its connection point,
   continuing the bundle, and moved with it; its texts move and turn with it (each keeps its
   place relative to the body, upright);
-- bundle designator above and length below the middle of its longest straight, connection
-  point names above the point.
+- bundle designator and length as a pair (designator above, length below the bundle) at the
+  first clear place along it: the middle of its longest straight, then towards its ends,
+  then beside a slanted part; connection point names beside the point (above first); texts
+  keep clear of bundles, connector pictures and each other (sizes estimated from the text).
 
 plan_flat_layout returns connectors / connection_points / bundles entries in
 edit_harness_layout's request format (mils, degrees); the caller merges explicit entries over
@@ -46,7 +51,8 @@ class FlatLayoutError(ValueError):
 
 def _view_box(conn: dict[str, Any], k: int, nx: float, ny: float) -> tuple[float, float, float, float] | None:
     """the connector's main view picture (mils) after turning it k quarter turns about its
-    location and moving the location to (nx, ny); None without a picture"""
+    location and moving the location to (nx, ny): the part it shows (image content_half)
+    when known, else the whole picture; None without a picture"""
     views = conn.get("views") or []
     v = next((v for v in views if v.get("main") and not v.get("hidden") and v.get("image")), None)
     v = v or next((v for v in views if not v.get("hidden") and v.get("image")), None)
@@ -54,7 +60,13 @@ def _view_box(conn: dict[str, Any], k: int, nx: float, ny: float) -> tuple[float
         return None
     cx, cy = _mils(conn["location"])
     im = v["image"]
-    corners = [_rot(px * 10.0 - cx, py * 10.0 - cy, k) for px in (im["x1"], im["x2"]) for py in (im["y1"], im["y2"])]
+    xs0, ys0 = (im["x1"], im["x2"]), (im["y1"], im["y2"])
+    if im.get("content_half"):
+        # only the part of the picture the part takes (the rest is plain background)
+        mx, my = sum(xs0) / 2, sum(ys0) / 2
+        hx, hy = im["content_half"]
+        xs0, ys0 = (mx - hx, mx + hx), (my - hy, my + hy)
+    corners = [_rot(px * 10.0 - cx, py * 10.0 - cy, k) for px in xs0 for py in ys0]
     xs = [nx + p[0] for p in corners]
     ys = [ny + p[1] for p in corners]
     return min(xs), min(ys), max(xs), max(ys)
@@ -64,18 +76,30 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     """options: root (connector designator), lengths ({bundle: mm}, applied as length_mm),
     origin ([x, y] mils of the root connection point, default its current place),
     scale (mils per mm, default: the trunk fills width_mils), width_mils (default 8000),
-    min_bundle_mils (400), lane_spacing (700), first_side ('up' | 'down'), place_texts (True),
+    min_bundle_mils (400), first_side ('up' | 'down'), place_texts (True),
+    lane_spacing (400: the least offset of a branch's run from the run it leaves, and between
+    two runs side by side), clearance_mils (100: between a run and connector pictures / texts),
+    min_tail_mils (300: the straight end of a branch after its bend), lane_step_mils (100) and
+    lane_steps (60: how far out a branch looks for a clear lane, per bend angle),
+    text_char_mils (60) / text_height_mils (100): the text size estimate, text_clearance_mils (30),
     connector_texts ('around': designator above the connector's main view picture, comment and
     shown parameters in rows below it (text_gap_mils 50, text_row_mils 130); 'keep': each text
     keeps its place relative to the body, turned with the connector; a connector without a
     view picture always keeps),
-    attach_mils (6000: notes / pictures whose centre lies within it of a connector move with its
-    nearest connector; 0 = none),
+    attach_mils (6000: notes / pictures lying within it of a connector's picture or a free wire
+    end move with the nearest one; 0 = none),
     break_symbols (True: on bundles whose drawn length differs from the physical one by > 2 %)."""
     o = dict(options or {})
     lengths_in = {str(k): float(v) for k, v in (o.get("lengths") or {}).items()}
     min_draw = float(o.get("min_bundle_mils", 400))
-    lane = float(o.get("lane_spacing", 700))
+    lane = float(o.get("lane_spacing", 400))
+    min_tail = float(o.get("min_tail_mils", 300))
+    run_clear = float(o.get("clearance_mils", 100))
+    step = float(o.get("lane_step_mils", 100))
+    steps = int(o.get("lane_steps", 60))
+    char_w = float(o.get("text_char_mils", 60))
+    text_h = float(o.get("text_height_mils", 100))
+    text_clear = float(o.get("text_clearance_mils", 30))
     first_up = str(o.get("first_side", "up")).lower() != "down"
     place_texts = bool(o.get("place_texts", True))
     conn_texts = str(o.get("connector_texts", "around")).lower()
@@ -146,31 +170,16 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
 
     def chain(n: str) -> list[tuple[str, str]]:
         """the run continuing from n: (node, bundle) steps along the bundle with the most wires
-        (the main bundle; ties: the longer way)"""
+        (the main bundle; ties: the shorter bundle, as a branch's bend makes it longer)"""
         out = []
         while children.get(n):
-            m, e = max(children[n], key=lambda me: (nwires[me[1]], phys[me[1]] + far[me[0]], me[0]))
+            m, e = max(children[n], key=lambda me: (nwires[me[1]], -phys[me[1]], me[0]))
             out.append((m, e))
             n = m
         return out
 
     def sides(n: str, cont: str | None) -> list[tuple[str, str]]:
         return [(m, e) for m, e in children.get(n, []) if m != cont]
-
-    lanes_cache: dict[str, int] = {}
-
-    def lanes_needed(n: str, first_edge_from: str | None = None) -> int:
-        """lanes a branch starting at node n (its run = chain(n)) needs beyond its own lane"""
-        if n in lanes_cache:
-            return lanes_cache[n]
-        total = 0
-        nodes = [n] + [m for m, _ in chain(n)]
-        for i, k in enumerate(nodes):
-            cont = nodes[i + 1] if i + 1 < len(nodes) else None
-            for m, _ in sides(k, cont):
-                total += 1 + lanes_needed(m)
-        lanes_cache[n] = total
-        return total
 
     # ---- scale
     trunk = chain(root)
@@ -188,75 +197,33 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     else:
         ox, oy = _mils(cps[root]["location"])
 
-    pos: dict[str, tuple[float, float]] = {root: (ox, oy)}
-    bundle_pts: dict[str, list[tuple[float, float]]] = {}
-    facing: dict[str, int] = {root: -1}          # +1 right, -1 left (connector bodies)
+    def text_box(x: float, y: float, just: str | None, w: float) -> tuple[float, float, float, float]:
+        j = (just or "bottom_left").lower()
+        v, hz = ("center", "center") if j == "center" else j.split("_", 1)
+        x1 = x if hz == "left" else x - w / 2 if hz == "center" else x - w
+        y1 = y if v == "bottom" else y - text_h / 2 if v == "center" else y - text_h
+        return x1, y1, x1 + w, y1 + text_h
 
-    def lay_run(start: str, x: float, y: float, outward: int, up_first: bool) -> None:
-        """lay the run of `start` (already placed at x, y) to the right; its side branches go
-        outward (+1 up / -1 down) when outward != 0, else alternate starting with up_first."""
-        nodes = [start] + [m for m, _ in chain(start)]
-        run = chain(start)
-        xs = [x]
-        for m, e in run:
-            xs.append(xs[-1] + drawn(e))
-        for (m, e), xm in zip(run, xs[1:]):
-            pos[m] = (xm, y)
-            bundle_pts[e] = [pos[parent[m][0]], (xm, y)]
-        # side branches: collect (node index, child) and assign sides / lanes
-        branches = []
-        flip = up_first
-        for i, k in enumerate(nodes):
-            cont = nodes[i + 1] if i + 1 < len(nodes) else None
-            for m, e in sorted(sides(k, cont), key=lambda me: -(phys[me[1]] + far[me[0]])):
-                s = outward if outward else (1 if flip else -1)
-                flip = not flip
-                branches.append((i, k, m, e, s))
-        for s in (1, -1):
-            used = 0
-            for i, k, m, e, ss in sorted((b for b in branches if b[4] == s), key=lambda b: -b[0]):
-                lane_no = used + 1
-                used += 1 + lanes_needed(m)
-                dy = s * lane_no * lane
-                kx, ky = pos[k]
-                bx, by = kx + abs(dy), ky + dy
-                run_len = max(min_draw, phys[e] * scale - abs(dy) * math.sqrt(2))
-                pos[m] = (bx + run_len, by)
-                bundle_pts[e] = [(kx, ky), (bx, by), pos[m]]
-                lay_run(m, pos[m][0], by, s, up_first)
+    def text_value(c: dict[str, Any], name: str) -> str:
+        n = name.lower()
+        if n == "designator":
+            return c["designator"]
+        if n == "comment":
+            return str(c.get("part_number") or c.get("comment") or "")
+        return str((c.get("parameters") or {}).get(name) or "") or "x" * 20
 
-    lay_run(root, ox, oy, 0, first_up)
-    for n in pos:
-        facing.setdefault(n, 1)
-
-    # ---- requests
-    # point names a row above the bundle texts (bundle name at +30); a name whose neighbour
-    # on the same line is closer than name_gap goes one row higher again
-    name_gap = float(o.get("name_gap_mils", 700))
-    name_y: dict[str, float] = {}
-    for n, (x, y) in sorted(pos.items(), key=lambda kv: (kv[1][1], kv[1][0])):
-        row = 0
-        for m, yy in name_y.items():
-            mx, my = pos[m]
-            if abs(my - y) < 1 and abs(mx - x) < name_gap and yy == y + 180 + 130 * row:
-                row += 1
-        name_y[n] = y + 180 + 130 * row
-    out_conns, out_cps, out_bundles = [], [], []
-    keep_out: list[tuple[float, float, float, float]] = []
-    for n, (x, y) in pos.items():
-        cp = cps.get(n)
-        entry: dict[str, Any] = {"designator": n, "x": round(x), "y": round(y)}
-        if place_texts and cp is not None and cp.get("show_name", True):
-            entry["texts"] = {"designator": {"x": round(x), "y": round(name_y[n]), "justification": "bottom_center"}}
+    def conn_place(n: str, x: float, y: float) -> tuple[dict[str, Any], list] | None:
+        """the request entry of the connector on node n with its connection point at (x, y),
+        and the boxes it takes (its picture and its texts, mils); None: no connector there"""
         d = conn_of_cp.get(n)
         if d is None:
-            out_cps.append(entry)
-            continue
+            return None
         c = conns[d]
+        cp = cps.get(n)
         cx0, cy0 = _mils(c["location"])
         px0, py0 = _mils(cp["location"]) if cp else (cx0, cy0)
         ox_, oy_ = cx0 - px0, cy0 - py0                   # body offset from the point, now
-        want = facing[n]
+        want = -1 if n == root else 1                      # the root faces left, the others right
         best = max(range(4), key=lambda k: (_rot(ox_, oy_, k)[0] * want, -k))
         rx, ry = _rot(ox_, oy_, best)
         nx, ny = x + rx, y + ry
@@ -266,40 +233,193 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             "connection_point": {"x": round(x), "y": round(y)},
         }
         vbox = _view_box(c, best, nx, ny)
+        shown = [(name, t) for name, t in (c.get("texts") or {}).items() if not t.get("hidden")]
+        boxes = [vbox] if vbox else [(min(x, nx) - 100, min(y, ny) - 100, max(x, nx) + 100, max(y, ny) + 100)]
+        tx: dict[str, Any] = {}
+        if vbox and conn_texts == "around":
+            # designator just above the connector's picture, the other shown texts (comment,
+            # parameters) in rows just below it, all left-aligned on the picture
+            bx1, by1, bx2, by2 = vbox
+            below = 0
+            for name, t in shown:
+                if name.lower() == "designator":
+                    tx["designator"] = {"x": round(bx1), "y": round(by2 + text_gap), "justification": "bottom_left"}
+                else:
+                    tx[name.lower()] = {"x": round(bx1), "y": round(by1 - text_gap - text_row * below), "justification": "top_left"}
+                    below += 1
+        else:
+            for name, t in shown:
+                # the text keeps its place relative to the body: it turns with the connector
+                tdx, tdy = _rot(t["x"] * 10.0 - cx0, t["y"] * 10.0 - cy0, best)
+                tx[name.lower()] = {"x": round(nx + tdx), "y": round(ny + tdy), "justification": t.get("justification", "bottom_left")}
+        for name, t in shown:
+            p = tx[name.lower()]
+            boxes.append(text_box(p["x"], p["y"], p["justification"], char_w * max(1, len(text_value(c, name)))))
+        if place_texts and tx:
+            ce["texts"] = tx
         if vbox:
-            # what graphics must keep clear of: the picture, and bands for its texts above
-            # (designator) and below (comment, parameters), a typical label width wide
-            n_below = sum(1 for nm, t in (c.get("texts") or {}).items() if not t.get("hidden") and nm.lower() != "designator")
-            keep_out.append(vbox)
-            keep_out.append((vbox[0], vbox[3], max(vbox[2], vbox[0] + 600), vbox[3] + text_gap + text_row))
-            if n_below:
-                keep_out.append((vbox[0], vbox[1] - text_gap - text_row * n_below - 40,
-                                 max(vbox[2], vbox[0] + 1500), vbox[1]))
-        if place_texts:
-            tx = {}
-            shown = [(name, t) for name, t in (c.get("texts") or {}).items() if not t.get("hidden")]
-            box = vbox if conn_texts == "around" else None
-            if box:
-                # designator just above the connector's picture, the other shown texts
-                # (comment, parameters) in rows just below it, all left-aligned on the picture
-                bx1, by1, bx2, by2 = box
-                below = 0
-                for name, t in shown:
-                    if name.lower() == "designator":
-                        tx["designator"] = {"x": round(bx1), "y": round(by2 + text_gap), "justification": "bottom_left"}
-                    else:
-                        tx[name.lower()] = {"x": round(bx1), "y": round(by1 - text_gap - text_row * below), "justification": "top_left"}
-                        below += 1
-            else:
-                for name, t in shown:
-                    # the text keeps its place relative to the body: it turns with the connector
-                    tdx, tdy = _rot(t["x"] * 10.0 - cx0, t["y"] * 10.0 - cy0, best)
-                    tx[name.lower()] = {"x": round(nx + tdx), "y": round(ny + tdy), "justification": t.get("justification", "bottom_left")}
-            if tx:
-                ce["texts"] = tx
-        out_conns.append(ce)
-        if place_texts and cp is not None:
-            out_cps.append({"designator": n, "texts": entry["texts"]} if "texts" in entry else {"designator": n})
+            ce["_picture"] = True
+        return ce, boxes
+
+    # ---- placement: the trunk, then each side branch in the first lane that is clear of all
+    # placed so far (bundles, connector pictures and texts); a nested branch is placed with
+    # its parent, so a parent that leaves no room for it moves out
+    pos: dict[str, tuple[float, float]] = {root: (ox, oy)}
+    bundle_pts: dict[str, list[tuple[float, float]]] = {}
+    # a connector's boxes carry its connection point: the bundles ending there may touch them
+    boxes: list[tuple[float, float, float, float, tuple[float, float]]] = []
+    segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    unclear: list[str] = []
+
+    def box_free(r: tuple, at: tuple) -> bool:
+        x1, y1, x2, y2 = r[0] - run_clear, r[1] - run_clear, r[2] + run_clear, r[3] + run_clear
+        if any(x1 < k[2] and k[0] < x2 and y1 < k[3] and k[1] < y2 for k in boxes):
+            return False
+        return not any(_seg_hits_box(a[0], a[1], b[0], b[1], x1, y1, x2, y2) for a, b in segs if at not in (a, b))
+
+    def seg_free(a: tuple, b: tuple) -> bool:
+        for k in boxes:
+            if k[4] in (a, b):
+                continue
+            if _seg_hits_box(a[0], a[1], b[0], b[1], k[0] - run_clear, k[1] - run_clear, k[2] + run_clear, k[3] + run_clear):
+                return False
+        for p, q in segs:
+            if {p, q} & {a, b}:
+                continue
+            if segments_cross(a, b, p, q):
+                return False
+            if a[1] == b[1] and p[1] == q[1] and abs(a[1] - p[1]) < lane \
+                    and min(a[0], b[0]) < max(p[0], q[0]) and min(p[0], q[0]) < max(a[0], b[0]):
+                return False                                    # two runs side by side
+        return True
+
+    def add_conn(n: str) -> bool:
+        g = conn_place(n, *pos[n])
+        if g is None:
+            return True
+        ok = all(box_free(b, pos[n]) for b in g[1])
+        boxes.extend((*b, pos[n]) for b in g[1])
+        return ok
+
+    def snapshot():
+        return len(boxes), len(segs), set(pos), set(bundle_pts), len(unclear)
+
+    def rollback(s) -> None:
+        del boxes[s[0]:]
+        del segs[s[1]:]
+        del unclear[s[4]:]
+        for k in set(pos) - s[2]:
+            del pos[k]
+        for k in set(bundle_pts) - s[3]:
+            del bundle_pts[k]
+
+    def lay_run(start: str, x: float, y: float, outward: int, up_first: bool) -> bool:
+        """lay the run of `start` (already placed at x, y) to the right, then its side
+        branches: outward (+1 up / -1 down) when outward != 0, else alternating starting with
+        up_first. False when part of it is not clear."""
+        run = chain(start)
+        nodes = [start] + [m for m, _ in run]
+        ok = True
+        xx = x
+        for m, e in run:
+            a = pos[parent[m][0]]
+            xx += drawn(e)
+            pos[m] = (xx, y)
+            ok = seg_free(a, pos[m]) and ok
+            segs.append((a, pos[m]))
+            bundle_pts[e] = [a, pos[m]]
+        for m, _ in run:
+            ok = add_conn(m) and ok
+        branches = []
+        flip = up_first
+        for i, k in enumerate(nodes):
+            cont = nodes[i + 1] if i + 1 < len(nodes) else None
+            for m, e in sorted(sides(k, cont), key=lambda me: -(phys[me[1]] + far[me[0]])):
+                s = outward if outward else (1 if flip else -1)
+                flip = not flip
+                branches.append((i, k, m, e, s))
+        # on each side the branch nearest the run's end first: it takes the innermost lane
+        for i, k, m, e, s in sorted(branches, key=lambda b: -b[0]):
+            ok = place_branch(k, m, e, s, up_first) and ok
+        return ok
+
+    def place_branch(k: str, m: str, e: str, s: int, up_first: bool) -> bool:
+        """the branch k -> m leaves k at 45 degrees (steeper when 45 is blocked) and runs
+        parallel to the trunk at the nearest clear offset; its drawn length (bend included)
+        follows the physical one"""
+        kx, ky = pos[k]
+        target = drawn(e)
+        tries = [(ang, lane + step * i) for ang in (45, 60, 75, 90) for i in range(steps + 1)]
+        for n_try, (ang, dy) in enumerate(tries):
+            last = n_try == len(tries) - 1
+            snap = snapshot()
+            bx, by = kx + dy / math.tan(math.radians(ang)), ky + s * dy
+            tail = max(min_tail, target - dy / math.sin(math.radians(ang)))
+            pos[m] = (bx + tail, by)
+            d1, d2 = ((kx, ky), (bx, by)), ((bx, by), pos[m])
+            ok = seg_free(*d1) and seg_free(*d2)
+            segs.extend([d1, d2])
+            bundle_pts[e] = [(kx, ky), (bx, by), pos[m]]
+            ok = add_conn(m) and ok
+            if ok or last:
+                ok = lay_run(m, pos[m][0], by, s, up_first) and ok
+            if ok:
+                return True
+            if last:
+                unclear.append(e)
+                return False
+            rollback(snap)
+        return False
+
+    add_conn(root)
+    lay_run(root, ox, oy, 0, first_up)
+    facing: dict[str, int] = {n: (-1 if n == root else 1) for n in pos}
+
+    # ---- requests
+    out_conns, out_cps, out_bundles = [], [], []
+    keep_out: list[tuple[float, float, float, float]] = []      # what graphics keep clear of
+    conn_entry: dict[str, dict[str, Any]] = {}
+    for n, (x, y) in pos.items():
+        g = conn_place(n, x, y)
+        if g:
+            conn_entry[n] = g[0]
+            # without a picture the body box is only an estimate: graphics may sit beside it
+            keep_out.extend(g[1] if g[0].get("_picture") else g[1][1:])
+            g[0].pop("_picture", None)
+            out_conns.append(g[0])
+
+    # texts: each bundle's designator and length as a pair, at the first clear place along it
+    # (a straight's middle, then towards its ends; beside a slanted part), then each connection
+    # point's name beside its point; all clear of bundles, connectors and placed texts
+    segs = [(p[i], p[i + 1]) for p in bundle_pts.values() for i in range(len(p) - 1)]
+    placed: list[tuple[float, float, float, float]] = []
+
+    def text_free(r: tuple, skip: tuple | None = None) -> bool:
+        c = text_clear
+        x1, y1, x2, y2 = r[0] - c, r[1] - c, r[2] + c, r[3] + c
+        if any(x1 < k[2] and k[0] < x2 and y1 < k[3] and k[1] < y2 for k in keep_out + placed):
+            return False
+        return not any(_seg_hits_box(a[0], a[1], b[0], b[1], x1, y1, x2, y2) for a, b in segs if (a, b) != skip)
+
+    def bundle_text_spots(pts: list, wd: float, wl: float):
+        """candidate (designator, length) text entries along a bundle, best first"""
+        sg = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+        flat = sorted((q for q in sg if q[0][1] == q[1][1]), key=lambda q: -abs(q[1][0] - q[0][0]))
+        slant = sorted((q for q in sg if q[0][1] != q[1][1]), key=lambda q: -math.dist(*q))
+        for q in flat:
+            (ax, ay), (zx, _) = q
+            for t in (0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8):
+                mx = ax + (zx - ax) * t
+                yield q, ({"x": round(mx), "y": round(ay + 30), "justification": "bottom_center"},
+                          {"x": round(mx), "y": round(ay - 30), "justification": "top_center"})
+        side = text_h + 60
+        for q in slant:
+            (ax, ay), (zx, zy) = q
+            for t in (0.5, 0.35, 0.65):
+                mx, my = ax + (zx - ax) * t, ay + (zy - ay) * t
+                for sx, hz in ((-side, "right"), (side, "left")):
+                    yield q, ({"x": round(mx + sx), "y": round(my + 10), "justification": "bottom_" + hz},
+                              {"x": round(mx + sx), "y": round(my - 10), "justification": "top_" + hz})
 
     for e, pts in bundle_pts.items():
         flat = [round(v) for p in pts for v in p]
@@ -314,21 +434,49 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
         if breaks:
             be["show_break_symbol"] = abs(dl - phys[e] * 1000 / 25.4) > 0.02 * max(dl, 1.0)
         if place_texts:
-            i = max(range(len(pts) - 1), key=lambda j: abs(pts[j + 1][0] - pts[j][0]) if pts[j + 1][1] == pts[j][1] else 0)
-            (ax, ay), (zx, zy) = pts[i], pts[i + 1]
-            mx, my = (ax + zx) / 2, (ay + zy) / 2
-            be["texts"] = {
-                "designator": {"x": round(mx), "y": round(my + 30), "justification": "bottom_center"},
-                "length": {"x": round(mx), "y": round(my - 30), "justification": "top_center"},
-            }
-            keep_out.append((mx - 450, my - 160, mx + 450, my + 160))      # its name and length
+            wd = char_w * max(2, len(e if e != bkey[e] else "B?"))
+            wl = char_w * len(f"{phys[e]:.2f}mm")
+            first = None
+            for q, (td, tl) in bundle_text_spots(pts, wd, wl):
+                bd = text_box(td["x"], td["y"], td["justification"], wd)
+                bl = text_box(tl["x"], tl["y"], tl["justification"], wl)
+                first = first or (td, tl, bd, bl)
+                if text_free(bd, q) and text_free(bl, q):
+                    break
+            else:
+                td, tl, bd, bl = first
+            be["texts"] = {"designator": td, "length": tl}
+            placed.extend([bd, bl])
         out_bundles.append(be)
+
+    for n, (x, y) in pos.items():
+        cp = cps.get(n)
+        entry: dict[str, Any] = {"designator": n}
+        if n not in conn_of_cp:
+            entry.update({"x": round(x), "y": round(y)})
+        if place_texts and cp is not None and cp.get("show_name", True):
+            w = char_w * len(n)
+            spots = [(0, 180, "bottom_center"), (0, -180, "top_center"), (-120, 90, "bottom_right"),
+                     (120, 90, "bottom_left"), (-120, -90, "top_right"), (120, -90, "top_left"),
+                     (0, 320, "bottom_center"), (0, -320, "top_center")]
+            for dx, dy, j in spots:
+                r = text_box(x + dx, y + dy, j, w)
+                if text_free(r):
+                    break
+            else:
+                dx, dy, j = spots[0]
+                r = text_box(x + dx, y + dy, j, w)
+            entry["texts"] = {"designator": {"x": round(x + dx), "y": round(y + dy), "justification": j}}
+            placed.append(r)
+        if len(entry) > 1:
+            out_cps.append(entry)
+    keep_out.extend(placed)
 
     # notes and pictures beside a connector or a free end (its label, a photo) travel with it:
     # each group (a graphic and the graphics lying inside it, e.g. an inset photo) is moved by
     # the offset of the anchor nearest its centre (within attach_mils), then pushed until it
     # clears the bundles, the connectors with their texts and the groups placed before it:
-    # vertically away from the anchor's point or outward, whichever is the shorter move
+    # in the shortest of the four ways (away from the anchor's point vertically or outward first)
     move_objects = []
     shifted = []
     attach = float(o.get("attach_mils", 6000))
@@ -344,6 +492,8 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             anchor_at[n] = _mils(cps[n]["location"])
             moved[n] = (x - anchor_at[n][0], y - anchor_at[n][1])
             cp_at[n] = (x, y)
+    # what a graphic is measured from: the connector's picture where it has one (its place now)
+    anchor_box = {k: (_view_box(conns[k], 0, *p) if k in conns else None) or (*p, *p) for k, p in anchor_at.items()}
     graphics = [g for g in list(layout.get("notes", [])) + list(layout.get("pictures", []))
                 if all(k in g for k in ("x1", "y1", "x2", "y2", "unique_id"))]
     rect = {g["unique_id"]: (min(g["x1"], g["x2"]) * 10.0, min(g["y1"], g["y2"]) * 10.0,
@@ -404,22 +554,27 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
     face_of = {d: facing.get(cp_of_conn.get(d), 1) for d in moved if d in conns}
     face_of.update({n: facing.get(n, 1) for n in moved if n not in conns})
     if attach > 0 and moved:
-        for host, members in groups.items():
+        # the biggest first: a photo has fewer places to go than a one-line note
+        for host, members in sorted(groups.items(), key=lambda hm: -(rect[hm[0]][2] - rect[hm[0]][0]) * (rect[hm[0]][3] - rect[hm[0]][1])):
             r0 = rect[host]
             gx, gy = (r0[0] + r0[2]) / 2, (r0[1] + r0[3]) / 2
-            d, best = min((math.dist((gx, gy), anchor_at[k]), k) for k in moved)
+            d, best = min((_box_dist(r0, anchor_box[k]), k) for k in moved)
             if d > attach:
                 continue
             dx, dy = moved[best]
             r = (r0[0] + dx, r0[1] + dy, r0[2] + dx, r0[3] + dy)
-            # away from the anchor's point vertically, or outward (the way its connector faces):
+            # away from the anchor's point vertically, or outward (the way its connector faces),
+            # else the other two ways:
             # whichever moves the group least
             vert = "up" if (r[1] + r[3]) / 2 >= cp_at[best][1] else "down"
             out = "right" if face_of.get(best, 1) > 0 else "left"
-            tries = [(w, settle(r, w)) for w in (vert, out)]
+            back = "left" if out == "right" else "right"
+            other = "down" if vert == "up" else "up"
+            tries = [(w, settle(r, w)) for w in (vert, out, other, back)]
             tries = [(w, t) for w, t in tries if t is not None]
             px = py = 0.0
             if tries:
+                # the shortest move; on a tie the preferred way (listed first)
                 way, (shift, r) = min(tries, key=lambda wt: abs(wt[1][0]))
                 if shift:
                     px, py = (0.0, shift) if way in ("up", "down") else (shift, 0.0)
@@ -442,9 +597,17 @@ def plan_flat_layout(layout: dict[str, Any], options: dict[str, Any] | None) -> 
             "trunk": [root] + [m for m, _ in trunk],
             "scale_mils_per_mm": round(scale, 3),
             **({"graphics_pushed": shifted} if shifted else {}),
+            **({"branches_not_clear": unclear} if unclear else {}),
             "extent_mils": [round(min(xs)), round(min(ys)), round(max(xs)), round(max(ys))],
         },
     }
+
+
+def _box_dist(a: tuple, b: tuple) -> float:
+    """distance between two boxes (0 when they touch or overlap)"""
+    dx = max(b[0] - a[2], a[0] - b[2], 0.0)
+    dy = max(b[1] - a[3], a[1] - b[3], 0.0)
+    return math.hypot(dx, dy)
 
 
 def _seg_hits_box(ax: float, ay: float, bx: float, by: float, x1: float, y1: float, x2: float, y2: float) -> bool:
