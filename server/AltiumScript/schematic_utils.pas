@@ -5202,6 +5202,8 @@ end;
 //   BUNDLE|uid or ''|designator|comment|length or AUTO|break|line_width|x1|y1|...
 //   COVERING|uid or ''|designator|part|library|thickness|start|end|item ref|...
 //   LABEL|uid or ''|designator|text|x|y|orientation|alignment|first_line|part|library
+//   OBJPARAM|owner ref|name|value     OBJDELPARAM|owner ref|name
+//   CPASSOC|cp ref|part|library|table|description[|name|value...]
 //   VIEW|connector uid|physical or symbol|render 1/0
 //   WIRELEN|wire data uid|length (0 = calculated from the bundles)
 //   TEXT|owner ref|text name|x|y|hidden 1/0  (designator, comment, length, ...)
@@ -5219,6 +5221,7 @@ function ExecuteEditHarnessLayout(SpecPath: String): String;
 var
     Spec         : TStringList;
     Misses       : TStringList;
+    Cleared      : TStringList;
     Rec, Kind, F : String;
     DocPath      : String;
     DocName      : String;
@@ -5226,6 +5229,7 @@ var
     ServerDoc    : IServerDocument;
     Doc          : ISch_Document;
     Obj, Item    : ISch_GraphicalObject;
+    Prim         : ISch_GraphicalObject;
     IsNew        : Boolean;
     Saved        : Boolean;
     Reloaded     : Boolean;
@@ -5241,6 +5245,9 @@ var
     CovUpdated   : Integer;
     LblCreated   : Integer;
     LblUpdated   : Integer;
+    ParamsSet    : Integer;
+    ParamsDeleted : Integer;
+    AssocPartsSet : Integer;
     ViewsChanged : Integer;
     WireLengths  : Integer;
     TextsPlaced  : Integer;
@@ -5274,6 +5281,7 @@ begin
 
     Spec := TStringList.Create;
     Misses := TStringList.Create;
+    Cleared := TStringList.Create;
     ViewUids := TStringList.Create;
     CopyNone := TStringList.Create;
     CopyTxtOld := TStringList.Create;
@@ -5382,6 +5390,9 @@ begin
         CovUpdated := 0;
         LblCreated := 0;
         LblUpdated := 0;
+        ParamsSet := 0;
+        ParamsDeleted := 0;
+        AssocPartsSet := 0;
         ViewsChanged := 0;
         WireLengths := 0;
         TextsPlaced := 0;
@@ -5822,6 +5833,55 @@ begin
                 CopyTxtOld.Add(SpecField(Rec, 1));
                 CopyTxtNew.Add(SpecField(Rec, 2));
             end
+            else if (Kind = 'OBJPARAM') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) then
+                    Misses.Add('param_owner:' + SpecField(Rec, 1))
+                else
+                begin
+                    UpsertSchParameter(Obj, SpecField(Rec, 2), SpecField(Rec, 3));
+                    ParamsSet := ParamsSet + 1;
+                    GeoChanged := True;
+                end;
+            end
+            else if (Kind = 'OBJDELPARAM') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) then
+                    Misses.Add('param_owner:' + SpecField(Rec, 1))
+                else
+                begin
+                    ParamsDeleted := ParamsDeleted + RemoveSchParameter(Obj, SpecField(Rec, 2));
+                    GeoChanged := True;
+                end;
+            end
+            else if (Kind = 'CPASSOC') then
+            begin
+                Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
+                if (Obj = nil) or (Obj.ObjectId <> 85) then
+                    Misses.Add('cp_assoc_owner:' + SpecField(Rec, 1))
+                else
+                begin
+                    F := 'CPASSOC:' + AnsiUpperCase(Obj.UniqueId);
+                    if (Cleared.IndexOf(F) < 0) then
+                    begin
+                        Obj.RemoveAllAssociatedParts;
+                        Cleared.Add(F);
+                    end;
+                    if (SpecField(Rec, 2) <> '') then
+                    begin
+                        Prim := NewHarnessPart(SpecField(Rec, 2), SpecField(Rec, 3), SpecField(Rec, 4), SpecField(Rec, 5));
+                        if (Prim <> nil) then
+                        begin
+                            ApplySpecParameters(Prim, Rec, 6);
+                            Obj.AddAssociatedPart(Prim);
+                            AssocPartsSet := AssocPartsSet + 1;
+                        end;
+                    end;
+                    GeoChanged := True;
+                end;
+            end
             else if (Kind = 'TEXT') then
             begin
                 Obj := FindLayoutObject(Doc, SpecField(Rec, 1));
@@ -5932,6 +5992,9 @@ begin
                   ', "coverings_updated": ' + IntToStr(CovUpdated) +
                   ', "layout_labels_created": ' + IntToStr(LblCreated) +
                   ', "layout_labels_updated": ' + IntToStr(LblUpdated) +
+                  ', "parameters_set": ' + IntToStr(ParamsSet) +
+                  ', "parameters_deleted": ' + IntToStr(ParamsDeleted) +
+                  ', "associated_parts_set": ' + IntToStr(AssocPartsSet) +
                   ', "views_changed": ' + IntToStr(ViewsChanged) +
                   ', "wire_lengths_set": ' + IntToStr(WireLengths) +
                   ', "texts_placed": ' + IntToStr(TextsPlaced) +
@@ -5948,6 +6011,7 @@ begin
         CopyTxtOld.Free;
         CopyNone.Free;
         ViewUids.Free;
+        Cleared.Free;
         Misses.Free;
         Spec.Free;
     end;

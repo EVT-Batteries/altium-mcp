@@ -227,6 +227,8 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     connectors: dict[int, dict[str, Any]] = {}
     pins: dict[str, dict[str, Any]] = {}  # pin uid -> pin
     cps: dict[int, dict[str, Any]] = {}
+    cp_assoc_containers: dict[int, int] = {}  # RECORD 125 index -> cp index
+    cp_assoc_parts: dict[int, dict[str, Any]] = {}  # owned RECORD 106 index -> part
     bundles: dict[int, dict[str, Any]] = {}
     labels: dict[int, dict[str, Any]] = {}
     coverings: dict[int, dict[str, Any]] = {}
@@ -254,6 +256,22 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "pin_uids": [],
                 "texts": {},
             }
+        elif rtype == "125" and owned:
+            owner = int(props["OwnerIndex"])
+            if owner in cps:
+                cp_assoc_containers[idx] = owner
+        elif rtype == "106" and owned:
+            owner = int(props["OwnerIndex"])
+            if owner in cp_assoc_containers:
+                part = {
+                    "part_number": _text(props, "DesignItemId"),
+                    "source_library": _text(props, "SourceLibraryName"),
+                    "source_table": _text(props, "DatabaseTableName"),
+                    "description": _text(props, "ComponentDescription"),
+                    "parameters": {},
+                }
+                cp_assoc_parts[idx] = part
+                cps[cp_assoc_containers[owner]]["associated_parts"].append(part)
         elif rtype == "113" and owned:
             owner = int(props["OwnerIndex"])
             if owner in connectors:
@@ -277,6 +295,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "bundle_uids": _uid_list(
                     props, "ConnectedBundlesUniqueIdsCount", "ConnectedBundleUniqueId"
                 ),
+                "associated_parts": [],
                 "texts": {},
             }
         elif rtype == "111" and not owned:
@@ -308,6 +327,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 "part_number": _text(props, "DesignItemId"),
                 "source_library": _text(props, "SourceLibraryName"),
                 "unique_id": props.get("UniqueID", ""),
+                "parameters": {},
                 "texts": {},
             }
         elif rtype == "128" and not owned:
@@ -326,6 +346,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                     for i in range(count)
                     if f"CoveredItemId{i}" in props
                 ],
+                "parameters": {},
                 "texts": {},
             }
         elif rtype == "115":
@@ -423,6 +444,9 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                         "image": None,
                     }
                     connectors[owner]["views"].append(image_views[idx])
+            elif owner in cp_assoc_parts:
+                if rtype == "41" and name and name not in ("Designator", "Comment"):
+                    cp_assoc_parts[owner]["parameters"][name] = val
             else:
                 target = (
                     cps.get(owner)
@@ -431,7 +455,13 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                     or coverings.get(owner)
                 )
                 if target is not None:
-                    target["texts"][text_name] = text
+                    if owner in coverings or owner in labels:
+                        if rtype == "41" and name and name not in ("Designator", "Comment"):
+                            target["parameters"][name] = val
+                        if not text["hidden"] or name in ("Designator", "Comment"):
+                            target["texts"][text_name] = text
+                    else:
+                        target["texts"][text_name] = text
                 if target is not None and name in ("Designator", "Comment"):
                     target[name.lower()] = val
                 if owner in cps and name == "Designator":
@@ -1139,6 +1169,8 @@ def build_layout_spec(
     text_records: list[list[Any]] = []
     cp_records: list[list[Any]] = []
     assign_records: list[list[Any]] = []
+    cp_assoc_records: list[list[Any]] = []
+    param_records: list[list[Any]] = []
     # Connection points given a position explicitly
     placed_cps = set()
     for c in connection_points or []:
@@ -1308,6 +1340,34 @@ def build_layout_spec(
             obj_uid = obj["unique_id"] if obj is not None else obj_des
             assign_records.append(["CPUNASSIGN", old["unique_id"], obj_uid])
             holder.pop(obj_des)
+        if "associated_parts" in item and item["associated_parts"] is not None:
+            parts = item["associated_parts"]
+            if not isinstance(parts, list):
+                errors.append(f"connection point '{des}': associated_parts must be a list")
+            elif not parts:
+                cp_assoc_records.append(["CPASSOC", ref, "", "", "", ""])
+            else:
+                for p in parts:
+                    if not isinstance(p, dict):
+                        errors.append(
+                            f"connection point '{des}': associated_parts entries must be objects"
+                        )
+                        continue
+                    params = dict(p.get("parameters") or {})
+                    desc = p.get("description") or params.pop("Description", "")
+                    params.pop("Description", None)
+                    rec: list[Any] = [
+                        "CPASSOC",
+                        ref,
+                        str(p.get("part_number") or "").strip(),
+                        str(p.get("source_library") or "").strip(),
+                        str(p.get("source_table") or "").strip(),
+                        str(desc or "").strip(),
+                    ]
+                    for pk, pv in params.items():
+                        if pv is not None and str(pv).strip():
+                            rec.extend([str(pk), str(pv)])
+                    cp_assoc_records.append(rec)
 
     # Connector connection points moved above but not listed explicitly
     listed = {r[1] for r in cp_records if r[1]}
@@ -1515,6 +1575,7 @@ def build_layout_spec(
         }
         if offsets:
             expect_cov_offsets[key if cov is None else cov["unique_id"]] = offsets
+        cov_ref = f"DES:{key}" if cov is None else cov["unique_id"]
         covering_records.append(
             [
                 "COVERING",
@@ -1528,8 +1589,16 @@ def build_layout_spec(
                 *(refs if refs is not None else []),
             ]
         )
+        if item.get("comment") is not None:
+            param_records.append(["OBJPARAM", cov_ref, "Comment", str(item["comment"])])
+        for pk, pv in (item.get("parameters") or {}).items():
+            if pv is not None and str(pv).strip():
+                param_records.append(["OBJPARAM", cov_ref, str(pk), str(pv)])
+        for pname in item.get("delete_parameters") or []:
+            if str(pname).strip():
+                param_records.append(["OBJDELPARAM", cov_ref, str(pname).strip()])
         text_records += _text_records(
-            f"DES:{key}" if cov is None else cov["unique_id"],
+            cov_ref,
             item.get("texts"),
             f"covering '{key}'",
             errors,
@@ -1561,6 +1630,7 @@ def build_layout_spec(
         if item.get("x") is not None or item.get("y") is not None:
             cur_x, cur_y = _mils(lbl["location"]) if lbl else (0, 0)
             pos = (int(item.get("x", cur_x)), int(item.get("y", cur_y)))
+        lbl_ref = f"DES:{key}" if lbl is None else lbl["unique_id"]
         label_records.append(
             [
                 "LABEL",
@@ -1575,8 +1645,16 @@ def build_layout_spec(
                 str(item.get("source_library") or ""),
             ]
         )
+        if item.get("comment") is not None:
+            param_records.append(["OBJPARAM", lbl_ref, "Comment", str(item["comment"])])
+        for pk, pv in (item.get("parameters") or {}).items():
+            if pv is not None and str(pv).strip():
+                param_records.append(["OBJPARAM", lbl_ref, str(pk), str(pv)])
+        for pname in item.get("delete_parameters") or []:
+            if str(pname).strip():
+                param_records.append(["OBJDELPARAM", lbl_ref, str(pname).strip()])
         text_records += _text_records(
-            f"DES:{key}" if lbl is None else lbl["unique_id"],
+            lbl_ref,
             item.get("texts"),
             f"layout label '{key}'",
             errors,
@@ -1628,9 +1706,11 @@ def build_layout_spec(
             *view_records,
             *cp_records,
             *assign_records,
+            *cp_assoc_records,
             *bundle_records,
             *covering_records,
             *label_records,
+            *param_records,
             *wire_records,
             *graphics_records,
             # Last: texts of objects created above, and after connector moves

@@ -1167,6 +1167,123 @@ class TestEditHarnessLayoutTool(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not an existing .LdrDoc", json.loads(raw)["error"])
         self.mock_bridge.assert_not_awaited()
 
+    async def test_covering_parameters_and_cp_associated_parts(self):
+        spec = build_layout_spec(
+            make_layout(),
+            coverings=[
+                {
+                    "designator": "COV1",
+                    "part_number": "SLEEVE-12",
+                    "source_library": "my.DbLib",
+                    "comment": "SLEEVE-12",
+                    "parameters": {
+                        "Description": "Braided Sleeve 12 mm",
+                        "Manufacturer 1": "Acme",
+                    },
+                    "delete_parameters": ["OldCol"],
+                }
+            ],
+            connection_points=[
+                {
+                    "designator": "CP1",
+                    "associated_parts": [
+                        {
+                            "part_number": "TERM-BOOT",
+                            "source_library": "my.DbLib",
+                            "source_table": "terminals-db.csv",
+                            "description": "Boot Terminal",
+                            "parameters": {"Manufacturer 1": "Acme"},
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(spec["errors"], [])
+        self.assertEqual(
+            records_of(spec, "CPASSOC"),
+            [
+                [
+                    "CPASSOC",
+                    "UCP1",
+                    "TERM-BOOT",
+                    "my.DbLib",
+                    "terminals-db.csv",
+                    "Boot Terminal",
+                    "Manufacturer 1",
+                    "Acme",
+                ]
+            ],
+        )
+        self.assertEqual(
+            records_of(spec, "OBJPARAM"),
+            [
+                ["OBJPARAM", "UCOV1", "Comment", "SLEEVE-12"],
+                ["OBJPARAM", "UCOV1", "Description", "Braided Sleeve 12 mm"],
+                ["OBJPARAM", "UCOV1", "Manufacturer 1", "Acme"],
+            ],
+        )
+        self.assertEqual(
+            records_of(spec, "OBJDELPARAM"),
+            [["OBJDELPARAM", "UCOV1", "OldCol"]],
+        )
+
+    async def test_sync_harness_library_on_ldrdoc(self):
+        import main
+
+        dblib = Path(self.tmp.name) / "my.DbLib"
+        csv_mech = Path(self.tmp.name) / "mechanicals-db.csv"
+        csv_term = Path(self.tmp.name) / "terminals-db.csv"
+        csv_mech.write_text(
+            "PartNumber,Description,Manufacturer 1,Manufacturer Part Number 1\n"
+            "SLEEVE-12,Braided Sleeve 12 mm,Acme,ACM-12\n",
+            encoding="utf-8",
+        )
+        csv_term.write_text(
+            "PartNumber,Description,Manufacturer 1,Manufacturer Part Number 1\n"
+            "TERM-BOOT,Boot Terminal,Acme,ACM-BT\n",
+            encoding="utf-8",
+        )
+        dblib.write_text(
+            "[DatabaseLinks]\n"
+            'ConnectionString=Provider=MSDASQL.1;Extended Properties="'
+            f'Driver={{Microsoft Access Text Driver (*.txt, *.csv)}};Dbq={self.tmp.name}\\;Extensions=csv;"\n'
+            "[Table1]\nTableName=mechanicals-db.csv\nEnabled=True\n"
+            "[Table2]\nTableName=terminals-db.csv\nEnabled=True\n",
+            encoding="utf-8",
+        )
+        self.before["coverings"][0]["part_number"] = "SLEEVE-12"
+        self.before["coverings"][0]["parameters"] = {"StaleCol": "old"}
+        self.before["connection_points"][1]["associated_parts"] = [
+            {"part_number": "TERM-BOOT", "parameters": {}}
+        ]
+        self.parse.stop()
+        self.parse = patch(
+            "main.parse_ldrdoc",
+            side_effect=[self.before, self.before, self.after],
+        )
+        self.parse.start()
+        raw = await main.sync_harness_library(
+            None,
+            document_path=str(self.doc),
+            dblib_path=str(dblib),
+            delete_stale_parameters=["StaleCol"],
+        )
+        data = json.loads(raw)
+        self.assertTrue(data["success"], data)
+        self.assertEqual(data["coverings_synced_count"], 1)
+        self.assertEqual(data["associated_parts_synced_count"], 1)
+        self.assertEqual(data["stale_parameters_deleted"], {"StaleCol": ["COV1"]})
+        lines = self.spec_file.read_text(encoding="utf-8-sig").splitlines()
+        self.assertIn(
+            "CPASSOC|UCP1|TERM-BOOT|my.DbLib|terminals-db.csv|Boot Terminal|"
+            "PartNumber|TERM-BOOT|Manufacturer 1|Acme|Manufacturer Part Number 1|ACM-BT",
+            lines,
+        )
+        self.assertIn("OBJPARAM|UCOV1|Comment|SLEEVE-12", lines)
+        self.assertIn("OBJPARAM|UCOV1|Description|Braided Sleeve 12 mm", lines)
+        self.assertIn("OBJPARAM|UCOV1|Manufacturer 1|Acme", lines)
+        self.assertIn("OBJDELPARAM|UCOV1|StaleCol", lines)
+
 
 if __name__ == "__main__":
     unittest.main()

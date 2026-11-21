@@ -4614,6 +4614,222 @@ async def _sync_harness_from_library(
     }
 
 
+async def _sync_layout_from_library(
+    ctx: Context,
+    document_path: str,
+    library: Any,
+    sync_coverings: bool = True,
+    sync_labels: bool = True,
+    sync_associated: bool = True,
+    covering_map: dict | None = None,
+    associated_map: dict | None = None,
+    parameter_aliases: dict | None = None,
+    source_library_name: str | None = None,
+    delete_stale_parameters: bool | list | None = None,
+) -> dict[str, Any]:
+    """Sync coverings, layout labels and connection-point associated parts of a
+    .LdrDoc from a local CSV-backed .DbLib."""
+    target_path = str(Path(document_path).resolve())
+    src_lib = source_library_name or library.name
+    aliases = parameter_aliases or {}
+    layout = parse_ldrdoc(target_path)
+    unresolved: list[dict[str, str]] = []
+    warnings: list[str] = []
+
+    def with_aliases(params: dict[str, str]) -> dict[str, str]:
+        out = dict(params)
+        for alias, column in aliases.items():
+            if params.get(column):
+                out[alias] = params[column]
+        return out
+
+    not_stale = NON_DATABASE_PARAMETERS | {n.lower() for n in aliases}
+    if isinstance(delete_stale_parameters, (list, tuple, set)):
+        delete_names = {str(n).lower() for n in delete_stale_parameters}
+    else:
+        delete_names = None
+    stale: dict[str, list[str]] = {}
+    stale_deleted: dict[str, list[str]] = {}
+
+    def stale_in(where: str, table: Any, params: dict[str, str]) -> list[str]:
+        columns = {c.lower() for c in table.columns}
+        to_delete = []
+        for name in params:
+            if name.lower() in columns or name.lower() in not_stale:
+                continue
+            if delete_stale_parameters is True or (
+                delete_names is not None and name.lower() in delete_names
+            ):
+                stale_deleted.setdefault(name, []).append(where)
+                to_delete.append(name)
+            else:
+                stale.setdefault(name, []).append(where)
+        return to_delete
+
+    def build_param_update(
+        where: str,
+        pn: str,
+        current_params: dict[str, str],
+    ) -> dict[str, Any] | None:
+        found = library.find(pn)
+        if found is None:
+            unresolved.append(
+                {"designator": where, "reason": f"PartNumber {pn!r} not in database"}
+            )
+            return None
+        table, row = found
+        params = with_aliases(table.parameters(row))
+        params["PartNumber"] = pn
+        params["Source Table"] = table.name
+        if src_lib:
+            params["Source Library"] = src_lib
+        to_delete = stale_in(where, table, current_params)
+        update: dict[str, Any] = {
+            "part_number": pn,
+            "source_library": src_lib,
+            "comment": pn,
+            "parameters": params,
+        }
+        if to_delete:
+            update["delete_parameters"] = to_delete
+        return update
+
+    cov_updates = []
+    if sync_coverings:
+        cov_map = {str(k): str(v) for k, v in (covering_map or {}).items()}
+        for cov in layout.get("coverings", []):
+            des = cov.get("designator") or cov["unique_id"]
+            pn = cov_map.pop(des, None) or cov.get("part_number") or ""
+            if not pn:
+                continue
+            upd = build_param_update(des, pn, cov.get("parameters", {}))
+            if upd is not None:
+                cov_updates.append({"unique_id": cov["unique_id"], **upd})
+        for des in cov_map:
+            unresolved.append(
+                {"designator": des, "reason": "covering not found on the layout"}
+            )
+
+    lbl_updates = []
+    if sync_labels:
+        for lbl in layout.get("layout_labels", []):
+            des = lbl.get("designator") or lbl["unique_id"]
+            pn = lbl.get("part_number") or ""
+            if not pn:
+                continue
+            upd = build_param_update(des, pn, lbl.get("parameters", {}))
+            if upd is not None:
+                lbl_updates.append({"unique_id": lbl["unique_id"], **upd})
+
+    cp_updates = []
+    cp_assoc_count = 0
+    if sync_associated:
+        wanted_assoc = {
+            str(k): [str(p) for p in v if p] for k, v in (associated_map or {}).items()
+        }
+        for cp in layout.get("connection_points", []):
+            des = cp.get("designator") or cp["unique_id"]
+            cur_parts = cp.get("associated_parts", [])
+            current_pns = [p["part_number"] for p in cur_parts if p.get("part_number")]
+            pns = wanted_assoc.pop(des, current_pns)
+            if not pns:
+                if current_pns:
+                    cp_updates.append({"unique_id": cp["unique_id"], "associated_parts": []})
+                continue
+            kept = {
+                p["part_number"]: p.get("parameters", {})
+                for p in cur_parts
+                if p.get("part_number")
+            }
+            resolved_parts = []
+            ok = True
+            for pn in pns:
+                found = library.find(pn)
+                if found is None:
+                    unresolved.append(
+                        {"designator": des, "reason": f"part {pn!r} not in database"}
+                    )
+                    ok = False
+                    break
+                table, row = found
+                params = with_aliases(table.parameters(row))
+                columns = {c.lower() for c in table.columns}
+                dropped = set(stale_in(f"{des} {pn}", table, kept.get(pn, {})))
+                for name, value in kept.get(pn, {}).items():
+                    if (
+                        name not in params
+                        and name != "Description"
+                        and value
+                        and name.lower() not in columns
+                        and name not in dropped
+                    ):
+                        params[name] = value
+                resolved_parts.append(
+                    {
+                        "part_number": pn,
+                        "source_library": src_lib,
+                        "source_table": table.name,
+                        "description": params.pop("Description", ""),
+                        "parameters": params,
+                    }
+                )
+            if ok:
+                cp_updates.append(
+                    {"unique_id": cp["unique_id"], "associated_parts": resolved_parts}
+                )
+                cp_assoc_count += len(resolved_parts)
+        for des in wanted_assoc:
+            unresolved.append(
+                {
+                    "designator": des,
+                    "reason": "connection point not found on the layout",
+                }
+            )
+
+    if cov_updates or lbl_updates or cp_updates:
+        res_str = await edit_harness_layout(
+            ctx,
+            document_path=target_path,
+            coverings=cov_updates or None,
+            layout_labels=lbl_updates or None,
+            connection_points=cp_updates or None,
+        )
+        try:
+            res_json = json.loads(res_str)
+        except ValueError:
+            res_json = {"success": False, "raw": res_str}
+    else:
+        res_json = {"success": True, "note": "nothing to update"}
+
+    if stale:
+        warnings.append(
+            f"{len(stale)} parameter name(s) under stale_parameters are no column of their "
+            "database table any more (renamed or deleted) and were kept: ask the user whether "
+            "to keep or delete them, then run again with delete_stale_parameters=True (all) "
+            "or a list of the names to delete"
+        )
+
+    return {
+        "success": bool(res_json.get("success")) and not unresolved,
+        "document_path": target_path,
+        "source_library": src_lib,
+        "coverings_synced_count": len(cov_updates),
+        "layout_labels_synced_count": len(lbl_updates),
+        "associated_parts_synced_count": res_json.get(
+            "associated_parts_set", cp_assoc_count
+        ),
+        "parameters_set_count": res_json.get("parameters_set", 0),
+        "stale_parameters": {name: sorted(set(w)) for name, w in sorted(stale.items())},
+        "stale_parameters_deleted": {
+            name: sorted(set(w)) for name, w in sorted(stale_deleted.items())
+        },
+        "parameters_deleted_count": res_json.get("parameters_deleted", 0),
+        "unresolved": unresolved,
+        "warnings": warnings,
+        "altium_response": res_json,
+    }
+
+
 @_tool()
 async def sync_harness_library(
     ctx: Context,
@@ -4630,47 +4846,59 @@ async def sync_harness_library(
     cables: bool = True,
     associated_map: dict | None = None,
     delete_stale_parameters: bool | list | None = None,
+    coverings: bool = True,
+    layout_labels: bool = True,
+    covering_map: dict | None = None,
 ) -> str:
-    """Link harness wires, cavity parts, associated parts and cables to a local CSV-backed .DbLib and copy their parameters.
+    """Link harness wires, cavity parts, associated parts, cables, coverings and layout labels to a local CSV-backed .DbLib and copy their parameters.
 
-    Altium's harness editor cannot pick wires or cavity parts from a desktop .DbLib, so this
-    tool writes the library link (Design Item Id, Source Library, Source Table) and every part
-    parameter from the database row onto the .WirDoc itself, then saves it. Running it again
-    updates values in place (no duplicates). A part's Description column becomes its component
-    description (Altium deletes Description parameters on cavity and associated parts).
+    Accepts either a Harness Wiring Diagram (.WirDoc) or a Harness Layout Drawing (.LdrDoc).
+    Altium's harness editor cannot pick symbol-less parts (wires, cavity parts, coverings,
+    layout labels, associated parts) from a desktop .DbLib, so this tool writes the library
+    link (Design Item Id, Source Library, Source Table) and every part parameter from the
+    database row directly onto the document, then saves and reloads it. Running it again
+    updates values in place (no duplicates). On cavity and associated parts, the Description
+    column becomes the component description (Altium drops Description parameters on those
+    parts when saving); on coverings and layout labels it is written as a Description parameter
+    so BOMs and manufacturing reports pick it up.
 
     Wires are matched by wire_designator_map, else their PartNumber / Design Item Id, else the one
-    row whose gauge and Color match the wire's. Cavity slots (crimp, seal, plug, other) and
-    connector/splice associated parts keep their current parts unless cavity_map /
-    associated_map assign others. Anything that cannot be matched is listed under "unresolved"
-    and left unchanged.
+    row whose gauge and Color match the wire's. Cavity slots (crimp, seal, plug, other),
+    connector/splice/connection-point associated parts, coverings and layout labels keep their
+    current parts unless cavity_map / associated_map / covering_map assign others. Anything that
+    cannot be matched is listed under "unresolved" and left unchanged.
 
-    Stale parameters - on a synced wire, cavity part, associated part or connector but no
-    column of its database table any more (the column was renamed or deleted) - are listed
-    under "stale_parameters" ({name: [objects]}) and kept. Ask the user whether to keep or
-    delete them, then run again with delete_stale_parameters. The library link, Comment,
+    Stale parameters - on a synced wire, cavity part, associated part, connector, covering or
+    layout label but no column of its database table any more (the column was renamed or deleted)
+    - are listed under "stale_parameters" ({name: [objects]}) and kept. Ask the user whether to
+    keep or delete them, then run again with delete_stale_parameters. The library link, Comment,
     Description, Net, SystemDesignUniqueId and Altium's built-in wire properties (Gauge,
     Color, Border, Min. Bending Radius, Thickness, Include Cut) are never stale.
 
     Args:
-        document_path: Target .WirDoc path. Required.
+        document_path: Target .WirDoc or .LdrDoc path. Required.
         dblib_path: The .DbLib to read. Defaults to $ALTIUM_DBLIB_PATH, else the first .DbLib
             found walking up from the document (in each folder and up to two levels below).
-        wires: Sync harness wires (default True).
-        cavities: Sync cavity parts - crimps, seals, plugs, other (default True).
+        wires: Sync harness wires on a .WirDoc (default True).
+        cavities: Sync cavity parts - crimps, seals, plugs, other on a .WirDoc (default True).
         connectors: Refresh placed connectors' existing database parameters whose values differ
-            from the database row (default True; Altium's "Update Parameters From Database").
-        associated_parts: Sync connector/splice associated parts (default True).
-        cables: Refresh placed cables that have a part number from their database row
-            (default True).
+            from the database row on a .WirDoc (default True; Altium's "Update Parameters From Database").
+        associated_parts: Sync connector/splice associated parts (.WirDoc) or connection-point
+            associated parts (.LdrDoc) (default True).
+        cables: Refresh placed cables that have a part number from their database row on a
+            .WirDoc (default True).
+        coverings: Sync layout coverings that have a part number on a .LdrDoc (default True).
+        layout_labels: Sync layout labels that have a part number on a .LdrDoc (default True).
         wire_designator_map: Wire designator -> part number, e.g. {"W1": "5875 BK005"}.
         cavity_map: Cavity parts to assign: {connector: {pin: part number}} for the crimp, or
             {connector: {pin: {slot: part number(s)}}} with slot "crimp", "seal", "plug" or
             "other" (a list for several "other" parts; an empty list empties the slot), e.g.
             {"J1": {"1": "1060-20-0122", "3": {"crimp": "1060-20-0122", "seal": "0413-204-2005"},
                     "4": {"plug": "114017"}}}.
-        associated_map: Associated parts to assign: {connector or splice: [part numbers]}, e.g.
-            {"J1": ["DTM04-4P-BOOT"]}; an empty list removes them.
+        associated_map: Associated parts to assign: {connector, splice or connection point:
+            [part numbers]}, e.g. {"J1": ["DTM04-4P-BOOT"]}; an empty list removes them.
+        covering_map: Coverings to assign on a .LdrDoc: {covering designator: part number},
+            e.g. {"COV1": "SLEEVE-12"}.
         color_map: Extra wire drawing colours, {name: "#RRGGBB"}, on top of the defaults
             (black, brown, red, orange, yellow, green, blue, violet, purple, gray/grey, white,
             pink, tan, light blue, light green). Striped names use their base colour.
@@ -4688,7 +4916,15 @@ async def sync_harness_library(
         return json.dumps(
             {
                 "success": False,
-                "error": f"document_path to an existing .WirDoc is required: {document_path!r}",
+                "error": f"document_path to an existing .WirDoc or .LdrDoc is required: {document_path!r}",
+            }
+        )
+    doc_suffix = Path(document_path).suffix.lower()
+    if doc_suffix not in (".wirdoc", ".ldrdoc"):
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"document_path must be a .WirDoc or .LdrDoc: {document_path!r}",
             }
         )
     lib_path = (
@@ -4706,24 +4942,39 @@ async def sync_harness_library(
     except (OSError, ValueError) as e:
         return json.dumps({"success": False, "error": f"Cannot read {lib_path}: {e}"})
 
-    result = await _sync_harness_from_library(
-        ctx,
-        document_path,
-        library,
-        sync_wires=wires,
-        sync_cavities=cavities,
-        sync_connectors=connectors,
-        wire_designator_map=wire_designator_map,
-        cavity_map=cavity_map,
-        color_map=color_map,
-        parameter_aliases=parameter_aliases,
-        extra_wire_parameters=None,
-        source_library_name=None,
-        sync_associated=associated_parts,
-        sync_cables=cables,
-        associated_map=associated_map,
-        delete_stale_parameters=delete_stale_parameters,
-    )
+    if doc_suffix == ".ldrdoc":
+        result = await _sync_layout_from_library(
+            ctx,
+            document_path,
+            library,
+            sync_coverings=coverings,
+            sync_labels=layout_labels,
+            sync_associated=associated_parts,
+            covering_map=covering_map,
+            associated_map=associated_map,
+            parameter_aliases=parameter_aliases,
+            source_library_name=None,
+            delete_stale_parameters=delete_stale_parameters,
+        )
+    else:
+        result = await _sync_harness_from_library(
+            ctx,
+            document_path,
+            library,
+            sync_wires=wires,
+            sync_cavities=cavities,
+            sync_connectors=connectors,
+            wire_designator_map=wire_designator_map,
+            cavity_map=cavity_map,
+            color_map=color_map,
+            parameter_aliases=parameter_aliases,
+            extra_wire_parameters=None,
+            source_library_name=None,
+            sync_associated=associated_parts,
+            sync_cables=cables,
+            associated_map=associated_map,
+            delete_stale_parameters=delete_stale_parameters,
+        )
     result["dblib_path"] = str(lib_path)
     return json.dumps(result, indent=2)
 
