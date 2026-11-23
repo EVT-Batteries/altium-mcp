@@ -1694,7 +1694,9 @@ begin
     Method := IniFile.ReadString('PublishSettings', 'PublishMethod' + IntToStr(J), '0');
     if Method = '0' then
     begin
-        FileName := IniFile.ReadString('PublishSettings', 'OutputFileName' + IntToStr(J), '');
+        FileName := IniFile.ReadString('PublishSettings', 'OutputFileNameSpecial' + IntToStr(J), '');
+        if FileName = '' then
+            FileName := IniFile.ReadString('PublishSettings', 'OutputFileName' + IntToStr(J), '');
         if FileName = '' then
             FileName := ExtractFileName(StringReplace(
                 IniFile.ReadString('PublishSettings', 'OutputFilePath' + IntToStr(J), ''),
@@ -1802,12 +1804,35 @@ begin
         // Add the OutJob path to the result
         AddJSONProperty(ResultProps, 'outjob_path', OutJobPath);
 
-        // Open the OutJob document. Checked for Nil before any use: a
-        // caller-supplied outjob_path may name a file Altium cannot open.
-        if not(Client.IsDocumentOpen(OutJobPath)) then
-            OutJobDoc := Client.OpenDocument('OUTPUTJOB', OutJobPath)
-        else
-            OutJobDoc := Client.GetDocumentByPath(OutJobPath);
+        // Open the OutJob document through its project when an open project
+        // holds it (Client.OpenDocument opens an OutJob under Free Documents,
+        // where [Project Physical Documents] finds no project files to print).
+        Project := OutJobProject(OutJobPath);
+        OutJobDoc := FindOpenDocument(OutJobPath);
+        if (OutJobDoc <> Nil) and (Project <> Nil) then
+        begin
+            // If the OutJob was previously opened under Free Documents before
+            // its project was opened, close and re-open it through the project.
+            if (FindProjectOfDocument(OutJobPath) = Nil) then
+            begin
+                Client.CloseDocument(OutJobDoc);
+                OutJobDoc := Nil;
+            end;
+        end;
+        if (OutJobDoc = Nil) then
+        begin
+            if (Project <> Nil) then
+                for I := 0 to Project.DM_LogicalDocumentCount - 1 do
+                    if SameText(NormalizePath(Project.DM_LogicalDocuments(I).DM_FullPath),
+                                NormalizePath(OutJobPath)) then
+                    begin
+                        Project.DM_LogicalDocuments(I).DM_OpenAndFocusDocument;
+                        Break;
+                    end;
+            OutJobDoc := FindOpenDocument(OutJobPath);
+            if (OutJobDoc = Nil) then
+                OutJobDoc := Client.OpenDocument('OUTPUTJOB', OutJobPath);
+        end;
 
         // Exit if we can't open the OutJob document
         if OutJobDoc = Nil then
