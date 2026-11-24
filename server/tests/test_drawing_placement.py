@@ -149,9 +149,38 @@ class GeometryTests(unittest.TestCase):
         rects = hd.item_rects(doc)
         self.assertEqual(rects["2"]["target"], "1")
         _, y1, x2, y2 = _mm_rect(rects["2"]["rects"][0])
-        # leader (-10, +5): text ends at x 100 and is centred on y 71
+        # leader (-10, +5): the leader ends at (100, 71); the text lies left of it,
+        # past the elbow, on its underline (just above y 71)
         self.assertAlmostEqual(x2, 100.0, places=2)
-        self.assertAlmostEqual((y1 + y2) / 2, 71.0, places=2)
+        self.assertAlmostEqual(y1, 70.5, places=2)
+        self.assertAlmostEqual(y2, 71.0 + hd.PAGE_TEXT_MM + 1.0, places=2)
+
+    def test_view_extent_uses_whole_picture_squares(self):
+        # a connector picture whose square reaches below / left of everything else sets
+        # the view's origin, although only its visible part counts as covered
+        layout = dict(LAYOUT)
+        layout["connectors"] = [
+            {
+                "designator": "J1",
+                "location": {"x": 150, "y": 300},
+                "views": [
+                    {
+                        "hidden": False,
+                        "image": {"x1": 50, "y1": 50, "x2": 250, "y2": 250, "content_half": [20, 20]},
+                    }
+                ],
+                "texts": {},
+            }
+        ]
+        doc = self._doc([_layout_view(1, 20, 30, str(self.ldr), scale=1.0)])
+        content, _ = hd.layout_view_content(doc.item(1), layout)
+        note = next(r for label, r in content if label.startswith("note"))
+        k = 0.0254
+        # origin = the square's corner (500, 500 mils), not the note (1000, 1000)
+        self.assertAlmostEqual(hd._mm(note[0]), 20.0 + 500 * k, places=3)
+        self.assertAlmostEqual(hd._mm(note[1]), 30.0 + 500 * k, places=3)
+        j1 = next(r for label, r in content if label == "connector J1")
+        self.assertAlmostEqual(hd._mm(j1[2] - j1[0]), 400 * k, places=3)
 
     def test_layout_content_mapped_at_view_scale(self):
         doc = self._doc([_layout_view(1, 20, 30, str(self.ldr), scale=0.9)])
@@ -378,3 +407,21 @@ class RenderToolTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoveringEndsTests(unittest.TestCase):
+    def test_start_is_the_leftmost_then_upper_outer_end(self):
+        import harness_layout as hl
+
+        cps = {
+            "a": {"designator": "CP_A", "location": {"x": 100, "y": 50}},
+            "b": {"designator": "CP_B", "location": {"x": 40, "y": 50}},
+            "c": {"designator": "CP_C", "location": {"x": 40, "y": 90}},
+        }
+        # one bundle drawn right to left: starts at its left end
+        self.assertEqual(hl._covering_ends(["a", "b"], cps), ("CP_B", "CP_A"))
+        # a vertical one: the upper end
+        self.assertEqual(hl._covering_ends(["b", "c"], cps), ("CP_C", "CP_B"))
+        # a chain a-b, b-c: the shared point is not an end
+        self.assertEqual(hl._covering_ends(["a", "b", "b", "c"], cps), ("CP_C", "CP_A"))
+        self.assertEqual(hl._covering_ends(["a"], cps), (None, None))

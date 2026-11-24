@@ -87,12 +87,24 @@ computer, and to keep tables and rear views off the layout view's content.
   layout drawing (document ObjectId 80) `ZoomSchToArea` now reads only the types verified to
   have `Selection` and `BoundingRectangle`: 2, 11, 18, 81, 85, 86, 104 (covering, verified this
   session); other sheets keep the exclusion list (+91).
+- **Layout view extent and picture turns (checked on five published drawings, within 1.4 mm):**
+  Draftsman sizes a layout view on each connector picture's whole square (plain background
+  included), so the page origin is the minimum over those squares and every other object; the
+  covered area still uses the visible part. `parse_ldrdoc` `content_half` was turned by the image
+  record's own `Orientation`, which does not follow the connector (a connector at 270 deg drew its
+  tall picture lying flat while the record said 0): it is now turned by the connector's
+  orientation plus the view's `Rotation`. Callout texts sit ~4 mm past the leader end on their
+  underline (`CALLOUT_ELBOW_MM`); with that, a callout drawn over a layout note is reported.
 - **Layout physical views:** `mirrored` is not applied to a connector's physical view picture
   (a mirrored Y-splitter still showed its unmirrored picture); turn it by 180 degrees instead.
-- **Covering offsets:** Altium's covering *start* is at the **last** vertex of the covered
-  bundle chain, its *end* at the first vertex of the first bundle (a -10 mm `end_offset_mm`
-  meant for the connector end landed on the breakout of every bundle drawn from the breakout
-  out). Documented in `edit_harness_layout`; read the bundle's `points` before choosing.
+- **Covering offsets:** Altium starts a covering at the **leftmost** outer end of its covered
+  chain (smallest x; on a tie the upper one), whatever order the bundles were drawn in. A first
+  guess ("start = last vertex") held on one drawing whose bundles all ran right to left and broke
+  coverings on drawings drawn left to right; the geometric rule was then predicted and checked
+  on screen on four drawings (bundles drawn both ways, vertical ones included) and all eight
+  layouts of the design were corrected with it. `parse_ldrdoc` / `get_harness_data` report each
+  covering's `start_at` / `end_at` connection points (`_covering_ends`); documented in
+  `edit_harness_layout`.
 - Tests: `tests/test_drawing_placement.py` (synthetic drawings, layouts and PDFs; the bridge
   mocked). Lint clean. The running MCP server keeps the old code until the IDE restarts; all
   of the above was run through `call_tool.py` with the repository's `.venv`.

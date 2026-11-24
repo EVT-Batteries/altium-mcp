@@ -128,6 +128,28 @@ def read_connection_point_streams(
     return result
 
 
+def _covering_ends(
+    chain_ends: list[str], cp_by_uid: dict[str, dict[str, Any]]
+) -> tuple[str | None, str | None]:
+    """(start, end) connection points of a covering: the two outer ends of
+    its bundle chain (the ends used once). Altium starts a covering at the
+    LEFTMOST outer end (smallest x; on a tie the upper one), whatever the
+    order the bundles were drawn in: PhysicalStartDistance applies there,
+    PhysicalEndDistance at the other end (found on screen on eight layout
+    drawings, bundles drawn either way)."""
+    outer = [u for u in chain_ends if chain_ends.count(u) == 1 and u in cp_by_uid]
+    if len(outer) != 2:
+        return None, None
+
+    def key(uid: str) -> tuple[float, float]:
+        loc = cp_by_uid[uid]["location"]
+        return round(loc["x"], 1), -loc["y"]
+
+    start = min(outer, key=key)
+    end = outer[1] if start == outer[0] else outer[0]
+    return cp_by_uid[start]["designator"] or start, cp_by_uid[end]["designator"] or end
+
+
 def read_image_contents(file_path: Path | str) -> dict[str, tuple[float, float]]:
     """Visible extent of each embedded image (the 'Storage' stream), keyed by its FileName:
     (half width, half height) of the non-background part around the image centre, as
@@ -235,6 +257,7 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
     wires: dict[int, dict[str, Any]] = {}
     synced: dict[int, dict[str, Any]] = {}
     image_views: dict[int, dict[str, Any]] = {}  # image parameter index -> view
+    view_turns: dict[int, int] = {}  # image parameter index -> quarter turns drawn
 
     for idx, props in enumerate(records):
         rtype = props.get("RECORD")
@@ -395,9 +418,13 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                 image_contents = read_image_contents(file_path)
             ext = image_contents.get(props.get("FileName", ""))
             if ext:
-                # the visible part, about the box centre (DXP units): half width / height,
-                # turned with the picture's own orientation (quarter turns)
-                hx, hy = ext if int(props.get("Orientation", 0) or 0) % 2 == 0 else ext[::-1]
+                # the visible part, about the box centre (DXP units): half width / height
+                # as drawn. Altium turns the stored picture with the connector (and the
+                # view's rotation); the image record's own Orientation does not follow
+                # it (a connector at 270 deg drew its tall picture lying flat while the
+                # record said 0), so it is not used.
+                turns = view_turns.get(int(props["OwnerIndex"]), 0)
+                hx, hy = ext if turns % 2 == 0 else ext[::-1]
                 im = image_views[int(props["OwnerIndex"])]["image"]
                 im["content_half"] = [round(hx * abs(im["x2"] - im["x1"]), 3), round(hy * abs(im["y2"] - im["y1"]), 3)]
         elif rtype in ("34", "41") and owned:
@@ -430,6 +457,11 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
                     view = dict(
                         part.split("=", 1) for part in val.split("|") if "=" in part
                     )
+                    # quarter turns the picture is drawn with: the connector's
+                    # orientation plus the view's own rotation
+                    view_turns[idx] = int(connectors[owner].get("orientation", 0) or 0) // 90 + {
+                        "eRotate90": 1, "eRotate180": 2, "eRotate270": 3
+                    }.get(view.get("Rotation", ""), 0)
                     image_views[idx] = {
                         "name": view.get("ViewName", ""),
                         "type": view.get("ViewType", ""),
@@ -506,10 +538,14 @@ def parse_ldrdoc(file_path: Path | str) -> dict[str, Any]:
         ]
     for cov in coverings.values():
         items = []
+        chain_ends: list[str] = []
         for uid in cov.pop("item_uids"):
             target = bundle_by_uid.get(uid) or cp_by_uid.get(uid) or by_uid.get(uid)
             items.append((target["designator"] or uid) if target else uid)
+            if uid in bundle_by_uid:
+                chain_ends += [bundle_by_uid[uid]["end1_uid"], bundle_by_uid[uid]["end2_uid"]]
         cov["items"] = items
+        cov["start_at"], cov["end_at"] = _covering_ends(chain_ends, cp_by_uid)
 
     # Wire ends -> "J1.3" / "SP1", and their connection points
     def end_of(uid: str) -> tuple[str, str | None]:

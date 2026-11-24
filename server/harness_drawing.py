@@ -537,6 +537,7 @@ Rect = tuple[float, float, float, float]
 MM_PER_MIL = 0.0254
 PAGE_CHAR_MM = 1.8  # a title / callout character at the document font
 PAGE_TEXT_MM = 4.0  # their height
+CALLOUT_ELBOW_MM = 4.5  # a callout's leader end to the far side of its elbow
 LAYOUT_CHAR_MILS = 55.0  # a character of a layout drawing text
 LAYOUT_TEXT_MILS = 90.0  # its height
 CONNECTOR_SYMBOL_MILS = 250.0  # half size of a connector drawn as its symbol
@@ -630,10 +631,11 @@ def _callout_rect(
     ly = _float(_child_text(e, "Leader", "Y")) or 0.0
     text = _child_text(e, "Sources", "CalloutSource", "CustomText") or "XXXX"
     tx, ty = px + lx, py + ly
-    w = _units(PAGE_CHAR_MM * len(text) + 2.0)
-    h = _units(PAGE_TEXT_MM)
+    # the text sits past the elbow (~4 mm beyond the leader's end) on its underline
+    # (checked against a published PDF: within 1 mm)
+    w = _units(CALLOUT_ELBOW_MM + PAGE_CHAR_MM * len(text))
     x1, x2 = (tx - w, tx) if lx < 0 else (tx, tx + w)
-    return target, (x1, ty - h / 2, x2, ty + h / 2)
+    return target, (x1, ty - _units(0.5), x2, ty + _units(PAGE_TEXT_MM + 1.0))
 
 
 def item_rects(doc: HarnessDrawing) -> dict[str, dict]:
@@ -798,8 +800,16 @@ def layout_view_content(
     box = view.box()
     if not raw or box is None:
         return [], None
-    min_x = min(r[0] for _, r in raw)
-    min_y = min(r[1] for _, r in raw)
+    # Draftsman sizes the view on each connector picture's whole square (its plain
+    # background included), while what covers the drawing is the part shown
+    squares = [
+        (v["image"]["x1"] * 10, v["image"]["y1"] * 10)
+        for c in layout.get("connectors", [])
+        for v in c.get("views", [])
+        if not v.get("hidden") and v.get("image")
+    ]
+    min_x = min([r[0] for _, r in raw] + [min(s[0] for s in squares)] if squares else [r[0] for _, r in raw])
+    min_y = min([r[1] for _, r in raw] + [min(s[1] for s in squares)] if squares else [r[1] for _, r in raw])
     k = _units(MM_PER_MIL * _view_scale(view.element))  # page units per mil
     out = [
         (

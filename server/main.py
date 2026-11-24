@@ -3758,10 +3758,11 @@ async def edit_harness_layout(
               "source_library": "my.DbLib", "thickness": 3,
               "start_offset_mm": -10, "end_offset_mm": 0}].
             Offsets are from the ends of the covered bundles: negative insets the covering,
-            positive extends it past the end. Altium's start is the LAST vertex of the
-            covered chain and its end the FIRST vertex of the first bundle (its
-            "points"): for a bundle drawn from a breakout out to a connector, the
-            connector end takes start_offset_mm. "bundles" replaces the covered bundles.
+            positive extends it past the end. Altium starts a covering at the LEFTMOST
+            outer end of its covered chain (smallest x; on a tie the upper one), whatever
+            order the bundles were drawn in: get_harness_data reports each covering's
+            start_at / end_at connection points; inset the connector end with the
+            offset of that side. "bundles" replaces the covered bundles.
         layout_labels (list): New or existing layout labels, e.g.
             [{"designator": "L1", "text": "LABEL", "x": 10000, "y": 17300,
               "orientation": 0, "alignment": 1, "show_only_first_line": False,
