@@ -3758,7 +3758,10 @@ async def edit_harness_layout(
               "source_library": "my.DbLib", "thickness": 3,
               "start_offset_mm": -10, "end_offset_mm": 0}].
             Offsets are from the ends of the covered bundles: negative insets the covering,
-            positive extends it past the end. "bundles" replaces the covered bundles.
+            positive extends it past the end. Altium's start is the LAST vertex of the
+            covered chain and its end the FIRST vertex of the first bundle (its
+            "points"): for a bundle drawn from a breakout out to a connector, the
+            connector end takes start_offset_mm. "bundles" replaces the covered bundles.
         layout_labels (list): New or existing layout labels, e.g.
             [{"designator": "L1", "text": "LABEL", "x": 10000, "y": 17300,
               "orientation": 0, "alignment": 1, "show_only_first_line": False,
@@ -8572,6 +8575,9 @@ async def get_screenshot(ctx: Context, view_type: str = "pcb", zoom_to: list = N
             the first or last page gets less zoom (zoom_steps in the result).
             The page sizes come from the saved file.
             Without zoom the current zoom is kept.
+            To look at a drawing while someone uses the computer, prefer
+            render_harness_drawing: it publishes the saved drawing to PDF
+            through the project's OutJob and needs no screen or input.
 
     Returns:
         Image content of the captured window plus a JSON metadata text block
@@ -9942,8 +9948,15 @@ async def get_harness_drawing_data(
     (designator, view side, stored projection lines) and the stored component
     projections, and lists issues: missing_template, empty_component_view (an
     empty projection is stored, which Draftsman never recomputes),
-    outside_page, overlap (between the page's own items other than layout /
-    wiring views), todo_text.
+    outside_page, overlap (between the page's own items on what they draw: a
+    component view's projection - location + bound x scale - and title, a
+    callout's text, a table's box and title; layout / wiring views are
+    checked on their content instead), covers_layout (an item drawn over the
+    layout view's content: bundles, connector pictures, points, notes,
+    pictures and texts of the layout drawing, mapped onto the page at the
+    view's scale from the layout's content extent at the view's location;
+    lists what it covers), todo_text. Each page with a layout view reports
+    layout_views: the view's content_mm extent [x1, y1, x2, y2].
 
     Args:
         document_path: Path to the .HarDwf.
@@ -9969,6 +9982,100 @@ async def get_harness_drawing_data(
     except (OSError, ValueError) as e:
         return json.dumps({"success": False, "error": f"drawing not read: {e}"})
     return json.dumps({"success": True, **review}, indent=2, ensure_ascii=False)
+
+
+@_tool()
+async def render_harness_drawing(
+    ctx: Context,
+    document_path: str,
+    pages: list | None = None,
+    area: dict | None = None,
+    dpi: float | None = None,
+    outjob_path: str = "",
+    container: str = "",
+):
+    """
+    Look at an Altium Draftsman drawing (.HarDwf) without using the screen:
+    publish it to PDF through its project's OutJob and return the pages (or an
+    area of one) as images. Unlike get_screenshot(view_type="dwf"), nothing is
+    brought to the front and neither mouse nor keyboard is used, so it can run
+    while someone works on the computer; Altium does the publish in the
+    background (it may show its progress bar).
+
+    The container is the first Publish (PDF) container of an OutJob of the
+    drawing's project that is connected to a Draftsman output for this drawing
+    (or for all drawings); name it with outjob_path / container otherwise.
+    The project must be open in Altium and the drawing saved (the PDF shows
+    the saved file). The run overwrites that container's own PDF, as running
+    the OutJob in Altium does. PDF pages are the drawing's pages in order.
+
+    Args:
+        document_path: The .HarDwf.
+        pages: 1-based pages to return (default all), each fitted to 1600 px
+            wide unless dpi is given.
+        area: {"page": n, "area": [x1, y1, x2, y2]} mm from the page's
+            bottom-left corner, y up (as get_harness_drawing_data reports
+            items): that area zoomed to 1600 px wide (at most 600 dpi).
+        dpi: Render resolution instead of the default fit.
+        outjob_path, container: The OutJob / container to use.
+
+    Returns:
+        A JSON text (pdf, outjob, container, pages rendered with dpi and pixel
+        size) followed by one image per page or area.
+    """
+    from drawing_render import (
+        RenderError,
+        find_publish_container,
+        render_pages,
+        wait_for_pdf,
+    )
+    from harness_drawing import HarnessDrawing
+
+    p = Path(document_path).resolve() if document_path else None
+    if not p or p.suffix.lower() != ".hardwf" or not p.exists():
+        return json.dumps(
+            {"success": False, "error": f"document_path to a .HarDwf is required: {document_path!r}"}
+        )
+    try:
+        target = find_publish_container(p, outjob_path, container)
+    except RenderError as e:
+        return json.dumps({"success": False, "error": str(e)})
+    started = time.time()
+    response = await altium_bridge.execute_command(
+        "run_output_jobs",
+        {"outjob_path": target["outjob"], "container_names": [target["container"]]},
+    )
+    if not response.get("success", False):
+        return json.dumps(
+            {"success": False, **target, "error": f"publish failed: {response.get('error', 'unknown error')}"}
+        )
+    pdf = await asyncio.to_thread(wait_for_pdf, Path(target["output_dir"]), started)
+    if pdf is None:
+        return json.dumps(
+            {
+                "success": False,
+                **target,
+                "error": "no PDF written in the container's folder within 90 s "
+                "(is the drawing's project open in Altium?)",
+            }
+        )
+    try:
+        drawing_pages = len(HarnessDrawing(p).pages())
+        info, images = await asyncio.to_thread(render_pages, pdf, pages, area, dpi)
+    except (RenderError, OSError, ValueError) as e:
+        return json.dumps({"success": False, **target, "pdf": str(pdf), "error": str(e)})
+    out = {"success": True, **target, "pdf": str(pdf), "pages": info}
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(str(pdf))
+    pdf_pages = len(doc)
+    doc.close()
+    if pdf_pages != drawing_pages:
+        out["warning"] = (
+            f"the PDF has {pdf_pages} pages, the drawing {drawing_pages}: the container "
+            "prints other documents too, so page numbers may not match the drawing's"
+        )
+    return [json.dumps(out, indent=2)] + [MCPImage(data=b, format="png") for b in images]
 
 
 @_tool()
@@ -10049,7 +10156,13 @@ async def edit_harness_drawing(
           other tables of that type (or item_ids); from_document takes the
           reference table from another .HarDwf. Tables keep their content
           and position; check widths and overlaps on a screenshot.
-      move_item {item_id, x_mm, y_mm}
+      move_item {item_id, x_mm, y_mm, clear?, margin_mm?, search_mm?, step_mm?}
+          clear: true takes the position nearest x_mm / y_mm (default: where
+          it is) where the item, its title and the callouts on it stay on
+          the page (page_margin_mm 10) and clear (margin_mm 3) of the layout
+          view's content and of the other items, searched on a step_mm (2)
+          grid out to search_mm (300); the result gives requested_mm. Moves
+          apply in order: free a place before moving another item into it.
       set_text {item_id, text}           Text items
       delete_item {item_id}              not template items
       set_template {to, pages? | from?}  point pages (1-based) or every page

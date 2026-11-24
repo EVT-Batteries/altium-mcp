@@ -37,6 +37,7 @@ REQUIREMENTS = [
     "mcp[cli]>=2.0.0",
     "olefile>=0.46",
     "pillow>=11.1.0",
+    "pypdfium2>=4.30",
     "pywin32>=310",
 ]
 

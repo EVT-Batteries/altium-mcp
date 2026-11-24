@@ -335,6 +335,16 @@ def _float(text: str | None) -> float | None:
         return None
 
 
+def _view_scale(element: ET.Element) -> float:
+    """A view's scale (2.0 for 2:1): its custom scale when used, else
+    numerator / denominator."""
+    if _child_text(element, "UseCustomScale") == "true":
+        return _float(_child_text(element, "CustomScale")) or 1.0
+    num = _float(_child_text(element, "Scale", "Numenator")) or 1.0
+    den = _float(_child_text(element, "Scale", "Denominator")) or 1.0
+    return num / den
+
+
 @dataclass
 class DrawingItem:
     page: int  # 1-based page index
@@ -519,6 +529,352 @@ def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# --- placement geometry ---------------------------------------------------
+# Rectangles are (x1, y1, x2, y2) in page units (1/96 inch), y up.
+
+Rect = tuple[float, float, float, float]
+
+MM_PER_MIL = 0.0254
+PAGE_CHAR_MM = 1.8  # a title / callout character at the document font
+PAGE_TEXT_MM = 4.0  # their height
+LAYOUT_CHAR_MILS = 55.0  # a character of a layout drawing text
+LAYOUT_TEXT_MILS = 90.0  # its height
+CONNECTOR_SYMBOL_MILS = 250.0  # half size of a connector drawn as its symbol
+POINT_MILS = 40.0  # half size of a connection point
+COVER_MIN_MM = 0.5  # least overlap (both ways) that counts as covering
+BUNDLE_MILS = 20.0  # half width of a bundle line
+
+
+def _overlaps(a: Rect, b: Rect, margin: float = 0.0) -> bool:
+    return (
+        a[0] < b[2] + margin
+        and b[0] < a[2] + margin
+        and a[1] < b[3] + margin
+        and b[1] < a[3] + margin
+    )
+
+
+def _overlap_size(a: Rect, b: Rect) -> tuple[float, float]:
+    return min(a[2], b[2]) - max(a[0], b[0]), min(a[3], b[3]) - max(a[1], b[1])
+
+
+def _shifted(r: Rect, dx: float, dy: float) -> Rect:
+    return r[0] + dx, r[1] + dy, r[2] + dx, r[3] + dy
+
+
+def _resolved_title(element: ET.Element) -> str:
+    """A view's title as drawn: =ViewScale as 2:1 / 1:2, =ComponentName as
+    the designator."""
+    title = _child_text(element, "Title") or ""
+    s = _view_scale(element)
+    scale = f"{s:g}:1" if s >= 1 else f"1:{1 / s:g}"
+    return title.replace("=ViewScale", scale).replace(
+        "=ComponentName", _child_text(element, "Designator") or ""
+    )
+
+
+def projection_bounds(doc: HarnessDrawing) -> dict[tuple[str, str], dict]:
+    """(designator, side name) -> the stored projection's bound (x, y, width,
+    height in page units; y as stored, i.e. negated)."""
+    out = {}
+    for p in doc.projections():
+        seg = doc.xml[p["start"] : p["end"]]
+        bound = {
+            k: float(v) for k, v in re.findall(r"<a:_(\w+)>([^<]+)</a:_\w+>", seg)
+        }
+        if {"x", "y", "width", "height"} <= bound.keys():
+            out[(p["designator"], p["view_side"])] = bound
+    return out
+
+
+def _view_body(item: DrawingItem, bounds: dict) -> Rect | None:
+    """A component view's drawn projection: its location is the bottom-left
+    corner of the projection's bound, scaled."""
+    box = item.box()
+    if box is None:
+        return None
+    designator = _child_text(item.element, "Designator") or ""
+    side = _side_name(_child_text(item.element, "ViewSide") or "0")
+    b = bounds.get((designator, side))
+    s = _view_scale(item.element)
+    w, h = (b["width"] * s, b["height"] * s) if b else (_units(20.0), _units(20.0))
+    return box[0], box[1], box[0] + w, box[1] + h
+
+
+def _callout_rect(
+    item: DrawingItem, views: dict[str, DrawingItem], bounds: dict
+) -> tuple[str | None, Rect] | None:
+    """(target view id, rectangle of the callout's text) from the point it
+    snaps to on its view (so it follows a moved view) plus its leader."""
+    e = item.element
+    target = _child_text(e, "TargetAnchor", "SnapTargetItemId")
+    view = views.get(target or "")
+    sx = _float(_child_text(e, "TargetAnchor", "Snap", "Points", "PointData", "X"))
+    sy = _float(_child_text(e, "TargetAnchor", "Snap", "Points", "PointData", "Y"))
+    px = py = None
+    if view is not None and sx is not None and sy is not None:
+        designator = _child_text(view.element, "Designator") or ""
+        side = _side_name(_child_text(view.element, "ViewSide") or "0")
+        b = bounds.get((designator, side))
+        box = view.box()
+        if b and box:
+            s = _view_scale(view.element)
+            px = box[0] + (sx - b["x"]) * s
+            py = box[1] + (b["y"] + b["height"] - sy) * s
+    if px is None:
+        px = _float(_child_text(e, "TargetAnchor", "PointOnPage", "X"))
+        py = _float(_child_text(e, "TargetAnchor", "PointOnPage", "Y"))
+    if px is None or py is None:
+        return None
+    lx = _float(_child_text(e, "Leader", "X")) or 0.0
+    ly = _float(_child_text(e, "Leader", "Y")) or 0.0
+    text = _child_text(e, "Sources", "CalloutSource", "CustomText") or "XXXX"
+    tx, ty = px + lx, py + ly
+    w = _units(PAGE_CHAR_MM * len(text) + 2.0)
+    h = _units(PAGE_TEXT_MM)
+    x1, x2 = (tx - w, tx) if lx < 0 else (tx, tx + w)
+    return target, (x1, ty - h / 2, x2, ty + h / 2)
+
+
+def item_rects(doc: HarnessDrawing) -> dict[str, dict]:
+    """Every page item's drawn rectangles: {id: {"page", "type", "rects",
+    "target"}}. A component view is its projection (location + bound x scale)
+    and its title above it; a callout the text at its leader's end (target:
+    the view it snaps to); a table, text or other boxed item its box, plus a
+    title strip above when it shows one. Layout and wiring views are left out
+    (their content: layout_view_content)."""
+    items = doc.items()
+    bounds = projection_bounds(doc)
+    views = {i.id: i for i in items if i.type == "HarnessComponentViewData"}
+    out: dict[str, dict] = {}
+    for i in items:
+        if i.type in ("LayoutDrawingViewData", "WiringDiagramViewData"):
+            continue
+        rects: list[Rect] = []
+        target = None
+        if i.type == "HarnessComponentViewData":
+            body = _view_body(i, bounds)
+            if body:
+                rects.append(body)
+        elif i.type == "Callout":
+            found = _callout_rect(i, views, bounds)
+            if found:
+                target, r = found
+                rects.append(r)
+        else:
+            box = i.box()
+            if box and box[2] > 0 and box[3] > 0:
+                rects.append((box[0], box[1], box[0] + box[2], box[1] + box[3]))
+            elif box and i.type == "Text":
+                text = _child_text(i.element, "Text") or ""
+                rects.append(
+                    (
+                        box[0],
+                        box[1],
+                        box[0] + _units(PAGE_CHAR_MM * len(text)),
+                        box[1] + _units(PAGE_TEXT_MM),
+                    )
+                )
+        if rects and _child_text(i.element, "ShowTitle") == "true":
+            title = _resolved_title(i.element) or "Title"
+            top = max(r[3] for r in rects)
+            left = rects[0][0]
+            rects.append(
+                (
+                    left,
+                    top + _units(0.5),
+                    left + _units(PAGE_CHAR_MM * len(title)),
+                    top + _units(1.0 + PAGE_TEXT_MM),
+                )
+            )
+        if rects:
+            out[i.id] = {
+                "page": i.page,
+                "type": i.type,
+                "rects": rects,
+                "target": target,
+                "from_template": i.from_template,
+            }
+    return out
+
+
+def _text_rect_mils(
+    t: dict, content: str
+) -> tuple[float, float, float, float] | None:
+    """A layout text's rectangle (mils) from its anchor and justification."""
+    if t.get("hidden") or "x" not in t:
+        return None
+    x, y = t["x"] * 10, t["y"] * 10
+    w, h = LAYOUT_CHAR_MILS * max(len(content), 1), LAYOUT_TEXT_MILS
+    just = t.get("justification") or "bottom_left"
+    if just.endswith("right"):
+        x -= w
+    elif just.endswith("center") or just == "center":
+        x -= w / 2
+    if just.startswith("top"):
+        y -= h
+    elif just.startswith("center"):
+        y -= h / 2
+    return x, y, x + w, y + h
+
+
+def layout_content_mils(layout: dict) -> list[tuple[str, Rect]]:
+    """The objects a layout drawing shows, (label, rectangle in mils):
+    bundles (per segment), connectors (their picture's visible part, or a
+    symbol-sized box), connection points, notes, pictures, frames, lines and
+    the visible texts (sizes estimated)."""
+    out: list[tuple[str, Rect]] = []
+
+    def add(label: str, x1: float, y1: float, x2: float, y2: float) -> None:
+        out.append((label, (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))))
+
+    for b in layout.get("bundles", []):
+        p = [v * 10 for v in b.get("points", [])]
+        for k in range(0, len(p) - 3, 2):
+            add(
+                f"bundle {b['designator']}",
+                min(p[k], p[k + 2]) - BUNDLE_MILS,
+                min(p[k + 1], p[k + 3]) - BUNDLE_MILS,
+                max(p[k], p[k + 2]) + BUNDLE_MILS,
+                max(p[k + 1], p[k + 3]) + BUNDLE_MILS,
+            )
+    for c in layout.get("connectors", []):
+        x, y = c["location"]["x"] * 10, c["location"]["y"] * 10
+        shown = [v for v in c.get("views", []) if not v.get("hidden") and v.get("image")]
+        label = f"connector {c['designator']}"
+        if shown:
+            im = shown[0]["image"]
+            ch = im.get("content_half")
+            if ch:
+                add(label, x - ch[0] * 10, y - ch[1] * 10, x + ch[0] * 10, y + ch[1] * 10)
+            else:
+                add(label, im["x1"] * 10, im["y1"] * 10, im["x2"] * 10, im["y2"] * 10)
+        else:
+            s = CONNECTOR_SYMBOL_MILS
+            add(label, x - s, y - s, x + s, y + s)
+    for cp in layout.get("connection_points", []):
+        x, y = cp["location"]["x"] * 10, cp["location"]["y"] * 10
+        add(f"point {cp['designator']}", x - POINT_MILS, y - POINT_MILS,
+            x + POINT_MILS, y + POINT_MILS)
+    for n in layout.get("notes", []):
+        add(f"note '{(n.get('text') or '')[:30]}'", n["x1"] * 10, n["y1"] * 10,
+            n["x2"] * 10, n["y2"] * 10)
+    for kind in ("pictures", "frames"):
+        for p in layout.get(kind, []):
+            if {"x1", "y1", "x2", "y2"} <= p.keys():
+                add(kind[:-1], p["x1"] * 10, p["y1"] * 10, p["x2"] * 10, p["y2"] * 10)
+    for ln in layout.get("lines", []):
+        p = [v * 10 for v in ln.get("points", [])]
+        if len(p) >= 4:
+            add("line", min(p[0::2]), min(p[1::2]), max(p[0::2]), max(p[1::2]))
+    for kind in ("connectors", "connection_points", "bundles", "coverings", "layout_labels"):
+        for o in layout.get(kind, []):
+            des = o.get("designator") or ""
+            for name, t in (o.get("texts") or {}).items():
+                low = name.lower()
+                if low == "designator":
+                    content = des
+                elif low == "comment":
+                    content = o.get("part_number") or o.get("comment") or ""
+                elif low == "length" and isinstance(o.get("length"), dict):
+                    content = f"{o['length'].get('mm', 0):.2f}mm"
+                else:
+                    content = str((o.get("parameters") or {}).get(name, "XXXXXXXX"))
+                r = _text_rect_mils(t, content)
+                if r:
+                    out.append((f"text {des} {name}", r))
+    return out
+
+
+def layout_view_content(
+    view: DrawingItem, layout: dict
+) -> tuple[list[tuple[str, Rect]], Rect | None]:
+    """The layout objects a layout view shows, as page rectangles, and their
+    extent. Draftsman draws the layout's content extent at the view's scale
+    (mm per mil = 0.0254 x scale) with its bottom-left corner at the view's
+    location (checked against a published PDF: every point name within 0.01
+    mm)."""
+    raw = layout_content_mils(layout)
+    box = view.box()
+    if not raw or box is None:
+        return [], None
+    min_x = min(r[0] for _, r in raw)
+    min_y = min(r[1] for _, r in raw)
+    k = _units(MM_PER_MIL * _view_scale(view.element))  # page units per mil
+    out = [
+        (
+            label,
+            (
+                box[0] + (r[0] - min_x) * k,
+                box[1] + (r[1] - min_y) * k,
+                box[0] + (r[2] - min_x) * k,
+                box[1] + (r[3] - min_y) * k,
+            ),
+        )
+        for label, r in raw
+    ]
+    extent = (
+        min(r[0] for _, r in out),
+        min(r[1] for _, r in out),
+        max(r[2] for _, r in out),
+        max(r[3] for _, r in out),
+    )
+    return out, extent
+
+
+# the last layout drawing read, keyed by (path, mtime): every clear move of a
+# call reads the same one
+_LAYOUT_CACHE: dict[tuple[str, int], dict] = {}
+
+
+def page_layout_content(
+    doc: HarnessDrawing, page: int
+) -> list[tuple[str, str, list[tuple[str, Rect]], Rect | None]]:
+    """(view id, source path, content rectangles, extent) for each layout view
+    on a page whose layout drawing can be read."""
+    from harness_layout import parse_ldrdoc
+
+    out = []
+    for i in doc.items():
+        if i.page != page or i.type != "LayoutDrawingViewData":
+            continue
+        source = _child_text(i.element, "BoardSourceName") or ""
+        src = Path(source)
+        if not src.is_absolute():
+            src = doc.path.parent / src
+        if not src.exists():
+            continue
+        key = (str(src), src.stat().st_mtime_ns)
+        layout = _LAYOUT_CACHE.get(key)
+        if layout is None:
+            try:
+                layout = parse_ldrdoc(src)
+            except (OSError, ValueError, KeyError, IndexError):
+                # an unreadable layout: nothing to check its content against
+                layout = None
+            if layout is None:
+                continue
+            _LAYOUT_CACHE.clear()
+            _LAYOUT_CACHE[key] = layout
+        rects, extent = layout_view_content(i, layout)
+        out.append((i.id, str(src), rects, extent))
+    return out
+
+
+def _covered(rects: list[Rect], content: list[tuple[str, Rect]], min_mm: float) -> list[str]:
+    """Labels of the layout objects the rectangles cover by more than
+    min_mm in both directions."""
+    m = _units(min_mm)
+    hits: list[str] = []
+    for r in rects:
+        for label, c in content:
+            if _overlaps(r, c):
+                ox, oy = _overlap_size(r, c)
+                if ox > m and oy > m and label not in hits:
+                    hits.append(label)
+    return hits
+
+
 # --- review ---------------------------------------------------------------
 
 
@@ -528,6 +884,7 @@ def review_drawing(path: Path, include_template_items: bool = False) -> dict:
     pages = doc.pages()
     items = doc.items()
     projections = doc.projections()
+    rects_by_item = item_rects(doc)
     issues: list[dict] = []
 
     out_pages = []
@@ -580,28 +937,61 @@ def review_drawing(path: Path, include_template_items: bool = False) -> dict:
                         "type": i.type,
                     }
                 )
-        for a in range(len(boxes)):
-            for b in range(a + 1, len(boxes)):
-                (ia, ba), (ib, bb) = boxes[a], boxes[b]
-                if min(ba[2], ba[3], bb[2], bb[3]) <= 0:
+        # overlaps between the page's own items, on what they draw (a component
+        # view: its projection and title; a callout: its text); a layout / wiring
+        # view's box includes its whitespace, where tables and notes are placed
+        # on purpose, so it is checked on its content instead (covers_layout)
+        drawn = {k: v for k, v in rects_by_item.items() if v["page"] == page["index"]
+                 and not v["from_template"]}
+        ids = list(drawn)
+        for a in range(len(ids)):
+            for b in range(a + 1, len(ids)):
+                da, db = drawn[ids[a]], drawn[ids[b]]
+                # a callout sits on its own view
+                if da["target"] == ids[b] or db["target"] == ids[a]:
                     continue
-                # a layout / wiring view's box includes its whitespace, where
-                # tables and notes are placed on purpose
-                if {ia.type, ib.type} & {
-                    "LayoutDrawingViewData",
-                    "WiringDiagramViewData",
-                }:
-                    continue
-                ox = min(ba[0] + ba[2], bb[0] + bb[2]) - max(ba[0], bb[0])
-                oy = min(ba[1] + ba[3], bb[1] + bb[3]) - max(ba[1], bb[1])
-                if ox > 0 and oy > 0:
+                best = (0.0, 0.0)
+                for ra in da["rects"]:
+                    for rb in db["rects"]:
+                        ox, oy = _overlap_size(ra, rb)
+                        if ox > 0 and oy > 0 and ox * oy > best[0] * best[1]:
+                            best = (ox, oy)
+                if best[0] > 0:
                     issues.append(
                         {
                             "kind": "overlap",
                             "page": page["index"],
-                            "items": [ia.id, ib.id],
-                            "types": [ia.type, ib.type],
-                            "overlap_mm": [_mm(ox), _mm(oy)],
+                            "items": [ids[a], ids[b]],
+                            "types": [da["type"], db["type"]],
+                            "overlap_mm": [_mm(best[0]), _mm(best[1])],
+                        }
+                    )
+        layout_views = page_layout_content(doc, page["index"])
+        if layout_views:
+            out_pages[-1]["layout_views"] = [
+                {
+                    "item": vid,
+                    "source": src,
+                    "content_mm": [_mm(v) for v in extent] if extent else None,
+                }
+                for vid, src, _, extent in layout_views
+            ]
+        for vid, _, content, _ in layout_views:
+            for iid, d in drawn.items():
+                hits = _covered(d["rects"], content, COVER_MIN_MM)
+                if hits:
+                    issues.append(
+                        {
+                            "kind": "covers_layout",
+                            "page": page["index"],
+                            "item": iid,
+                            "type": d["type"],
+                            "layout_view": vid,
+                            "covers": hits[:12],
+                            "covers_count": len(hits),
+                            "detail": "the item is drawn over the layout view's "
+                            "content; move it (move_item with clear: true finds "
+                            "the nearest free place)",
                         }
                     )
         for i in own:
@@ -922,10 +1312,92 @@ def _op_set_view_title(doc: HarnessDrawing, op: dict) -> dict:
     return out
 
 
+def _clear_position(doc: HarnessDrawing, item: DrawingItem, op: dict) -> tuple[float, float]:
+    """The position (page units) nearest the requested x_mm / y_mm where the
+    item - with its title and the callouts on it - lies inside the page and
+    clear (by margin_mm) of the layout views' content and of every other item
+    on the page (sheet template items included, except page-sized ones such as
+    the frame). Searched on a grid of step_mm out to search_mm."""
+    box = item.box()
+    if box is None:
+        raise DrawingEditError(f"item {item.id} ({item.type}) has no position")
+    rects_all = item_rects(doc)
+    mine = rects_all.get(item.id, {"rects": [(box[0], box[1], box[0], box[1])]})["rects"]
+    mine = list(mine) + [
+        r
+        for k, v in rects_all.items()
+        if v["target"] == item.id
+        for r in v["rects"]
+    ]
+    page = next(p for p in doc.pages() if p["index"] == item.page)
+    pw, ph = page["width"] or 0.0, page["height"] or 0.0
+    obstacles: list[Rect] = []
+    for k, v in rects_all.items():
+        if k == item.id or v["target"] == item.id or v["page"] != item.page:
+            continue
+        for r in v["rects"]:
+            # the frame / border of a sheet template covers the whole page
+            if (r[2] - r[0]) * (r[3] - r[1]) > 0.3 * pw * ph:
+                continue
+            obstacles.append(r)
+    for _, _, content, _ in page_layout_content(doc, item.page):
+        obstacles += [r for _, r in content]
+    margin = _units(float(op.get("margin_mm", 3.0)))
+    edge = _units(float(op.get("page_margin_mm", 10.0)))
+    step = _units(float(op.get("step_mm", 2.0)))
+    search = _units(float(op.get("search_mm", 300.0)))
+    want_dx = _units(float(op["x_mm"])) - box[0]
+    want_dy = _units(float(op["y_mm"])) - box[1]
+    ext = (
+        min(r[0] for r in mine),
+        min(r[1] for r in mine),
+        max(r[2] for r in mine),
+        max(r[3] for r in mine),
+    )
+    # only obstacles the item can reach within the search
+    reach = _shifted(ext, want_dx, want_dy)
+    reach = (reach[0] - search - margin, reach[1] - search - margin,
+             reach[2] + search + margin, reach[3] + search + margin)
+    near = [r for r in obstacles if _overlaps(r, reach)]
+
+    def fits(dx: float, dy: float) -> bool:
+        e = _shifted(ext, dx, dy)
+        if e[0] < edge or e[1] < edge or e[2] > pw - edge or e[3] > ph - edge:
+            return False
+        hit = [o for o in near if _overlaps(e, o, margin)]
+        if not hit:
+            return True
+        return not any(
+            _overlaps(_shifted(r, dx, dy), o, margin) for r in mine for o in hit
+        )
+
+    rings = int(search / step)
+    for ring in range(rings + 1):
+        cands = []
+        for i in range(-ring, ring + 1):
+            for j in (-ring, ring) if abs(i) != ring else range(-ring, ring + 1):
+                cands.append((i * i + j * j, i, j))
+        for _, i, j in sorted(set(cands)):
+            dx, dy = want_dx + i * step, want_dy + j * step
+            if fits(dx, dy):
+                return box[0] + dx, box[1] + dy
+    raise DrawingEditError(
+        f"item {item.id}: no clear place within {op.get('search_mm', 300.0)} mm of "
+        f"({op['x_mm']}, {op['y_mm']})"
+    )
+
+
 def _op_move_item(doc: HarnessDrawing, op: dict) -> dict:
     item = doc.item(op.get("item_id"))
     if "x_mm" not in op or "y_mm" not in op:
-        raise DrawingEditError("x_mm and y_mm are required")
+        if not op.get("clear"):
+            raise DrawingEditError("x_mm and y_mm are required")
+        box = item.box() or (0.0, 0.0, 0.0, 0.0)
+        op = {**op, "x_mm": _mm(box[0]), "y_mm": _mm(box[1])}
+    if op.get("clear"):
+        cx, cy = _clear_position(doc, item, op)
+        op = {**op, "requested_mm": [op["x_mm"], op["y_mm"]],
+              "x_mm": round(_mm(cx), 3), "y_mm": round(_mm(cy), 3)}
     x, y = _fmt(_units(float(op["x_mm"]))), _fmt(_units(float(op["y_mm"])))
     holder = (
         "Location"
@@ -938,7 +1410,10 @@ def _op_move_item(doc: HarnessDrawing, op: dict) -> dict:
         raise DrawingEditError(f"item {item.id} ({item.type}) has no position")
     doc._set_child(item, [holder, "X"], x)
     doc._set_child(doc.item(item.id), [holder, "Y"], y)
-    return {"item_id": item.id, "x_mm": op["x_mm"], "y_mm": op["y_mm"]}
+    out = {"item_id": item.id, "x_mm": op["x_mm"], "y_mm": op["y_mm"]}
+    if "requested_mm" in op:
+        out["requested_mm"] = op["requested_mm"]
+    return out
 
 
 def _op_copy_item(doc: HarnessDrawing, op: dict) -> dict:
@@ -1036,12 +1511,7 @@ def _projection_point_on_page(
         raise DrawingEditError(f"no projection stored for {designator} {side}")
     seg = doc.xml[proj["start"] : proj["end"]]
     bound = {k: float(v) for k, v in re.findall(r"<a:_(\w+)>([^<]+)</a:_\w+>", seg)}
-    if _child_text(view.element, "UseCustomScale") == "true":
-        scale = _float(_child_text(view.element, "CustomScale")) or 1.0
-    else:
-        num = _float(_child_text(view.element, "Scale", "Numenator")) or 1.0
-        den = _float(_child_text(view.element, "Scale", "Denominator")) or 1.0
-        scale = num / den
+    scale = _view_scale(view.element)
     box = view.box() or (0.0, 0.0, 0.0, 0.0)
     # stored projection: x as given, y negated (see _projection_xml)
     sx, sy = _units(float(point[0])), -_units(float(point[1]))

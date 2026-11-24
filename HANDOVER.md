@@ -47,6 +47,56 @@ of real documents first; files the user is editing are not ours.
 
 ## 3. History (newest first)
 
+### Session 31 (2026-11-24): drawing review without the screen, placement clear of the layout (uncommitted)
+
+The user asked to check a Draftsman drawing visually without disturbing whoever works at the
+computer, and to keep tables and rear views off the layout view's content.
+
+- **`render_harness_drawing` (new tool, `server/drawing_render.py`):** publishes the saved
+  drawing through its project's own OutJob (the first Publish container connected to a
+  Draftsman output for that drawing or for all of them; `outjob_path` / `container` to choose)
+  and returns pages, or `{"page", "area"}` crops (mm, page bottom-left, y up), rendered with
+  **pypdfium2** (new dependency: Apache-2.0 / BSD; `pyproject.toml`, `uv.lock`,
+  `requirements.txt`, the fallback list in `start_server.py`). No window is raised and no
+  input is used. Why it works now: session 25 tried a *temporary* OutJob, which only prints
+  documents of its own project, and the Save As export; the project's own OutJob prints them.
+  The bridge passes `DisableDialog=True`, so a second publish overwrites the PDF without a
+  prompt (verified). PDF pages = drawing pages (warning when the counts differ). Verified live
+  on a 12-page drawing: a 310 x 180 mm area of the E-size page 2 rendered at 131 dpi.
+- **Placement geometry (`harness_drawing.py`):**
+  - `item_rects`: what each item draws. A component view: location + projection bound x scale
+    (its Location is the bound's bottom-left corner, checked against the PDF lines: exact) and
+    a title strip above. A callout: its text at the leader's end, placed from its snap point
+    through the view's *current* location (so it follows a moved view; the stored PointOnPage
+    is stale until Draftsman saves). A table: its box plus title.
+  - `layout_view_content`: the layout drawing's objects (bundles per segment, connector pictures'
+    visible part or a symbol box, points, notes, pictures, frames, lines, visible texts with
+    estimated sizes) mapped onto the page: page = view location + (object - layout content
+    minimum) x 0.0254 mm/mil x view scale. Fitted against a published PDF on 37 point names:
+    0.000 mm residual (scale 0.9). The view's stored auto Size can be stale (it was 765 x 705 mm
+    for content 688 x 635 mm); the mapping only uses its location and scale.
+  - Review: `overlap` now compares what items draw (component views used to have 0 x 0 boxes,
+    so view overlaps were never seen); new `covers_layout` issue (item, layout view, the layout
+    objects covered); `layout_views[].content_mm` per page.
+  - `move_item` `clear: true`: nearest grid position (step 2 mm, out to 300 mm) where the item
+    with its title and callouts is on the page (10 mm margin) and 3 mm clear of the layout
+    content and every other item (sheet-template items too, except page-sized ones). Moves
+    apply in order, so free a place before moving another item into it.
+- **`get_screenshot` zoom on a layout drawing failed** with "Undeclared identifier: Selection":
+  a layout's sheet also owns ObjectId 91 records (they appeared with fixed wire lengths). On a
+  layout drawing (document ObjectId 80) `ZoomSchToArea` now reads only the types verified to
+  have `Selection` and `BoundingRectangle`: 2, 11, 18, 81, 85, 86, 104 (covering, verified this
+  session); other sheets keep the exclusion list (+91).
+- **Layout physical views:** `mirrored` is not applied to a connector's physical view picture
+  (a mirrored Y-splitter still showed its unmirrored picture); turn it by 180 degrees instead.
+- **Covering offsets:** Altium's covering *start* is at the **last** vertex of the covered
+  bundle chain, its *end* at the first vertex of the first bundle (a -10 mm `end_offset_mm`
+  meant for the connector end landed on the breakout of every bundle drawn from the breakout
+  out). Documented in `edit_harness_layout`; read the bundle's `points` before choosing.
+- Tests: `tests/test_drawing_placement.py` (synthetic drawings, layouts and PDFs; the bridge
+  mocked). Lint clean. The running MCP server keeps the old code until the IDE restarts; all
+  of the above was run through `call_tool.py` with the repository's `.venv`.
+
 ### Session 30 (2026-11-19): flat layout in proportion, lanes by collision, labels placed clear (uncommitted)
 
 User review of the flattened layouts: a 19 mm branch drawn as long as (or longer than) a

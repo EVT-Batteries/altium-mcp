@@ -1214,10 +1214,16 @@ begin
             // objects that have no Selection (a late-bound read then stops the
             // script). BoundingRectangle is read typed (late-bound it has
             // crashed Altium). A layout drawing's sheet also owns harness data
-            // records (ObjectId 90 wire data, 95, 97) that have neither
+            // records (ObjectId 90 wire data, 91, 95, 97, ...) that have neither
             // Selection nor BoundingRectangle: reading either stops the script.
+            // On a layout drawing (ObjectId 80) only the graphics verified to
+            // have both are read: 2, 11, 18, 81, 85, 86, 104 (covering).
             if (OwnerId = Doc.ObjectId) and (Obj.ObjectId <> 42) and (Obj.ObjectId <> 27) and
-               (Obj.ObjectId <> 90) and (Obj.ObjectId <> 95) and (Obj.ObjectId <> 97) then
+               (Obj.ObjectId <> 90) and (Obj.ObjectId <> 91) and (Obj.ObjectId <> 95) and
+               (Obj.ObjectId <> 97) and
+               ((Doc.ObjectId <> 80) or (Obj.ObjectId = 2) or (Obj.ObjectId = 11) or
+                (Obj.ObjectId = 18) or (Obj.ObjectId = 81) or (Obj.ObjectId = 85) or
+                (Obj.ObjectId = 86) or (Obj.ObjectId = 104)) then
             begin
                 Sel := Obj;
                 if (BoolToStr(Sel.Selection, True) = 'True') then
